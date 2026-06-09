@@ -29,11 +29,14 @@ SemVer; everything pre-`1.0` may break the wire protocol between minor versions.
   cross-compiles for macOS / Linux / Windows.
 - *Remaining:* CI produces packaged installers (binaries build today).
 
-## v0.6 — Internet-wide serverless mesh ✅ (core) / DHT pending
+## v0.6 — Internet-wide serverless mesh ✅ (core) / DHT wiring pending
 - **NAT traversal:** STUN reflexive discovery + UDP hole punching across all
   candidate endpoints. ✅
-- *Remaining:* Kademlia **DHT** rendezvous (the `Rendezvous` trait is defined)
-  and DERP-like fallback relay.
+- **Kademlia DHT** rendezvous (`lattice-dht`): XOR distance, k-bucket routing,
+  iterative lookup; implements `Rendezvous`. Verified by a 40-node simulated
+  network (publish on one node, retrieve from a distant one). ✅
+- *Remaining:* wire the DHT into the daemon (UDP server loop with request-id
+  demux + public bootstrap nodes), and a DERP-like fallback relay.
 
 ## v0.7 — Hardening ✅ (components) ◀ (current)
 - Replay window, rekey policy (wired into sessions), stateless handshake cookie,

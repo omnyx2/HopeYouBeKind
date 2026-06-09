@@ -81,6 +81,7 @@ GUI setup lives in [`gui/README.md`](gui/README.md).
 | `crates/net`        | UDP transport, NAT traversal, mDNS/DHT peer discovery   |
 | `crates/overlay`    | SDN control plane: virtual-IP allocation, routing table |
 | `crates/engine`     | Node runtime that wires the planes together             |
+| `crates/dht`        | Kademlia DHT for serverless peer rendezvous             |
 | `crates/ipc`        | Local daemon⇄GUI/CLI control protocol (Unix socket)     |
 | `crates/daemon`     | Privileged background service + IPC server              |
 | `crates/cli`        | Terminal control client                                 |

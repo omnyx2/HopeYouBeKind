@@ -10,6 +10,13 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 
 ## [Unreleased]
 
+### Added
+- **`lattice-dht`**: a Kademlia DHT for serverless peer rendezvous — XOR distance
+  metric, k-bucket routing table, iterative node/value lookup, and a
+  `Rendezvous` impl (publish candidates to the k closest nodes; look them up by
+  node id). Verified by a 40-node in-memory simulated network. UDP transport
+  included; daemon wiring (server loop + bootstrap) is the remaining step.
+
 ## [0.7.0] — 2026-06-09
 
 ### Added — v0.7 hardening

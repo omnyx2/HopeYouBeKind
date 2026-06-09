@@ -1,0 +1,16 @@
+[package]
+name = "lattice-dht"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Kademlia DHT for serverless peer rendezvous (publish/lookup candidate addresses)."
+
+[dependencies]
+lattice-net.workspace = true
+serde.workspace = true
+bincode.workspace = true
+tokio = { workspace = true }
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

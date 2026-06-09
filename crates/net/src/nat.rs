@@ -123,8 +123,9 @@ pub async fn punch<T: Transport>(transport: &T, candidates: &[SocketAddr], probe
 }
 
 /// Serverless rendezvous: how a node publishes its candidate addresses and finds
-/// a peer's, without a central coordinator. v0.6 ships STUN + hole punching
-/// above; a Kademlia DHT implementation of this trait is the remaining work.
+/// a peer's, without a central coordinator. STUN + hole punching live above;
+/// `lattice-dht` implements this trait with a Kademlia DHT (publish to the k
+/// closest nodes, iterative lookup by node id).
 #[async_trait::async_trait]
 pub trait Rendezvous: Send {
     /// Publish our candidates under our node id so peers can find them.
