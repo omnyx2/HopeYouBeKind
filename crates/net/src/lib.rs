@@ -10,6 +10,8 @@ use std::net::SocketAddr;
 
 use lattice_proto::NodeId;
 
+pub mod nat;
+
 #[derive(thiserror::Error, Debug)]
 pub enum NetError {
     #[error("io error: {0}")]

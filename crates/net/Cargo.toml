@@ -14,3 +14,4 @@ thiserror.workspace = true
 tracing.workspace = true
 socket2.workspace = true
 mdns-sd.workspace = true
+rand.workspace = true

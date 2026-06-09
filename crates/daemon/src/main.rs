@@ -70,6 +70,15 @@ async fn main() -> Result<()> {
     let udp_addr = transport.local_addr()?;
     tracing::info!(udp = %udp_addr, "transport bound");
 
+    // Best-effort: learn our public (reflexive) address via STUN. Used as a
+    // WAN candidate for NAT hole punching. (Distributing it to peers without a
+    // server — the DHT rendezvous — is the remaining v0.6 work; today this is
+    // informational + available for manual peer pinning.)
+    match lattice_net::nat::reflexive_address("stun.l.google.com:19302").await {
+        Ok(public) => tracing::info!(%public, "public address (STUN)"),
+        Err(e) => tracing::debug!(error = %e, "STUN lookup failed (LAN-only or offline)"),
+    }
+
     // Serverless LAN discovery: advertise ourselves and browse for peers over
     // mDNS. Discovered peers trigger an automatic handshake in the engine.
     let discovery = MdnsDiscovery::new(&public_key, udp_addr.port())?;

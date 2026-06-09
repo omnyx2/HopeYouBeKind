@@ -65,6 +65,9 @@ pub struct Engine {
     sessions: HashMap<SocketAddr, NoiseSession>,
     /// Initiator handshakes awaiting a response, keyed by the peer's endpoint.
     pending: HashMap<SocketAddr, Handshake>,
+    /// The endpoint each peer is actually reachable at, learned when its session
+    /// establishes — the candidate whose NAT binding won the hole punch.
+    connected: HashMap<NodeId, SocketAddr>,
     config: EngineConfig,
     /// Whether the engine loop is live (set while `run` is executing).
     running: Arc<AtomicBool>,
@@ -82,6 +85,7 @@ impl Engine {
             overlay: Arc::new(Mutex::new(Overlay::new())),
             sessions: HashMap::new(),
             pending: HashMap::new(),
+            connected: HashMap::new(),
             config,
             running: Arc::new(AtomicBool::new(false)),
             enabled: Arc::new(AtomicBool::new(true)),
@@ -177,9 +181,9 @@ impl Engine {
         peer: DiscoveredPeer,
         transport: &X,
     ) -> Result<(), EngineError> {
-        let Some(&endpoint) = peer.endpoints.first() else {
+        if peer.endpoints.is_empty() {
             return Ok(()); // no address to reach them yet
-        };
+        }
         // Identity == public key in v0, so discovery carries everything we need.
         let public_key = peer.id.0.to_vec();
         let info = PeerInfo {
@@ -192,15 +196,23 @@ impl Engine {
         self.overlay.lock().await.upsert_peer(info)?;
 
         let private = self.identity.private_key().to_vec();
-        let (handshake, init_msg) = Handshake::initiate(&private, &public_key)?;
-        self.pending.insert(endpoint, handshake);
-        transport
-            .send_to(
-                &wire::encode(MessageType::HandshakeInit, &init_msg),
-                endpoint,
-            )
-            .await?;
-        tracing::info!(peer = %peer.id.fingerprint(), %endpoint, "handshake initiated");
+        // Hole punch: initiate a handshake toward every candidate endpoint at
+        // once. The first to answer wins — its NAT binding is the working path.
+        for &endpoint in &peer.endpoints {
+            let (handshake, init_msg) = Handshake::initiate(&private, &public_key)?;
+            self.pending.insert(endpoint, handshake);
+            transport
+                .send_to(
+                    &wire::encode(MessageType::HandshakeInit, &init_msg),
+                    endpoint,
+                )
+                .await?;
+        }
+        tracing::info!(
+            peer = %peer.id.fingerprint(),
+            candidates = peer.endpoints.len(),
+            "handshake initiated"
+        );
         Ok(())
     }
 
@@ -216,14 +228,16 @@ impl Engine {
         if !self.enabled.load(Ordering::Relaxed) {
             return Ok(()); // mesh administratively down
         }
-        let endpoint = {
+        let (peer_id, fallback) = {
             let overlay = self.overlay.lock().await;
             match overlay.route(&dst) {
-                Ok(peer) => peer.endpoints.first().copied(),
-                Err(_) => None,
+                Ok(peer) => (peer.id, peer.endpoints.first().copied()),
+                Err(_) => return Ok(()),
             }
         };
-        let Some(endpoint) = endpoint else {
+        // Prefer the endpoint whose session is live; fall back to the first
+        // candidate while the handshake is still settling.
+        let Some(endpoint) = self.connected.get(&peer_id).copied().or(fallback) else {
             return Ok(()); // no route yet
         };
         let Some(session) = self.sessions.get_mut(&endpoint) else {
@@ -262,6 +276,7 @@ impl Engine {
                 };
                 self.overlay.lock().await.upsert_peer(info)?;
                 self.sessions.insert(from, pending.session);
+                self.connected.insert(peer_id, from);
                 transport
                     .send_to(
                         &wire::encode(MessageType::HandshakeResp, &pending.response),
@@ -275,6 +290,7 @@ impl Engine {
                     let session = handshake.complete(payload)?;
                     self.sessions.insert(from, session);
                     if let Some(peer_id) = self.peer_id_at(from).await {
+                        self.connected.insert(peer_id, from);
                         self.overlay
                             .lock()
                             .await
