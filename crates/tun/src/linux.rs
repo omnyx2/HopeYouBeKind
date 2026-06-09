@@ -51,7 +51,9 @@ impl LinuxTun {
         // kernel assigns the next free tunN and writes it back into `req.name`.
         let mut req: IfReq = unsafe { std::mem::zeroed() };
         req.flags = IFF_TUN | IFF_NO_PI;
-        if unsafe { libc::ioctl(fd, TUNSETIFF, &mut req as *mut IfReq as *mut c_void) } < 0 {
+        // `ioctl`'s request arg is c_ulong on glibc but c_int on musl; `as _`
+        // coerces our constant to whichever the target expects.
+        if unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut req as *mut IfReq as *mut c_void) } < 0 {
             return Err(last_err("ioctl(TUNSETIFF)"));
         }
 
