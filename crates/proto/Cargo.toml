@@ -9,3 +9,6 @@ description = "Shared wire types, message framing, and IPC contract for Lattice.
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

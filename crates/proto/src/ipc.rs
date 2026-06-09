@@ -24,8 +24,12 @@ pub enum Request {
 }
 
 /// The daemon's reply.
+///
+/// Adjacently tagged (`{"ok": <variant>, "data": <payload>}`): a sequence payload
+/// like `Peers(Vec<…>)` cannot be *internally* tagged (serde can only inline a
+/// tag into a map), so the content lives in a separate `data` field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "ok", rename_all = "snake_case")]
+#[serde(tag = "ok", content = "data", rename_all = "snake_case")]
 pub enum Response {
     Status(NodeStatus),
     Peers(Vec<PeerInfo>),
@@ -44,4 +48,33 @@ pub struct NodeStatus {
     pub virtual_ip: Option<VirtualIp>,
     pub running: bool,
     pub peer_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every response variant — including the `Vec` payload that broke internal
+    /// tagging — must serialize to JSON and parse back.
+    #[test]
+    fn responses_round_trip_as_json() {
+        let cases = vec![
+            Response::Status(NodeStatus {
+                id: NodeId([1u8; 32]),
+                virtual_ip: None,
+                running: true,
+                peer_count: 0,
+            }),
+            Response::Peers(vec![]),
+            Response::Done,
+            Response::Error {
+                message: "nope".into(),
+            },
+        ];
+        for r in cases {
+            let json = serde_json::to_string(&r).expect("serialize");
+            let back: Response = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(format!("{r:?}"), format!("{back:?}"), "round-trip: {json}");
+        }
+    }
 }

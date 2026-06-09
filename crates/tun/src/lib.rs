@@ -56,6 +56,21 @@ pub trait TunDevice: Send {
     async fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunError>;
 }
 
+/// A TUN device that never yields a packet and discards writes. Lets the daemon
+/// run as a headless node — IPC, discovery, and peer handshakes only, with no
+/// real interface and therefore no root required (`--no-tun`).
+pub struct NullTun;
+
+#[async_trait::async_trait]
+impl TunDevice for NullTun {
+    async fn read_packet(&mut self) -> Result<Vec<u8>, TunError> {
+        std::future::pending().await
+    }
+    async fn write_packet(&mut self, _packet: &[u8]) -> Result<(), TunError> {
+        Ok(())
+    }
+}
+
 /// Lets a boxed trait object be used wherever a `T: TunDevice` is expected
 /// (e.g. the daemon, which opens the device dynamically per OS).
 #[async_trait::async_trait]

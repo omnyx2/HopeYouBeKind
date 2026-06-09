@@ -26,6 +26,11 @@ struct Args {
     /// UDP address to bind the transport to (port 0 = OS-assigned).
     #[arg(long, default_value = "0.0.0.0:0")]
     bind: String,
+
+    /// Run without creating a TUN device: IPC + discovery + handshakes only, no
+    /// packet forwarding. Lets the daemon run unprivileged (no root needed).
+    #[arg(long)]
+    no_tun: bool,
 }
 
 #[tokio::main]
@@ -33,7 +38,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                // mdns-sd logs an ERROR per interface when IPv6 multicast has no
+                // route (common on macOS with many utun interfaces) — noise, not
+                // our concern. Quiet it by default; override with RUST_LOG.
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mdns_sd=off")),
         )
         .init();
 
@@ -57,14 +65,20 @@ async fn main() -> Result<()> {
         "lattice-daemon starting"
     );
 
-    // Bring up the real data plane. Creating the TUN device needs root.
-    let tun = lattice_tun::open(TunConfig {
-        address: virtual_ip,
-        prefix_len: OVERLAY_SUBNET.1,
-        mtu: 1380,
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to open TUN device (need sudo?): {e}"))?;
+    // Bring up the data plane. Creating a real TUN device needs root; --no-tun
+    // runs a headless node (IPC + discovery only) without it.
+    let tun: Box<dyn lattice_tun::TunDevice> = if args.no_tun {
+        tracing::warn!("--no-tun: headless mode, no packet forwarding");
+        Box::new(lattice_tun::NullTun)
+    } else {
+        lattice_tun::open(TunConfig {
+            address: virtual_ip,
+            prefix_len: OVERLAY_SUBNET.1,
+            mtu: 1380,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open TUN device (need sudo?): {e}"))?
+    };
 
     let transport = UdpTransport::bind(args.bind.parse()?).await?;
     let udp_addr = transport.local_addr()?;
