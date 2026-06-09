@@ -17,7 +17,8 @@
       "targets": "all",
       "category": "Utility",
       "shortDescription": "Serverless mesh VPN",
-      "longDescription": "Fuse every installed node into one private overlay network."
+      "longDescription": "Fuse every installed node into one private overlay network.",
+      "resources": ["resources/lattice-daemon"]
     },
     "windows": [
       {

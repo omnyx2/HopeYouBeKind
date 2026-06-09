@@ -38,6 +38,40 @@ h2 { font-size: 15px; margin: 0 0 12px; }
 }
 .pill.off { background: var(--off); }
 .pill.on { background: var(--ok); color: #06281d; }
+.pill.warn { background: #d9a23a; color: #2a1d05; }
+
+.hidden { display: none !important; }
+.hint { color: var(--muted); font-size: 12px; margin: 10px 0 0; line-height: 1.4; }
+
+.copy { cursor: pointer; }
+.copy:hover { color: var(--accent); text-decoration: underline; }
+
+/* toggle switch */
+.switch { position: relative; display: inline-block; width: 42px; height: 24px; }
+.switch input { display: none; }
+.slider {
+  position: absolute; inset: 0; cursor: pointer;
+  background: var(--off); border-radius: 999px; transition: 0.2s;
+}
+.slider::before {
+  content: ""; position: absolute; height: 18px; width: 18px;
+  left: 3px; top: 3px; background: white; border-radius: 50%; transition: 0.2s;
+}
+.switch input:checked + .slider { background: var(--ok); }
+.switch input:checked + .slider::before { transform: translateX(18px); }
+
+button.secondary {
+  width: 100%; margin-top: 14px; padding: 10px; border: 1px solid #3a3f4d;
+  border-radius: 10px; background: transparent; color: var(--text);
+  font-size: 14px; cursor: pointer;
+}
+button.secondary:hover { border-color: var(--off); }
+
+.toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  background: #2a2e3a; color: var(--text); padding: 10px 16px;
+  border-radius: 10px; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+}
 
 .card {
   background: var(--card);

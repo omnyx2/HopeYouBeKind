@@ -77,13 +77,69 @@ async fn send(req: Request) -> Result<(), String> {
     }
 }
 
+/// Start the bundled daemon as root via the macOS admin prompt. Creating the TUN
+/// device requires privileges; this is the one moment the user authenticates.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn start_daemon(app: tauri::AppHandle) -> Result<(), String> {
+    let daemon = app
+        .path_resolver()
+        .resolve_resource("resources/lattice-daemon")
+        .ok_or("bundled daemon not found")?;
+    let path = daemon.to_string_lossy().to_string();
+    if path.contains('\'') {
+        return Err("daemon path contains an unsupported character".into());
+    }
+    // Run detached, logging to /tmp, with administrator privileges.
+    let script = format!(
+        "do shell script \"'{path}' > /tmp/lattice-daemon.log 2>&1 &\" with administrator privileges"
+    );
+    let status = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("authentication cancelled or failed".into())
+    }
+}
+
+/// Stop the daemon (needs admin since it runs as root).
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn stop_daemon() -> Result<(), String> {
+    let script =
+        "do shell script \"pkill -x lattice-daemon\" with administrator privileges".to_string();
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .status();
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn start_daemon(_app: tauri::AppHandle) -> Result<(), String> {
+    Err("GUI daemon control is implemented for macOS; on Linux run `sudo lattice-daemon`".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn stop_daemon() -> Result<(), String> {
+    Err("GUI daemon control is implemented for macOS".into())
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_status,
             list_peers,
             mesh_up,
-            mesh_down
+            mesh_down,
+            start_daemon,
+            stop_daemon
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");

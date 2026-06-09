@@ -10,26 +10,45 @@
     <main class="app">
       <header>
         <h1>Lattice</h1>
-        <span id="state-pill" class="pill off">offline</span>
+        <span id="state-pill" class="pill off">stopped</span>
       </header>
 
-      <section class="card">
+      <!-- When the daemon is stopped -->
+      <section id="stopped-card" class="card">
+        <p class="muted">The node service is not running.</p>
+        <button id="start" class="primary">Start node</button>
+        <p id="start-hint" class="hint">You'll be asked for your password — the
+          node needs admin rights to create the virtual network interface.</p>
+      </section>
+
+      <!-- When the daemon is running -->
+      <section id="running-card" class="card hidden">
         <div class="row">
           <span class="label">Your virtual IP</span>
-          <span id="virtual-ip" class="mono">—</span>
+          <span id="virtual-ip" class="mono copy" title="Click to copy">—</span>
         </div>
         <div class="row">
           <span class="label">Node fingerprint</span>
           <span id="fingerprint" class="mono">—</span>
         </div>
-        <button id="toggle" class="primary">Connect mesh</button>
+        <div class="row">
+          <span class="label">Mesh</span>
+          <label class="switch">
+            <input type="checkbox" id="mesh-toggle" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <button id="stop" class="secondary">Stop node</button>
       </section>
 
-      <section class="card">
+      <section id="peers-card" class="card hidden">
         <h2>Peers <span id="peer-count" class="muted">(0)</span></h2>
         <ul id="peers" class="peers"></ul>
+        <p class="hint">Click a peer's IP to copy it — then use it like any
+          address (ssh, http://&lt;ip&gt;:port, …).</p>
       </section>
     </main>
+    <div id="toast" class="toast hidden"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
