@@ -15,8 +15,9 @@ tauri-build = { version = "1.5", features = [] }
 tauri = { version = "1.6", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Reuse the shared types so the GUI and daemon speak the same vocabulary.
+# Reuse the shared types and IPC client so the GUI talks to the daemon directly.
 lattice-proto = { path = "../../crates/proto" }
+lattice-ipc = { path = "../../crates/ipc" }
 
 [features]
 # Production builds use the bundled assets; dev uses the Vite server.

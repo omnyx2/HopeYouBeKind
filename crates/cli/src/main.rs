@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use lattice_proto::ipc::Request;
+use lattice_proto::ipc::{Request, Response};
 
 /// Control the Lattice mesh from the terminal.
 #[derive(Parser, Debug)]
@@ -45,10 +45,36 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let request = cli.command.to_request();
 
-    // TODO(v0.4): connect to `cli.ipc_socket`, send `request` as JSON, await the
-    // Response, and pretty-print it. Until the daemon's IPC server exists we
-    // just show what would be sent.
-    let wire = serde_json::to_string(&request)?;
-    println!("→ {} (would send to {})", wire, cli.ipc_socket);
+    let response = lattice_ipc::request(&cli.ipc_socket, request)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not reach daemon at {}: {e}", cli.ipc_socket))?;
+
+    print_response(response);
     Ok(())
+}
+
+fn print_response(response: Response) {
+    match response {
+        Response::Status(s) => {
+            println!("node      {}", s.id.fingerprint());
+            println!(
+                "virtual   {}",
+                s.virtual_ip
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into())
+            );
+            println!("mesh      {}", if s.running { "up" } else { "down" });
+            println!("peers     {}", s.peer_count);
+        }
+        Response::Peers(peers) => {
+            if peers.is_empty() {
+                println!("no peers yet");
+            }
+            for p in peers {
+                println!("{}  {}  {:?}", p.id.fingerprint(), p.virtual_ip, p.status);
+            }
+        }
+        Response::Done => println!("ok"),
+        Response::Error { message } => eprintln!("error: {message}"),
+    }
 }

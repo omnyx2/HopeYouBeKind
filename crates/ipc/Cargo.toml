@@ -1,0 +1,12 @@
+[package]
+name = "lattice-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local IPC between the Lattice daemon and its GUI/CLI clients."
+
+[dependencies]
+lattice-proto.workspace = true
+tokio = { workspace = true }
+serde_json.workspace = true

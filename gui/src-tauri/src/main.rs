@@ -9,7 +9,11 @@
     windows_subsystem = "windows"
 )]
 
+use lattice_proto::ipc::{Request, Response};
 use serde::Serialize;
+
+/// Where the daemon listens. (Configurable via the GUI settings in a later pass.)
+const SOCKET: &str = "/tmp/lattice.sock";
 
 #[derive(Serialize)]
 struct StatusView {
@@ -26,29 +30,51 @@ struct PeerView {
 }
 
 #[tauri::command]
-fn get_status() -> StatusView {
-    // TODO(v0.4): send ipc::Request::Status to the daemon and map the response.
-    StatusView {
-        running: false,
-        virtual_ip: None,
-        fingerprint: "00000000".into(),
+async fn get_status() -> Result<StatusView, String> {
+    match lattice_ipc::request(SOCKET, Request::Status).await {
+        Ok(Response::Status(s)) => Ok(StatusView {
+            running: s.running,
+            virtual_ip: s.virtual_ip.map(|v| v.to_string()),
+            fingerprint: s.id.fingerprint(),
+        }),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
 #[tauri::command]
-fn list_peers() -> Vec<PeerView> {
-    // TODO(v0.4): send ipc::Request::Peers to the daemon.
-    Vec::new()
+async fn list_peers() -> Result<Vec<PeerView>, String> {
+    match lattice_ipc::request(SOCKET, Request::Peers).await {
+        Ok(Response::Peers(peers)) => Ok(peers
+            .into_iter()
+            .map(|p| PeerView {
+                virtual_ip: p.virtual_ip.to_string(),
+                fingerprint: p.id.fingerprint(),
+                status: format!("{:?}", p.status).to_lowercase(),
+            })
+            .collect()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[tauri::command]
-fn mesh_up() {
-    // TODO(v0.4): send ipc::Request::Up to the daemon.
+async fn mesh_up() -> Result<(), String> {
+    send(Request::Up).await
 }
 
 #[tauri::command]
-fn mesh_down() {
-    // TODO(v0.4): send ipc::Request::Down to the daemon.
+async fn mesh_down() -> Result<(), String> {
+    send(Request::Down).await
+}
+
+async fn send(req: Request) -> Result<(), String> {
+    match lattice_ipc::request(SOCKET, req).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn main() {

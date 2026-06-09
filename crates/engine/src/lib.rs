@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use lattice_crypto::{respond, Handshake, Identity, NoiseSession, TunnelSession};
@@ -65,7 +66,10 @@ pub struct Engine {
     /// Initiator handshakes awaiting a response, keyed by the peer's endpoint.
     pending: HashMap<SocketAddr, Handshake>,
     config: EngineConfig,
-    running: bool,
+    /// Whether the engine loop is live (set while `run` is executing).
+    running: Arc<AtomicBool>,
+    /// Whether the mesh is administratively up (toggled via the IPC `up`/`down`).
+    enabled: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -79,7 +83,8 @@ impl Engine {
             sessions: HashMap::new(),
             pending: HashMap::new(),
             config,
-            running: false,
+            running: Arc::new(AtomicBool::new(false)),
+            enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -91,14 +96,21 @@ impl Engine {
         &self.config
     }
 
+    /// A cloneable handle for reading status and issuing control commands while
+    /// the engine runs in its own task — used by the daemon's IPC server.
+    pub fn handle(&self) -> EngineHandle {
+        EngineHandle {
+            node_id: self.identity.node_id(),
+            virtual_ip: self.virtual_ip,
+            overlay: Arc::clone(&self.overlay),
+            running: Arc::clone(&self.running),
+            enabled: Arc::clone(&self.enabled),
+        }
+    }
+
     /// A snapshot for the GUI/CLI dashboard.
     pub async fn status(&self) -> NodeStatus {
-        NodeStatus {
-            id: self.identity.node_id(),
-            virtual_ip: Some(self.virtual_ip),
-            running: self.running,
-            peer_count: self.overlay.lock().await.peer_count(),
-        }
+        self.handle().status().await
     }
 
     /// Drive the node until the TUN device or transport closes.
@@ -113,7 +125,7 @@ impl Engine {
         X: Transport,
         D: Discovery,
     {
-        self.running = true;
+        self.running.store(true, Ordering::Relaxed);
         tracing::info!(virtual_ip = %self.virtual_ip, "engine started");
 
         let mut discovery_done = false;
@@ -155,7 +167,7 @@ impl Engine {
             }
         }
 
-        self.running = false;
+        self.running.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -201,6 +213,9 @@ impl Engine {
         let Some(dst) = ipv4_dst(packet) else {
             return Ok(()); // not IPv4 / too short — ignore for now
         };
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Ok(()); // mesh administratively down
+        }
         let endpoint = {
             let overlay = self.overlay.lock().await;
             match overlay.route(&dst) {
@@ -288,6 +303,40 @@ impl Engine {
             .peers()
             .find(|p| p.endpoints.first() == Some(&endpoint))
             .map(|p| p.id)
+    }
+}
+
+/// A cloneable, read/command handle to a running [`Engine`]. The daemon hands
+/// these to its IPC server so the GUI/CLI can query status and toggle the mesh
+/// while the engine loop runs in its own task.
+#[derive(Clone)]
+pub struct EngineHandle {
+    node_id: NodeId,
+    virtual_ip: VirtualIp,
+    overlay: Arc<Mutex<Overlay>>,
+    running: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl EngineHandle {
+    pub async fn status(&self) -> NodeStatus {
+        let up = self.running.load(Ordering::Relaxed) && self.enabled.load(Ordering::Relaxed);
+        NodeStatus {
+            id: self.node_id,
+            virtual_ip: Some(self.virtual_ip),
+            running: up,
+            peer_count: self.overlay.lock().await.peer_count(),
+        }
+    }
+
+    pub async fn peers(&self) -> Vec<PeerInfo> {
+        self.overlay.lock().await.peers().cloned().collect()
+    }
+
+    /// Bring the mesh up (`true`) or down (`false`). When down, the engine keeps
+    /// running but stops forwarding overlay packets.
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
     }
 }
 

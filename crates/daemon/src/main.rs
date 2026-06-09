@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
     // TODO(v0.4): load a persisted identity from disk; generate on first run.
     let identity = Identity::generate()?;
     let node_id = identity.node_id();
+    let public_key = identity.public_key().to_vec();
 
     let config = EngineConfig {
         bind_addr: args.bind.parse()?,
@@ -66,17 +67,44 @@ async fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("failed to open TUN device (need sudo?): {e}"))?;
 
     let transport = UdpTransport::bind(args.bind.parse()?).await?;
-    tracing::info!(udp = %transport.local_addr()?, "transport bound");
+    let udp_addr = transport.local_addr()?;
+    tracing::info!(udp = %udp_addr, "transport bound");
 
-    // mDNS LAN discovery (browse/resolve lands in v0.3; until then no peers
-    // are surfaced and the node simply holds the interface up).
-    let discovery = MdnsDiscovery::new()?;
+    // Serverless LAN discovery: advertise ourselves and browse for peers over
+    // mDNS. Discovered peers trigger an automatic handshake in the engine.
+    let discovery = MdnsDiscovery::new(&public_key, udp_addr.port())?;
 
-    // TODO(v0.4): also bind the IPC listener so the GUI/CLI can drive this node.
+    // IPC server lets the GUI/CLI query status and toggle the mesh while the
+    // engine runs. The handler captures a cloneable handle to the engine.
+    let ipc_handle = engine.handle();
+    let ipc = lattice_ipc::serve(&args.ipc_socket, move |req| {
+        let handle = ipc_handle.clone();
+        async move {
+            use lattice_proto::ipc::{Request, Response};
+            match req {
+                Request::Status => Response::Status(handle.status().await),
+                Request::Peers => Response::Peers(handle.peers().await),
+                Request::Up => {
+                    handle.set_enabled(true);
+                    Response::Done
+                }
+                Request::Down => {
+                    handle.set_enabled(false);
+                    Response::Done
+                }
+            }
+        }
+    });
+    tracing::info!(ipc = %args.ipc_socket, "IPC server listening");
+
     tokio::select! {
         result = engine.run(tun, transport, discovery) => {
             result?;
             tracing::info!("engine loop ended");
+        }
+        result = ipc => {
+            result?;
+            tracing::info!("ipc server ended");
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");

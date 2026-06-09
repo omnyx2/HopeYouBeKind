@@ -430,8 +430,8 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "lattice-ipc",
  "lattice-proto",
- "serde_json",
  "tokio",
 ]
 
@@ -454,6 +454,7 @@ dependencies = [
  "clap",
  "lattice-crypto",
  "lattice-engine",
+ "lattice-ipc",
  "lattice-net",
  "lattice-proto",
  "lattice-tun",
@@ -475,6 +476,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "lattice-ipc"
+version = "0.2.0"
+dependencies = [
+ "lattice-proto",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
