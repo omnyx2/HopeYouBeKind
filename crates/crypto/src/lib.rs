@@ -11,8 +11,14 @@
 use lattice_proto::NodeId;
 use zeroize::Zeroize;
 
+pub mod cookie;
+pub mod rekey;
+pub mod replay;
 pub mod session;
 
+pub use cookie::CookieMaker;
+pub use rekey::RekeyPolicy;
+pub use replay::ReplayWindow;
 pub use session::{respond, Handshake, NoiseSession, PendingHandshake};
 
 /// The Noise pattern + primitive suite LTP uses. Mirrors WireGuard's choices

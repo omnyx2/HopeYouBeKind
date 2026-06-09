@@ -14,29 +14,32 @@ SemVer; everything pre-`1.0` may break the wire protocol between minor versions.
 - `daemon` wires the real data plane together (runs under `sudo`).
 - **Live demo (manual, needs sudo):** see "Running the live tunnel" below.
 
-## v0.3 — Two hosts on a LAN ◀ (current)
+## v0.3 — Two hosts on a LAN ✅
 - `net` real UDP transport + mDNS discovery (`_lattice._udp.local`).
 - `overlay` peer registry + key-derived virtual IP allocation.
 - **Demo:** two laptops on the same Wi-Fi auto-discover and ping over the mesh.
 
-## v0.4 — Daemon + CLI + GUI MVP
+## v0.4 — Daemon + CLI + GUI MVP ✅ (GUI packaging pending)
 - `daemon` hosts the engine, exposes IPC; `cli status/up/down/peers`.
-- Tauri GUI: node on/off, peer list with live status, copyable virtual IP.
-- macOS packaging (`.app` + notarization path documented).
+- `lattice-ipc` (newline-JSON / Unix socket); GUI Tauri commands call the daemon.
+- *Remaining:* macOS `.app` packaging + notarization; Windows named-pipe IPC.
 
-## v0.5 — Cross-platform data plane
-- `tun` for **Linux** (`/dev/net/tun`) and **Windows** (Wintun).
-- CI build matrix produces installers for all three.
+## v0.5 — Cross-platform data plane ✅
+- `tun` for **Linux** (`/dev/net/tun`) and **Windows** (Wintun). Whole workspace
+  cross-compiles for macOS / Linux / Windows.
+- *Remaining:* CI produces packaged installers (binaries build today).
 
-## v0.6 — Internet-wide serverless mesh
-- Kademlia **DHT** rendezvous (no coordination server).
-- **NAT traversal:** STUN-style reflexive discovery + UDP hole punching.
-- Fallback relay (DERP-like) only when hole-punching fails — still serverless,
-  any node can volunteer as a relay.
+## v0.6 — Internet-wide serverless mesh ✅ (core) / DHT pending
+- **NAT traversal:** STUN reflexive discovery + UDP hole punching across all
+  candidate endpoints. ✅
+- *Remaining:* Kademlia **DHT** rendezvous (the `Rendezvous` trait is defined)
+  and DERP-like fallback relay.
 
-## v0.7 — Hardening
-- Replay window, rekeying parameters, handshake-flood cookies (see PROTOCOL.md).
-- Fuzzing of `proto`/`crypto` parsers; `cargo-deny` + audit gates in CI.
+## v0.7 — Hardening ✅ (components) ◀ (current)
+- Replay window, rekey policy (wired into sessions), stateless handshake cookie,
+  fuzz targets for the parsers. `cargo-deny` gates in CI.
+- *Remaining:* bind the replay counter to the AEAD nonce (needs the move off
+  snow's in-order transport); wire the cookie into the responder's flood path.
 
 ## v1.0 — Stable
 - Frozen wire protocol with a version negotiation byte.

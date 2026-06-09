@@ -10,9 +10,11 @@ Install the app on any set of machines and they self-assemble into a single,
 private, encrypted network — as if they were all plugged into the same switch,
 no matter where they physically are. No central server to run, no accounts.
 
-> **Status:** `0.1.0` — early scaffold. The architecture and module boundaries
-> are in place; data-plane and control-plane internals are being filled in.
-> See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> **Status:** `0.7.0` — working serverless mesh. Real Noise-IK tunnel, mDNS LAN
+> discovery, NAT hole punching, daemon/CLI/GUI control plane, cross-platform TUN
+> (macOS/Linux/Windows), and hardening components (replay window, rekey, cookie).
+> Remaining infra (DHT rendezvous, GUI packaging, AEAD-bound replay) is tracked
+> in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## What it is
 
@@ -79,6 +81,7 @@ GUI setup lives in [`gui/README.md`](gui/README.md).
 | `crates/net`        | UDP transport, NAT traversal, mDNS/DHT peer discovery   |
 | `crates/overlay`    | SDN control plane: virtual-IP allocation, routing table |
 | `crates/engine`     | Node runtime that wires the planes together             |
+| `crates/ipc`        | Local daemon⇄GUI/CLI control protocol (Unix socket)     |
 | `crates/daemon`     | Privileged background service + IPC server              |
 | `crates/cli`        | Terminal control client                                 |
 | `gui/`              | Tauri desktop application                                |

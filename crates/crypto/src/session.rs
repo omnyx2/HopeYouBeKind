@@ -20,6 +20,9 @@
 //! counter + sliding replay window from PROTOCOL.md is layered on in v0.7, when
 //! we move to lossy/reordering UDP paths.
 
+use std::time::Duration;
+
+use crate::rekey::RekeyPolicy;
 use crate::{CryptoError, TunnelSession, NOISE_PARAMS};
 
 fn params() -> snow::params::NoiseParams {
@@ -63,7 +66,7 @@ impl Handshake {
         let mut scratch = vec![0u8; 1024];
         self.state.read_message(response, &mut scratch)?;
         let transport = self.state.into_transport_mode()?;
-        Ok(NoiseSession { transport })
+        Ok(NoiseSession::new(transport))
     }
 }
 
@@ -89,16 +92,33 @@ pub fn respond(local_private: &[u8], init: &[u8]) -> Result<PendingHandshake, Cr
 
     let transport = state.into_transport_mode()?;
     Ok(PendingHandshake {
-        session: NoiseSession { transport },
+        session: NoiseSession::new(transport),
         response,
         remote_static,
     })
 }
 
 /// A live, authenticated tunnel: AEAD-seals outbound packets and opens inbound
-/// ones with ChaCha20-Poly1305, keys established by the handshake.
+/// ones with ChaCha20-Poly1305, keys established by the handshake. Tracks usage
+/// so the engine can renegotiate per the [`RekeyPolicy`].
 pub struct NoiseSession {
     transport: snow::TransportState,
+    rekey: RekeyPolicy,
+}
+
+impl NoiseSession {
+    fn new(transport: snow::TransportState) -> Self {
+        Self {
+            transport,
+            rekey: RekeyPolicy::default(),
+        }
+    }
+
+    /// Whether this session should be renegotiated, given how long it has lived.
+    /// The caller owns the clock (tracks the session's creation time).
+    pub fn rekey_due(&self, age: Duration) -> bool {
+        self.rekey.due(age)
+    }
 }
 
 impl TunnelSession for NoiseSession {
@@ -107,6 +127,7 @@ impl TunnelSession for NoiseSession {
         let mut out = vec![0u8; plaintext.len() + 16];
         let n = self.transport.write_message(plaintext, &mut out)?;
         out.truncate(n);
+        self.rekey.record();
         Ok(out)
     }
 

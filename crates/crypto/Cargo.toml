@@ -11,4 +11,5 @@ lattice-proto.workspace = true
 snow.workspace = true
 rand.workspace = true
 zeroize.workspace = true
+blake2.workspace = true
 thiserror.workspace = true

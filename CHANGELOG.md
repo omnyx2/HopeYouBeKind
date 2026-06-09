@@ -10,6 +10,38 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-06-09
+
+### Added — v0.7 hardening
+- **Replay window** (`lattice-crypto::replay`): sliding-window anti-replay over a
+  monotonic packet counter (accept-once, reject duplicates/too-old, allow
+  in-window reorder).
+- **Rekey policy** (`lattice-crypto::rekey`): rekey after a message ceiling or
+  max age; wired into `NoiseSession` (`rekey_due`).
+- **Stateless handshake cookie** (`lattice-crypto::cookie`): BLAKE2s-keyed MAC
+  bound to the initiator's address for handshake-flood mitigation.
+- **Fuzz targets** (`fuzz/`): libfuzzer harnesses for the datagram and STUN
+  parsers.
+
+### Added — v0.6 NAT traversal
+- `lattice-net::nat`: RFC 5389 STUN binding codec, `reflexive_address()`, and
+  `punch()`. Engine hole-punches across all candidate endpoints and routes via
+  the winning session; daemon logs its STUN public address. `Rendezvous` trait
+  scopes the remaining serverless-DHT work.
+
+### Added — v0.5 cross-platform data plane
+- Real Linux `/dev/net/tun` and Windows Wintun TUN devices. Workspace
+  cross-compiles for macOS, Linux, and Windows.
+
+### Added — v0.4 control plane
+- `lattice-ipc` crate (newline-JSON over a Unix socket); daemon IPC server backed
+  by a cloneable `EngineHandle`; CLI speaks real IPC; GUI commands call the
+  daemon. Mesh up/down is a live toggle.
+
+### Added — v0.3 LAN discovery
+- Real mDNS advertise + browse in `lattice-net` (`_lattice._udp.local`),
+  surfacing peers to the engine's auto-handshake.
+
 ## [0.2.0] — 2026-06-09
 
 ### Added
@@ -39,6 +71,7 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 ### Added
 - Project scaffold and module skeletons.
 
-[Unreleased]: https://github.com/your-org/lattice/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/your-org/lattice/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/your-org/lattice/compare/v0.2.0...v0.7.0
 [0.2.0]: https://github.com/your-org/lattice/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/your-org/lattice/releases/tag/v0.1.0
