@@ -25,6 +25,14 @@ where
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
 
+    // The daemon usually runs as root (to create the TUN device), which would
+    // otherwise leave the socket root-only. Loosen it so the unprivileged CLI
+    // and GUI can connect without sudo.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666));
+    }
+
     loop {
         let (stream, _addr) = listener.accept().await?;
         let handler = handler.clone();
