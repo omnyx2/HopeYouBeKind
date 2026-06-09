@@ -91,6 +91,15 @@ impl Kademlia {
         }
     }
 
+    /// Build a participant that shares an existing node state with a server loop
+    /// (so requests it serves and lookups it issues see the same routing table).
+    pub fn with_shared(
+        node: Arc<Mutex<KademliaNode>>,
+        transport: Arc<dyn KademliaTransport>,
+    ) -> Self {
+        Self { node, transport }
+    }
+
     /// Share the underlying node so a server loop can `handle` incoming requests
     /// against the same state the lookups use.
     pub fn node(&self) -> Arc<Mutex<KademliaNode>> {
@@ -112,6 +121,20 @@ impl Kademlia {
 
     pub fn id(&self) -> Key {
         self.node.lock().unwrap().id()
+    }
+
+    /// Bootstrap from addresses alone (no node ids known yet): ping each so the
+    /// transport learns their real contact, then self-lookup to fill buckets.
+    /// Use when joining via public bootstrap nodes.
+    pub async fn bootstrap_addrs(&self, addrs: &[SocketAddr]) {
+        for &addr in addrs {
+            // A placeholder id is fine: we send to the address, and the response
+            // teaches us the responder's real id (see DhtNode's serve loop).
+            let probe = Contact::new([0u8; 32], addr);
+            let _ = self.transport.query(&probe, Message::Ping).await;
+        }
+        let id = self.id();
+        let _ = self.iterative(&id, false).await;
     }
 
     /// The core Kademlia node lookup. Queries progressively closer nodes until it

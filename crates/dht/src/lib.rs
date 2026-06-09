@@ -14,11 +14,13 @@ pub mod distance;
 pub mod node;
 pub mod routing;
 pub mod rpc;
+pub mod server;
 
 pub use distance::Key;
 pub use node::{Kademlia, KademliaNode, KademliaTransport, ALPHA};
 pub use routing::{Contact, RoutingTable, K};
 pub use rpc::Message;
+pub use server::DhtNode;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -14,8 +14,20 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 - **`lattice-dht`**: a Kademlia DHT for serverless peer rendezvous — XOR distance
   metric, k-bucket routing table, iterative node/value lookup, and a
   `Rendezvous` impl (publish candidates to the k closest nodes; look them up by
-  node id). Verified by a 40-node in-memory simulated network. UDP transport
-  included; daemon wiring (server loop + bootstrap) is the remaining step.
+  node id). Verified by a 40-node in-memory simulated network.
+- **`DhtNode`**: a real UDP DHT server with a request-id-demuxing transport
+  (background serve loop + matched query replies). Verified with 3 nodes over
+  localhost UDP.
+- **Daemon DHT wiring**: `--dht-bind`, `--dht-bootstrap`, and `--peer <hex-id>`.
+  The daemon runs a DHT node, publishes its STUN candidate under its node id, and
+  resolves `--peer` ids via the DHT, feeding endpoints to the engine through a
+  merged `ChannelDiscovery` (mDNS + DHT). Verified live (binds, publishes).
+- **`--no-tun`** headless daemon mode (control plane without root) and
+  `ChannelDiscovery` for merging discovery sources.
+
+### Fixed
+- IPC `Response` now uses adjacent serde tagging so the `Peers(Vec)` payload
+  serializes (internal tagging cannot tag a sequence); regression test added.
 
 ## [0.7.0] — 2026-06-09
 

@@ -16,6 +16,7 @@ lattice-crypto.workspace = true
 lattice-tun.workspace = true
 lattice-net.workspace = true
 lattice-engine.workspace = true
+lattice-dht.workspace = true
 lattice-ipc.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true

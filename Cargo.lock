@@ -483,6 +483,7 @@ dependencies = [
  "anyhow",
  "clap",
  "lattice-crypto",
+ "lattice-dht",
  "lattice-engine",
  "lattice-ipc",
  "lattice-net",

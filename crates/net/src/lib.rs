@@ -217,6 +217,27 @@ pub mod discovery {
         }
     }
 
+    /// A discovery source fed from a channel. Lets the daemon merge several
+    /// sources — mDNS on the LAN, DHT lookups across the internet — into the one
+    /// stream the engine consumes.
+    pub struct ChannelDiscovery {
+        rx: mpsc::Receiver<DiscoveredPeer>,
+    }
+
+    impl ChannelDiscovery {
+        pub fn new() -> (mpsc::Sender<DiscoveredPeer>, Self) {
+            let (tx, rx) = mpsc::channel(64);
+            (tx, Self { rx })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Discovery for ChannelDiscovery {
+        async fn next_peer(&mut self) -> Option<DiscoveredPeer> {
+            self.rx.recv().await
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;

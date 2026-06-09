@@ -5,15 +5,23 @@
 //! Privileges are needed to create the virtual interface; everything user-facing
 //! talks to this process instead of touching the network directly.
 
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 use lattice_crypto::Identity;
+use lattice_dht::{DhtNode, Kademlia, KademliaNode};
 use lattice_engine::{Engine, EngineConfig};
-use lattice_net::discovery::MdnsDiscovery;
+use lattice_net::discovery::{ChannelDiscovery, MdnsDiscovery};
+use lattice_net::nat::Rendezvous;
 use lattice_net::udp::UdpTransport;
-use lattice_net::Transport;
-use lattice_proto::OVERLAY_SUBNET;
+use lattice_net::{DiscoveredPeer, Discovery, Transport};
+use lattice_proto::{NodeId, OVERLAY_SUBNET};
 use lattice_tun::TunConfig;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 /// Lattice background service.
 #[derive(Parser, Debug)]
@@ -31,6 +39,20 @@ struct Args {
     /// packet forwarding. Lets the daemon run unprivileged (no root needed).
     #[arg(long)]
     no_tun: bool,
+
+    /// Enable the Kademlia DHT for serverless internet-wide rendezvous, bound to
+    /// this UDP address (e.g. `0.0.0.0:0`). Off by default.
+    #[arg(long)]
+    dht_bind: Option<String>,
+
+    /// DHT bootstrap node addresses to join the network through (repeatable).
+    #[arg(long)]
+    dht_bootstrap: Vec<String>,
+
+    /// Node ids (64-hex) of peers to resolve via the DHT and connect to
+    /// (repeatable). Their candidate addresses are looked up and fed to the engine.
+    #[arg(long)]
+    peer: Vec<String>,
 }
 
 #[tokio::main]
@@ -84,18 +106,52 @@ async fn main() -> Result<()> {
     let udp_addr = transport.local_addr()?;
     tracing::info!(udp = %udp_addr, "transport bound");
 
-    // Best-effort: learn our public (reflexive) address via STUN. Used as a
-    // WAN candidate for NAT hole punching. (Distributing it to peers without a
-    // server — the DHT rendezvous — is the remaining v0.6 work; today this is
-    // informational + available for manual peer pinning.)
-    match lattice_net::nat::reflexive_address("stun.l.google.com:19302").await {
-        Ok(public) => tracing::info!(%public, "public address (STUN)"),
-        Err(e) => tracing::debug!(error = %e, "STUN lookup failed (LAN-only or offline)"),
-    }
+    // Best-effort: learn our public (reflexive) address via STUN — a WAN
+    // candidate we publish to the DHT for NAT hole punching.
+    let reflexive: Option<SocketAddr> =
+        match lattice_net::nat::reflexive_address("stun.l.google.com:19302").await {
+            Ok(public) => {
+                tracing::info!(%public, "public address (STUN)");
+                Some(public)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "STUN lookup failed (LAN-only or offline)");
+                None
+            }
+        };
+
+    // All discovery sources feed one channel the engine consumes.
+    let (disc_tx, discovery) = ChannelDiscovery::new();
 
     // Serverless LAN discovery: advertise ourselves and browse for peers over
-    // mDNS. Discovered peers trigger an automatic handshake in the engine.
-    let discovery = MdnsDiscovery::new(&public_key, udp_addr.port())?;
+    // mDNS, forwarding each into the merged stream.
+    let mut mdns = MdnsDiscovery::new(&public_key, udp_addr.port())?;
+    {
+        let tx = disc_tx.clone();
+        tokio::spawn(async move {
+            while let Some(peer) = mdns.next_peer().await {
+                if tx.send(peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Optional: Kademlia DHT rendezvous for internet-wide peer resolution.
+    if let Some(dht_bind) = args.dht_bind.clone() {
+        if let Err(e) = start_dht(
+            dht_bind,
+            args.dht_bootstrap.clone(),
+            args.peer.clone(),
+            node_id,
+            reflexive,
+            disc_tx.clone(),
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "DHT setup failed");
+        }
+    }
 
     // IPC server lets the GUI/CLI query status and toggle the mesh while the
     // engine runs. The handler captures a cloneable handle to the engine.
@@ -134,4 +190,81 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bring up a Kademlia DHT node: join via bootstrap addresses, publish our
+/// candidate addresses under our node id, and resolve each `--peer` id (feeding
+/// the discovered endpoints to the engine for handshaking).
+async fn start_dht(
+    bind: String,
+    bootstrap: Vec<String>,
+    peers: Vec<String>,
+    node_id: NodeId,
+    reflexive: Option<SocketAddr>,
+    disc_tx: mpsc::Sender<DiscoveredPeer>,
+) -> Result<()> {
+    let socket = Arc::new(UdpSocket::bind(&bind).await?);
+    let local = socket.local_addr()?;
+    let kad_id = node_id.0;
+
+    let node = Arc::new(Mutex::new(KademliaNode::new(kad_id)));
+    let dht = DhtNode::new(socket, Arc::clone(&node));
+    dht.spawn_server();
+    let kad = Arc::new(Kademlia::with_shared(node, dht));
+    tracing::info!(dht = %local, node = %node_id.fingerprint(), "DHT node listening");
+
+    // Join the DHT through any bootstrap nodes.
+    let boots: Vec<SocketAddr> = bootstrap.iter().filter_map(|a| a.parse().ok()).collect();
+    if !boots.is_empty() {
+        kad.bootstrap_addrs(&boots).await;
+        tracing::info!(count = boots.len(), "DHT bootstrapped");
+    }
+
+    // Publish our candidate addresses so peers can find us by node id.
+    if let Some(public) = reflexive {
+        match kad.publish(kad_id, &[public]).await {
+            Ok(()) => tracing::info!(%public, "published candidate to DHT"),
+            Err(e) => tracing::warn!(error = %e, "DHT publish failed"),
+        }
+    }
+
+    // Resolve each requested peer by id and feed its candidates to the engine.
+    for p in peers {
+        let Some(id) = parse_hex_id(&p) else {
+            tracing::warn!(peer = %p, "ignoring invalid peer id (need 64 hex chars)");
+            continue;
+        };
+        let kad = Arc::clone(&kad);
+        let tx = disc_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(addrs) = kad.lookup(id).await {
+                    if !addrs.is_empty() {
+                        tracing::info!(peer = %NodeId(id).fingerprint(), count = addrs.len(), "DHT resolved peer");
+                        let _ = tx
+                            .send(DiscoveredPeer {
+                                id: NodeId(id),
+                                endpoints: addrs,
+                            })
+                            .await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Parse a 64-character hex node id into 32 bytes.
+fn parse_hex_id(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    for (i, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(id)
 }
