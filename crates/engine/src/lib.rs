@@ -198,15 +198,18 @@ impl Engine {
         let private = self.identity.private_key().to_vec();
         // Hole punch: initiate a handshake toward every candidate endpoint at
         // once. The first to answer wins — its NAT binding is the working path.
+        // A single unreachable candidate must not abort the others.
         for &endpoint in &peer.endpoints {
             let (handshake, init_msg) = Handshake::initiate(&private, &public_key)?;
-            self.pending.insert(endpoint, handshake);
-            transport
-                .send_to(
-                    &wire::encode(MessageType::HandshakeInit, &init_msg),
-                    endpoint,
-                )
-                .await?;
+            let frame = wire::encode(MessageType::HandshakeInit, &init_msg);
+            match transport.send_to(&frame, endpoint).await {
+                Ok(()) => {
+                    self.pending.insert(endpoint, handshake);
+                }
+                Err(e) => {
+                    tracing::debug!(%endpoint, error = %e, "candidate unreachable, skipping");
+                }
+            }
         }
         tracing::info!(
             peer = %peer.id.fingerprint(),

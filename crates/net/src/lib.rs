@@ -157,9 +157,13 @@ pub mod discovery {
         id.copy_from_slice(&pk);
 
         let port = info.get_port();
+        // Our transport binds IPv4 (0.0.0.0), so skip IPv6 candidates — sending
+        // to one from an IPv4 socket fails with EINVAL, and link-local fe80::
+        // addresses are unusable without a scope id anyway.
         let endpoints: Vec<SocketAddr> = info
             .get_addresses()
             .iter()
+            .filter(|ip| ip.is_ipv4())
             .map(|ip| SocketAddr::new(*ip, port))
             .collect();
         if endpoints.is_empty() {
