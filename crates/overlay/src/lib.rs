@@ -65,6 +65,13 @@ impl Overlay {
         }
     }
 
+    /// Update a known peer's connection status (no-op if unknown).
+    pub fn set_status(&mut self, id: &NodeId, status: lattice_proto::PeerStatus) {
+        if let Some(p) = self.peers.get_mut(id) {
+            p.status = status;
+        }
+    }
+
     /// Which peer should a packet destined for `dst` be tunneled to?
     pub fn route(&self, dst: &VirtualIp) -> Result<&PeerInfo, OverlayError> {
         let id = self.routes.get(dst).ok_or(OverlayError::NoRoute(*dst))?;

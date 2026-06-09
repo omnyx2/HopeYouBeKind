@@ -8,6 +8,9 @@
 
 use lattice_proto::VirtualIp;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 #[derive(thiserror::Error, Debug)]
 pub enum TunError {
     #[error("tun device closed")]
@@ -47,7 +50,28 @@ pub trait TunDevice: Send {
     async fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunError>;
 }
 
-/// Open the platform-native TUN device. Stubbed until the per-OS impls land.
+/// Lets a boxed trait object be used wherever a `T: TunDevice` is expected
+/// (e.g. the daemon, which opens the device dynamically per OS).
+#[async_trait::async_trait]
+impl TunDevice for Box<dyn TunDevice> {
+    async fn read_packet(&mut self) -> Result<Vec<u8>, TunError> {
+        (**self).read_packet().await
+    }
+    async fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunError> {
+        (**self).write_packet(packet).await
+    }
+}
+
+/// Open the platform-native TUN device. macOS (utun) is implemented; Linux and
+/// Windows land in v0.5 (see ROADMAP).
+#[cfg(target_os = "macos")]
+pub async fn open(config: TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
+    Ok(Box::new(macos::MacTun::open(config).await?))
+}
+
+/// Open the platform-native TUN device. macOS (utun) is implemented; Linux and
+/// Windows land in v0.5 (see ROADMAP).
+#[cfg(not(target_os = "macos"))]
 pub async fn open(_config: TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
     Err(TunError::Unsupported)
 }

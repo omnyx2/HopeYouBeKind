@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 lattice-proto.workspace = true
 lattice-crypto.workspace = true
+lattice-tun.workspace = true
+lattice-net.workspace = true
 lattice-engine.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true

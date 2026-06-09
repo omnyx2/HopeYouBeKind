@@ -4,12 +4,16 @@
 //! rekeying — see `docs/PROTOCOL.md`) on top of *vetted* primitives from the
 //! Noise framework (`snow`). We do not implement ciphers ourselves.
 //!
-//! At this milestone the crate provides node identity (real) and the session
-//! trait + an in-memory passthrough session for testing the engine without
-//! crypto. The Noise handshake lands in v0.2 (see ROADMAP).
+//! The crate provides node identity, the [`TunnelSession`] trait, a real
+//! Noise-IK handshake + session (in [`session`]), and an in-memory passthrough
+//! session for testing the engine without crypto.
 
 use lattice_proto::NodeId;
 use zeroize::Zeroize;
+
+pub mod session;
+
+pub use session::{respond, Handshake, NoiseSession, PendingHandshake};
 
 /// The Noise pattern + primitive suite LTP uses. Mirrors WireGuard's choices
 /// because they are well analyzed: mutual auth, forward secrecy, AEAD.

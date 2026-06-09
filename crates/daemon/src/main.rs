@@ -9,6 +9,11 @@ use anyhow::Result;
 use clap::Parser;
 use lattice_crypto::Identity;
 use lattice_engine::{Engine, EngineConfig};
+use lattice_net::discovery::MdnsDiscovery;
+use lattice_net::udp::UdpTransport;
+use lattice_net::Transport;
+use lattice_proto::OVERLAY_SUBNET;
+use lattice_tun::TunConfig;
 
 /// Lattice background service.
 #[derive(Parser, Debug)]
@@ -41,18 +46,41 @@ async fn main() -> Result<()> {
     let config = EngineConfig {
         bind_addr: args.bind.parse()?,
     };
-    let engine = Engine::new(identity, config);
+    let mut engine = Engine::new(identity, config);
+    let virtual_ip = engine.virtual_ip();
 
     tracing::info!(
         node = %node_id.fingerprint(),
-        virtual_ip = %engine.virtual_ip(),
+        %virtual_ip,
         ipc = %args.ipc_socket,
-        "lattice-daemon ready (engine wiring lands in v0.2)"
+        "lattice-daemon starting"
     );
 
-    // TODO(v0.4): bind the IPC listener, accept clients, and dispatch
-    // lattice_proto::ipc::Request → engine actions. For now, idle until signal.
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutting down");
+    // Bring up the real data plane. Creating the TUN device needs root.
+    let tun = lattice_tun::open(TunConfig {
+        address: virtual_ip,
+        prefix_len: OVERLAY_SUBNET.1,
+        mtu: 1380,
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to open TUN device (need sudo?): {e}"))?;
+
+    let transport = UdpTransport::bind(args.bind.parse()?).await?;
+    tracing::info!(udp = %transport.local_addr()?, "transport bound");
+
+    // mDNS LAN discovery (browse/resolve lands in v0.3; until then no peers
+    // are surfaced and the node simply holds the interface up).
+    let discovery = MdnsDiscovery::new()?;
+
+    // TODO(v0.4): also bind the IPC listener so the GUI/CLI can drive this node.
+    tokio::select! {
+        result = engine.run(tun, transport, discovery) => {
+            result?;
+            tracing::info!("engine loop ended");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down");
+        }
+    }
     Ok(())
 }

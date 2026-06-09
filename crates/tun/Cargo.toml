@@ -13,7 +13,7 @@ thiserror.workspace = true
 tokio = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# real utun impl deps land in v0.2
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # /dev/net/tun impl deps land in v0.5

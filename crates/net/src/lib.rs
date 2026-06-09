@@ -130,6 +130,63 @@ pub mod discovery {
     }
 }
 
+pub mod memory {
+    //! In-memory point-to-point transport for tests: a wired pair where each
+    //! side's `send_to` lands in the other's `recv_from`, stamped with the
+    //! sender's address. Lets the engine's packet loop be tested with no sockets.
+    use super::*;
+    use tokio::sync::{mpsc, Mutex};
+
+    pub struct MemoryTransport {
+        local: SocketAddr,
+        tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+        rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+    }
+
+    /// Create two transports wired to each other.
+    pub fn duplex(a: SocketAddr, b: SocketAddr) -> (MemoryTransport, MemoryTransport) {
+        let (tx_ab, rx_ab) = mpsc::channel(64);
+        let (tx_ba, rx_ba) = mpsc::channel(64);
+        (
+            MemoryTransport {
+                local: a,
+                tx: tx_ab,
+                rx: Mutex::new(rx_ba),
+            },
+            MemoryTransport {
+                local: b,
+                tx: tx_ba,
+                rx: Mutex::new(rx_ab),
+            },
+        )
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MemoryTransport {
+        async fn send_to(&self, data: &[u8], _dest: SocketAddr) -> Result<(), NetError> {
+            // Point-to-point: destination is implicit; stamp our own address so
+            // the receiver knows who sent it.
+            self.tx
+                .send((data.to_vec(), self.local))
+                .await
+                .map_err(|_| NetError::Discovery("memory transport closed".into()))
+        }
+
+        async fn recv_from(&self) -> Result<(Vec<u8>, SocketAddr), NetError> {
+            self.rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| NetError::Discovery("memory transport closed".into()))
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr, NetError> {
+            Ok(self.local)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

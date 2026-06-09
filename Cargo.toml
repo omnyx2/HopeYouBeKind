@@ -23,7 +23,7 @@ members = [
 exclude = ["gui"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.79"
 license = "MIT"
@@ -63,12 +63,12 @@ mdns-sd = "0.11"        # serverless LAN peer discovery
 # pinned Rust 1.79 toolchain does not support. Lift this when we bump the MSRV.
 clap = { version = ">=4.0.0, <4.5.0", features = ["derive"] }
 # --- internal crates (path deps, versions inherited from workspace) ---
-lattice-proto   = { path = "crates/proto", version = "0.1.0" }
-lattice-crypto  = { path = "crates/crypto", version = "0.1.0" }
-lattice-tun     = { path = "crates/tun", version = "0.1.0" }
-lattice-net     = { path = "crates/net", version = "0.1.0" }
-lattice-overlay = { path = "crates/overlay", version = "0.1.0" }
-lattice-engine  = { path = "crates/engine", version = "0.1.0" }
+lattice-proto   = { path = "crates/proto", version = "0.2.0" }
+lattice-crypto  = { path = "crates/crypto", version = "0.2.0" }
+lattice-tun     = { path = "crates/tun", version = "0.2.0" }
+lattice-net     = { path = "crates/net", version = "0.2.0" }
+lattice-overlay = { path = "crates/overlay", version = "0.2.0" }
+lattice-engine  = { path = "crates/engine", version = "0.2.0" }
 
 # Release profile: optimized, but keep thin debug info for crash triage.
 [profile.release]
