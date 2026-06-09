@@ -1,0 +1,11 @@
+[package]
+name = "lattice-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared wire types, message framing, and IPC contract for Lattice."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

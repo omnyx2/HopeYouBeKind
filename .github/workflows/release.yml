@@ -1,0 +1,62 @@
+name: Release
+
+# Tag-driven: push a tag like v0.2.0 to cut a release.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.79.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p lattice-daemon -p lattice-cli
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin_dir="target/${{ matrix.target }}/release"
+          ext=""
+          [[ "${{ matrix.os }}" == "windows-latest" ]] && ext=".exe"
+          for b in lattice-daemon lattice-cli; do
+            cp "$bin_dir/$b$ext" "dist/" || true
+          done
+          tar -czf "lattice-${{ matrix.target }}.tar.gz" -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lattice-${{ matrix.target }}
+          path: lattice-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true

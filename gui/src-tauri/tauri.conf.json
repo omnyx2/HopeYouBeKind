@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/1",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:5173",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Lattice",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "bundle": {
+      "active": true,
+      "identifier": "dev.lattice.app",
+      "targets": "all",
+      "category": "Utility",
+      "shortDescription": "Serverless mesh VPN",
+      "longDescription": "Fuse every installed node into one private overlay network."
+    },
+    "windows": [
+      {
+        "title": "Lattice",
+        "width": 560,
+        "height": 680,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+    },
+    "allowlist": {
+      "all": false
+    }
+  }
+}

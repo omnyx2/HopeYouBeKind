@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lattice</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <h1>Lattice</h1>
+        <span id="state-pill" class="pill off">offline</span>
+      </header>
+
+      <section class="card">
+        <div class="row">
+          <span class="label">Your virtual IP</span>
+          <span id="virtual-ip" class="mono">—</span>
+        </div>
+        <div class="row">
+          <span class="label">Node fingerprint</span>
+          <span id="fingerprint" class="mono">—</span>
+        </div>
+        <button id="toggle" class="primary">Connect mesh</button>
+      </section>
+
+      <section class="card">
+        <h2>Peers <span id="peer-count" class="muted">(0)</span></h2>
+        <ul id="peers" class="peers"></ul>
+      </section>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+[package]
+name = "lattice-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "UDP transport, NAT traversal, and serverless peer discovery for Lattice."
+
+[dependencies]
+lattice-proto.workspace = true
+tokio = { workspace = true }
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+socket2.workspace = true
+mdns-sd.workspace = true

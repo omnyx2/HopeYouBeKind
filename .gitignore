@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# GUI / Node
+gui/node_modules
+gui/dist
+gui/src-tauri/target
+gui/.vite
+
+# Local config, keys, state — NEVER commit secrets or node identity
+*.key
+*.pem
+/state
+*.local.toml
+.env
+.env.*
+
+# Claude Code local overrides
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp

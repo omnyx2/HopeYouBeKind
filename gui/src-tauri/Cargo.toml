@@ -1,0 +1,23 @@
+[package]
+name = "lattice-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT"
+description = "Lattice mesh VPN desktop GUI (Tauri shell)."
+# Intentionally NOT a workspace member (see root Cargo.toml `exclude`): the
+# Tauri/webview toolchain is heavy and built via `cargo tauri`, not `cargo check`.
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.6", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Reuse the shared types so the GUI and daemon speak the same vocabulary.
+lattice-proto = { path = "../../crates/proto" }
+
+[features]
+# Production builds use the bundled assets; dev uses the Vite server.
+custom-protocol = ["tauri/custom-protocol"]

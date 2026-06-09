@@ -1,0 +1,21 @@
+[package]
+name = "lattice-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The privileged Lattice background service that hosts the engine."
+
+[[bin]]
+name = "lattice-daemon"
+path = "src/main.rs"
+
+[dependencies]
+lattice-proto.workspace = true
+lattice-crypto.workspace = true
+lattice-engine.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true

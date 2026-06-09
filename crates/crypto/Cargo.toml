@@ -1,0 +1,14 @@
+[package]
+name = "lattice-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The Lattice Tunnel Protocol: custom handshake/session on Noise primitives."
+
+[dependencies]
+lattice-proto.workspace = true
+snow.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
