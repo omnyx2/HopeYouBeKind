@@ -57,10 +57,10 @@ where
     H: Fn(Request) -> F + Clone + Send + Sync + 'static,
     F: Future<Output = Response> + Send,
 {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "IPC server on this platform lands in v0.5 (named pipes)",
-    ))
+    // Named-pipe IPC for Windows is future work; until then the daemon runs
+    // without a control channel rather than exiting. Park forever.
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 /// Send one request to the daemon and read its response.

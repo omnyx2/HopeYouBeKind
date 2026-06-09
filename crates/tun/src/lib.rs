@@ -11,6 +11,12 @@ use lattice_proto::VirtualIp;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(windows)]
+mod windows;
+
 #[derive(thiserror::Error, Debug)]
 pub enum TunError {
     #[error("tun device closed")]
@@ -62,16 +68,27 @@ impl TunDevice for Box<dyn TunDevice> {
     }
 }
 
-/// Open the platform-native TUN device. macOS (utun) is implemented; Linux and
-/// Windows land in v0.5 (see ROADMAP).
+/// Open the platform-native TUN device. macOS (utun) and Linux (`/dev/net/tun`)
+/// are implemented; Windows (Wintun) is scaffolded (see `src/windows.rs`).
 #[cfg(target_os = "macos")]
 pub async fn open(config: TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
     Ok(Box::new(macos::MacTun::open(config).await?))
 }
 
-/// Open the platform-native TUN device. macOS (utun) is implemented; Linux and
-/// Windows land in v0.5 (see ROADMAP).
-#[cfg(not(target_os = "macos"))]
+/// Open the platform-native TUN device.
+#[cfg(target_os = "linux")]
+pub async fn open(config: TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
+    Ok(Box::new(linux::LinuxTun::open(config).await?))
+}
+
+/// Open the platform-native TUN device (Wintun).
+#[cfg(windows)]
+pub async fn open(config: TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
+    Ok(Box::new(windows::WinTun::open(config).await?))
+}
+
+/// Open the platform-native TUN device.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub async fn open(_config: TunConfig) -> Result<Box<dyn TunDevice>, TunError> {
     Err(TunError::Unsupported)
 }
