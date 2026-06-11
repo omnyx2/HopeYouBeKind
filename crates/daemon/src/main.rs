@@ -97,6 +97,10 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Write our PID so the GUI can stop us reliably (process name = full path,
+    // which breaks pkill -x / killall matching).
+    let _ = std::fs::write("/tmp/lattice-daemon.pid", std::process::id().to_string());
+
     // Stable identity: load it from disk, or generate + save on first run.
     let identity = Identity::load_or_generate(std::path::Path::new(&args.identity))?;
     let node_id = identity.node_id();
@@ -363,6 +367,7 @@ async fn main() -> Result<()> {
     // NAT in a diverted state.
     exit::restore_routes();
     exit::disable_nat();
+    let _ = std::fs::remove_file("/tmp/lattice-daemon.pid");
     Ok(())
 }
 
