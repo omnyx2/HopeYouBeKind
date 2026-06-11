@@ -42,6 +42,11 @@ struct Args {
     #[arg(long)]
     no_tun: bool,
 
+    /// Where to persist this node's identity so its node id is stable across
+    /// restarts (needed for manual peer pins). Generated on first run.
+    #[arg(long, default_value = "/var/lib/lattice/identity.key")]
+    identity: String,
+
     /// Enable the Kademlia DHT for serverless internet-wide rendezvous, bound to
     /// this UDP address (e.g. `0.0.0.0:0`). Off by default.
     #[arg(long)]
@@ -77,10 +82,11 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // TODO(v0.4): load a persisted identity from disk; generate on first run.
-    let identity = Identity::generate()?;
+    // Stable identity: load it from disk, or generate + save on first run.
+    let identity = Identity::load_or_generate(std::path::Path::new(&args.identity))?;
     let node_id = identity.node_id();
     let public_key = identity.public_key().to_vec();
+    tracing::info!(identity = %args.identity, "identity ready");
 
     let config = EngineConfig {
         bind_addr: args.bind.parse()?,

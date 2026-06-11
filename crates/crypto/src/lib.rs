@@ -60,6 +60,43 @@ impl Identity {
         Self { public, private }
     }
 
+    /// Load a saved identity (32-byte private ++ 32-byte public), or `None` if
+    /// the file is missing or malformed.
+    pub fn load(path: &std::path::Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() != 64 {
+            return None;
+        }
+        Some(Self::from_keys(bytes[32..].to_vec(), bytes[..32].to_vec()))
+    }
+
+    /// Persist this identity to `path` (creating parent dirs), with 0600 perms.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&self.private);
+        bytes.extend_from_slice(&self.public);
+        std::fs::write(path, &bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    /// Load the identity at `path`, or generate a fresh one and save it there.
+    pub fn load_or_generate(path: &std::path::Path) -> Result<Self, CryptoError> {
+        if let Some(id) = Self::load(path) {
+            return Ok(id);
+        }
+        let id = Self::generate()?;
+        let _ = id.save(path); // best-effort; ephemeral if the path isn't writable
+        Ok(id)
+    }
+
     pub fn public_key(&self) -> &[u8] {
         &self.public
     }

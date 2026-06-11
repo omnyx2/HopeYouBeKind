@@ -57,6 +57,7 @@ fn print_response(response: Response) {
     match response {
         Response::Status(s) => {
             println!("node      {}", s.id.fingerprint());
+            println!("node-id   {}", s.id.to_hex());
             println!(
                 "virtual   {}",
                 s.virtual_ip
