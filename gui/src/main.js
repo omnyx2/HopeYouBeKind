@@ -1,8 +1,5 @@
-// Lattice GUI — full control, no terminal needed.
-//
-// Polls the daemon over IPC (via Tauri commands) and renders live state. The
-// "Start node" button launches the bundled daemon as root (one admin prompt);
-// everything else — mesh on/off, peer list, copy IP — is one click.
+// Lattice GUI — sidebar layout. Polls the daemon over IPC (Tauri commands) and
+// renders live state across the Status / Peers / Network panels.
 
 const invoke = window.__TAURI__?.invoke ?? mockInvoke;
 if (!window.__TAURI__) {
@@ -11,6 +8,17 @@ if (!window.__TAURI__) {
 
 const el = (id) => document.getElementById(id);
 let starting = false;
+
+// ---- tab navigation ----
+document.querySelectorAll(".nav-item").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".nav-item").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    document.querySelectorAll(".panel").forEach((p) => {
+      p.classList.toggle("hidden", p.dataset.panel !== btn.dataset.tab);
+    });
+  });
+});
 
 async function refresh() {
   let status = null;
@@ -21,30 +29,33 @@ async function refresh() {
     reachable = false;
   }
 
-  const pill = el("state-pill");
   el("stopped-card").classList.toggle("hidden", reachable);
   el("running-card").classList.toggle("hidden", !reachable);
-  el("peers-card").classList.toggle("hidden", !reachable);
 
+  const dot = el("conn-dot");
+  const txt = el("conn-text");
   if (!reachable) {
-    pill.textContent = starting ? "starting…" : "stopped";
-    pill.className = "pill " + (starting ? "warn" : "off");
+    dot.className = "conn-dot " + (starting ? "warn" : "off");
+    txt.textContent = starting ? "starting…" : "stopped";
+    setPeerBadge(0);
     return;
   }
 
   starting = false;
   const meshUp = !!status.running;
-  pill.textContent = meshUp ? "online" : "paused";
-  pill.className = "pill " + (meshUp ? "on" : "warn");
+  dot.className = "conn-dot " + (meshUp ? "on" : "warn");
+  txt.textContent = meshUp ? "online" : "paused";
 
   el("virtual-ip").textContent = status.virtual_ip ?? "—";
   el("public-addr").textContent = status.public_addr ?? "not detected (LAN only)";
-  el("relay-status").textContent = status.relay ?? "off";
+  el("fingerprint").textContent = status.fingerprint ?? "—";
   const nodeId = status.node_id ?? "";
-  el("node-id").textContent = nodeId ? nodeId.slice(0, 16) + "…" : "—";
+  el("node-id").textContent = nodeId ? nodeId.slice(0, 20) + "…" : "—";
   el("node-id").dataset.full = nodeId;
   el("mesh-toggle").checked = meshUp;
+  el("relay-status").textContent = status.relay ?? "off";
 
+  // peers
   let peers = [];
   try {
     peers = await invoke("list_peers");
@@ -52,8 +63,28 @@ async function refresh() {
     /* transient */
   }
   el("peer-count").textContent = `(${peers.length})`;
+  setPeerBadge(peers.length);
+  renderPeers(peers);
+  updateExitSelect(peers, status.exit_node);
+  el("exit-toggle").checked = !!status.is_exit;
+}
+
+function setPeerBadge(n) {
+  const b = el("nav-peer-count");
+  b.textContent = n;
+  b.classList.toggle("hidden", n === 0);
+}
+
+function renderPeers(peers) {
   const ul = el("peers");
   ul.innerHTML = "";
+  if (peers.length === 0) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "No peers yet.";
+    ul.appendChild(li);
+    return;
+  }
   for (const p of peers) {
     const li = document.createElement("li");
     const ip = document.createElement("span");
@@ -66,34 +97,26 @@ async function refresh() {
     left.appendChild(ip);
     const right = document.createElement("span");
     right.className = "muted mono small";
-    right.textContent = [osLabel(p.os), p.fingerprint, p.endpoint]
-      .filter(Boolean)
-      .join(" · ");
+    right.textContent = [osLabel(p.os), p.fingerprint, p.endpoint].filter(Boolean).join(" · ");
     li.appendChild(left);
     li.appendChild(right);
     ul.appendChild(li);
   }
-
-  updateExitSelect(peers, status.exit_node);
-  el("exit-toggle").checked = !!status.is_exit;
 }
 
-// Rebuild the exit dropdown only when the peer set changes (so it doesn't snap
-// shut while you're choosing), and reflect the daemon's current selection.
 function updateExitSelect(peers, exitNode) {
   const sel = el("exit-select");
   const sig = ["", ...peers.map((p) => p.node_id)].join(",");
   if (sel.dataset.sig !== sig) {
     sel.innerHTML = "";
     sel.add(new Option("Direct (no exit)", ""));
-    for (const p of peers) {
-      sel.add(new Option(`${p.fingerprint} · ${p.virtual_ip}`, p.node_id));
-    }
+    for (const p of peers) sel.add(new Option(`${p.fingerprint} · ${p.virtual_ip}`, p.node_id));
     sel.dataset.sig = sig;
   }
   sel.value = exitNode ?? "";
 }
 
+// ---- actions ----
 el("start").addEventListener("click", async () => {
   starting = true;
   refresh();
@@ -103,7 +126,6 @@ el("start").addEventListener("click", async () => {
     starting = false;
     toast(String(e));
   }
-  // The daemon takes a moment to bind + STUN; poll until it answers.
   for (let i = 0; i < 15 && starting; i++) {
     await sleep(700);
     await refresh();
@@ -129,16 +151,6 @@ el("mesh-toggle").addEventListener("change", async (e) => {
   refresh();
 });
 
-el("virtual-ip").addEventListener("click", () => {
-  const ip = el("virtual-ip").textContent;
-  if (ip && ip !== "—") copy(ip);
-});
-
-el("node-id").addEventListener("click", () => {
-  const full = el("node-id").dataset.full;
-  if (full) copy(full);
-});
-
 el("exit-select").addEventListener("change", async (e) => {
   try {
     await invoke("set_exit", { nodeId: e.target.value || null });
@@ -157,19 +169,6 @@ el("exit-toggle").addEventListener("change", async (e) => {
   refresh();
 });
 
-el("add-peer").addEventListener("click", async () => {
-  const spec = el("peer-spec").value.trim();
-  if (!spec) return;
-  try {
-    await invoke("add_peer", { spec });
-    el("peer-spec").value = "";
-    toast("peer added");
-  } catch (err) {
-    toast(String(err));
-  }
-  refresh();
-});
-
 el("set-relay").addEventListener("click", async () => {
   try {
     await invoke("set_relay", { addr: el("relay-addr").value.trim() });
@@ -180,18 +179,34 @@ el("set-relay").addEventListener("click", async () => {
   refresh();
 });
 
-el("add-relay-peer").addEventListener("click", async () => {
-  const id = el("relay-peer-id").value.trim();
-  if (!id) return;
-  try {
-    await invoke("relay_peer", { nodeId: id });
-    el("relay-peer-id").value = "";
-    toast("peer added via relay");
-  } catch (err) {
-    toast(String(err));
-  }
-  refresh();
+bindAdd("add-peer", "peer-spec", (v) => invoke("add_peer", { spec: v }), "peer added");
+bindAdd("add-relay-peer", "relay-peer-id", (v) => invoke("relay_peer", { nodeId: v }), "peer added via relay");
+
+el("virtual-ip").addEventListener("click", () => maybeCopy("virtual-ip"));
+el("node-id").addEventListener("click", () => {
+  const full = el("node-id").dataset.full;
+  if (full) copy(full);
 });
+
+function bindAdd(btnId, inputId, fn, okMsg) {
+  el(btnId).addEventListener("click", async () => {
+    const v = el(inputId).value.trim();
+    if (!v) return;
+    try {
+      await fn(v);
+      el(inputId).value = "";
+      toast(okMsg);
+    } catch (err) {
+      toast(String(err));
+    }
+    refresh();
+  });
+}
+
+function maybeCopy(id) {
+  const t = el(id).textContent;
+  if (t && t !== "—") copy(t);
+}
 
 async function copy(text) {
   try {
@@ -219,8 +234,7 @@ function toast(msg) {
 function osLabel(os) {
   if (!os) return "";
   return (
-    { macos: "🍎 macOS", linux: "🐧 Linux", windows: "🪟 Windows", ios: "📱 iOS", android: "🤖 Android" }[os] ||
-    os
+    { macos: "🍎 macOS", linux: "🐧 Linux", windows: "🪟 Windows", ios: "📱 iOS", android: "🤖 Android" }[os] || os
   );
 }
 
@@ -229,9 +243,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 refresh();
 setInterval(refresh, 2000);
 
-// ---- development mock (only when not running inside Tauri) ----
+// ---- development mock (only outside Tauri) ----
 function mockInvoke(cmd, args) {
-  const s = (mockInvoke.s ??= { up: false, mesh: true, exit: null, isExit: false });
+  const s = (mockInvoke.s ??= { up: false, mesh: true, exit: null, isExit: false, relay: null });
   switch (cmd) {
     case "start_daemon": s.up = true; return Promise.resolve();
     case "stop_daemon": s.up = false; return Promise.resolve();
