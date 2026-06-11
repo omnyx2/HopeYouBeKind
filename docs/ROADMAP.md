@@ -81,7 +81,8 @@ Connectivity (makes the mesh reach anywhere, reliably):
   Any node can volunteer; no dedicated server. This is the cross-NAT safety net.
 - **Multi-hop mesh routing:** forward packets through several mesh nodes toward
   the destination (a generalization of relay).
-- **Public bootstrap node + peer keepalive/liveness** (drop stale peers).
+- **Public bootstrap node** (stable internet entry point). *(Peer
+  keepalive/liveness + stale-peer cleanup is now implemented.)*
 
 Capabilities:
 - **Exit-node mode:** route a node's full internet traffic out through another

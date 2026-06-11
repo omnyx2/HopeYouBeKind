@@ -25,7 +25,8 @@ A snapshot of what Lattice does today (v0.7.0). Legend: ✅ working & tested ·
 | Eager handshake on peer discovery | ✅ | `crates/engine` |
 | Connected-endpoint routing (per-peer best path) | ✅ | `crates/engine` |
 | Mesh up/down toggle | ✅ | `crates/engine` (`EngineHandle`) |
-| Peer liveness / drop stale peers (keepalive) | 🔜 | — |
+| Keepalive: peer reachability + NAT-binding refresh | ✅ | `crates/engine` |
+| Drop stale "ghost" peers after timeout | ✅ | `crates/engine` |
 
 ## Discovery & NAT traversal (finding peers)
 

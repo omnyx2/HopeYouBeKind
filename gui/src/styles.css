@@ -113,4 +113,6 @@ button.primary:active { transform: translateY(1px); }
 .peers li:first-child { border-top: none; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; }
 .dot.connected { background: var(--ok); }
+.dot.connecting { background: #d9a23a; }
 .dot.known { background: var(--off); }
+.dot.lost { background: #e05260; }
