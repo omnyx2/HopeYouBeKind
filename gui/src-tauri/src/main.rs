@@ -191,8 +191,8 @@ async fn stop_daemon() -> Result<(), String> {
     // Kill by PID file and by the bound UDP port — NOT by process-name pattern.
     // The daemon's process command is its full path (so killall/pkill -x miss
     // it), and pkill -f '…lattice-daemon…' self-matches the shell running it.
-    let script = "do shell script \"kill $(cat /tmp/lattice-daemon.pid 2>/dev/null) 2>/dev/null; \
-                  lsof -ti udp:41000 2>/dev/null | xargs kill 2>/dev/null; \
+    let script = "do shell script \"kill -9 $(cat /tmp/lattice-daemon.pid 2>/dev/null) 2>/dev/null; \
+                  lsof -ti udp:41000 2>/dev/null | xargs kill -9 2>/dev/null; \
                   rm -f /tmp/lattice.sock /tmp/lattice-daemon.pid; true\" \
                   with administrator privileges"
         .to_string();
