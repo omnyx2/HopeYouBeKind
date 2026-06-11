@@ -11,6 +11,21 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 ## [Unreleased]
 
 ### Added
+- **Pluggable tunnel crypto (`CryptoSuite`)**: the engine no longer names a
+  concrete cipher — it drives an `Arc<dyn CryptoSuite>` that owns the whole
+  handshake + session-encryption story. `NoiseSuite` (Noise-IK) is the default;
+  alternative schemes drop in by implementing the trait. `Engine::with_suite`
+  injects one. Wire format unchanged for the default.
+- **Mesh membership with a network CA (`lattice-membership`)**: a network is an
+  Ed25519 keypair whose public half is the `NetworkId` (the stable, shareable
+  mesh id). The CA admits nodes by signing a `MemberCert` (binds a node's
+  identity key to the network, with serial + optional expiry) and evicts them by
+  signing a `Revocation`. The engine presents its cert in the handshake and
+  rejects peers without a valid, unrevoked cert for the network; revocations
+  gossip across the mesh (`MessageType::Revocation`) and drop evicted peers.
+  Membership is orthogonal to the crypto suite. Open mode (no network) keeps the
+  prior behaviour.
+
 - **Traffic monitor**: a passive per-flow observer of everything crossing the
   tunnel. `lattice-engine` gained a `monitor` module (`TrafficMonitor`) that
   records each plaintext packet on the outbound (pre-encrypt) and inbound
