@@ -15,14 +15,15 @@
 //!
 //! Both sides end in a [`NoiseSession`] that AEAD-seals/opens transport packets.
 //!
-//! Nonce handling: v0.2 uses snow's in-order stateful transport, which is
-//! correct for the single-host loopback milestone. The explicit per-packet
-//! counter + sliding replay window from PROTOCOL.md is layered on in v0.7, when
-//! we move to lossy/reordering UDP paths.
+//! Nonce handling: the session uses snow's **stateless** transport — each packet
+//! carries an explicit 8-byte counter used as the AEAD nonce, with a sliding
+//! replay window. This survives the packet loss and reordering of real UDP; an
+//! in-order stateful transport desyncs on the first lost/reordered packet.
 
 use std::time::Duration;
 
 use crate::rekey::RekeyPolicy;
+use crate::replay::ReplayWindow;
 use crate::{CryptoError, TunnelSession, NOISE_PARAMS};
 
 fn params() -> snow::params::NoiseParams {
@@ -71,7 +72,7 @@ impl Handshake {
         let mut scratch = vec![0u8; 1024];
         let n = self.state.read_message(response, &mut scratch)?;
         let peer_payload = scratch[..n].to_vec();
-        let transport = self.state.into_transport_mode()?;
+        let transport = self.state.into_stateless_transport_mode()?;
         Ok((NoiseSession::new(transport), peer_payload))
     }
 }
@@ -102,7 +103,7 @@ pub fn respond(
     let n = state.write_message(payload, &mut response)?;
     response.truncate(n);
 
-    let transport = state.into_transport_mode()?;
+    let transport = state.into_stateless_transport_mode()?;
     Ok(PendingHandshake {
         session: NoiseSession::new(transport),
         response,
@@ -112,17 +113,25 @@ pub fn respond(
 }
 
 /// A live, authenticated tunnel: AEAD-seals outbound packets and opens inbound
-/// ones with ChaCha20-Poly1305, keys established by the handshake. Tracks usage
-/// so the engine can renegotiate per the [`RekeyPolicy`].
+/// ones with ChaCha20-Poly1305, keys established by the handshake.
+///
+/// Uses snow's **stateless** transport: each packet carries an explicit 8-byte
+/// counter used as the AEAD nonce, so packet loss and reordering on the UDP path
+/// don't desync the session (the in-order stateful mode breaks on the first
+/// lost/reordered packet). A sliding [`ReplayWindow`] rejects duplicates/old.
 pub struct NoiseSession {
-    transport: snow::TransportState,
+    transport: snow::StatelessTransportState,
+    send_counter: u64,
+    replay: ReplayWindow,
     rekey: RekeyPolicy,
 }
 
 impl NoiseSession {
-    fn new(transport: snow::TransportState) -> Self {
+    fn new(transport: snow::StatelessTransportState) -> Self {
         Self {
             transport,
+            send_counter: 0,
+            replay: ReplayWindow::new(),
             rekey: RekeyPolicy::default(),
         }
     }
@@ -136,20 +145,33 @@ impl NoiseSession {
 
 impl TunnelSession for NoiseSession {
     fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        // AEAD adds a 16-byte tag.
-        let mut out = vec![0u8; plaintext.len() + 16];
-        let n = self.transport.write_message(plaintext, &mut out)?;
-        out.truncate(n);
+        let nonce = self.send_counter;
+        self.send_counter = self.send_counter.wrapping_add(1);
+        // Wire: [counter (8, big-endian)] [AEAD ciphertext = plaintext + 16 tag].
+        let mut out = vec![0u8; 8 + plaintext.len() + 16];
+        out[..8].copy_from_slice(&nonce.to_be_bytes());
+        let n = self
+            .transport
+            .write_message(nonce, plaintext, &mut out[8..])?;
+        out.truncate(8 + n);
         self.rekey.record();
         Ok(out)
     }
 
     fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let mut out = vec![0u8; ciphertext.len()];
+        if ciphertext.len() < 8 {
+            return Err(CryptoError::AuthFailed);
+        }
+        let nonce = u64::from_be_bytes(ciphertext[..8].try_into().expect("8 bytes"));
+        let mut out = vec![0u8; ciphertext.len() - 8];
         let n = self
             .transport
-            .read_message(ciphertext, &mut out)
+            .read_message(nonce, &ciphertext[8..], &mut out)
             .map_err(|_| CryptoError::AuthFailed)?;
+        // Authentic — now drop replays / too-old packets (window is 1-based).
+        if !self.replay.check_and_update(nonce.wrapping_add(1)) {
+            return Err(CryptoError::AuthFailed);
+        }
         out.truncate(n);
         Ok(out)
     }
@@ -212,5 +234,31 @@ mod tests {
         let mut sealed = sa.encrypt(b"secret").unwrap();
         sealed[0] ^= 0xff; // flip a bit
         assert!(matches!(sb.decrypt(&sealed), Err(CryptoError::AuthFailed)));
+    }
+
+    /// The real-world failure: UDP loses/reorders packets. The stateless session
+    /// must still decrypt out-of-order packets and reject replays — the in-order
+    /// stateful mode broke on the first reordered packet.
+    #[test]
+    fn tolerates_reordering_and_rejects_replays() {
+        let a = Identity::generate().unwrap();
+        let b = Identity::generate().unwrap();
+        let (hs, init) = Handshake::initiate(a.private_key(), b.public_key(), b"").unwrap();
+        let pending = respond(b.private_key(), &init, b"").unwrap();
+        let (mut sa, _) = hs.complete(&pending.response).unwrap();
+        let mut sb = pending.session;
+
+        // Seal three packets in order...
+        let p0 = sa.encrypt(b"zero").unwrap();
+        let p1 = sa.encrypt(b"one").unwrap();
+        let p2 = sa.encrypt(b"two").unwrap();
+
+        // ...but deliver them out of order — all must still open.
+        assert_eq!(sb.decrypt(&p2).unwrap(), b"two");
+        assert_eq!(sb.decrypt(&p0).unwrap(), b"zero");
+        assert_eq!(sb.decrypt(&p1).unwrap(), b"one");
+
+        // A replayed packet is rejected.
+        assert!(matches!(sb.decrypt(&p1), Err(CryptoError::AuthFailed)));
     }
 }
