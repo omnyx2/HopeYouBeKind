@@ -52,6 +52,7 @@ A snapshot of what Lattice does today (v0.7.0). Legend: ✅ working & tested ·
 | GUI: start/stop the daemon (admin prompt) | ✅ | `gui/` (bundles the daemon) |
 | GUI: live dashboard (status, mesh toggle, peers) | ✅ | `gui/` |
 | GUI: virtual IP, node id, public address — copyable | ✅ | `gui/` |
+| Exit node — route internet via a peer, pick it in the GUI | ⚠️ engine+GUI done; OS plumbing needs 2-machine test | `crates/engine`, `crates/daemon` (`exit.rs`), `gui/` |
 | Windows named-pipe IPC | 🔜 | (Unix socket today) |
 
 ## Security

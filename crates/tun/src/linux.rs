@@ -33,7 +33,6 @@ fn last_err(context: &str) -> TunError {
 
 pub struct LinuxTun {
     fd: AsyncFd<OwnedFd>,
-    #[allow(dead_code)]
     name: String,
 }
 
@@ -110,6 +109,10 @@ fn run(args: &[&str]) -> Result<(), TunError> {
 
 #[async_trait::async_trait]
 impl TunDevice for LinuxTun {
+    fn name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+
     async fn read_packet(&mut self) -> Result<Vec<u8>, TunError> {
         loop {
             let mut guard = self

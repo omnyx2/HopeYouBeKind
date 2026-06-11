@@ -21,6 +21,11 @@ pub enum Request {
     Status,
     /// List known peers.
     Peers,
+    /// Route this node's internet traffic through `node_id` (or `None` to stop
+    /// using an exit node and go direct again).
+    SetExit { node_id: Option<NodeId> },
+    /// Allow (or stop allowing) this node to act as an exit for others.
+    AllowExit { enabled: bool },
 }
 
 /// The daemon's reply.
@@ -50,6 +55,10 @@ pub struct NodeStatus {
     pub public_addr: Option<std::net::SocketAddr>,
     pub running: bool,
     pub peer_count: usize,
+    /// The peer we're routing internet traffic through, if any.
+    pub exit_node: Option<NodeId>,
+    /// Whether we're acting as an exit node for others.
+    pub is_exit: bool,
 }
 
 #[cfg(test)]
@@ -67,6 +76,8 @@ mod tests {
                 public_addr: None,
                 running: true,
                 peer_count: 0,
+                exit_node: None,
+                is_exit: false,
             }),
             Response::Peers(vec![]),
             Response::Done,

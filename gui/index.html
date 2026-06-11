@@ -42,6 +42,19 @@
             <span class="slider"></span>
           </label>
         </div>
+        <div class="row">
+          <span class="label">Exit through</span>
+          <select id="exit-select" class="select"></select>
+        </div>
+        <div class="row">
+          <span class="label">Act as exit node</span>
+          <label class="switch">
+            <input type="checkbox" id="exit-toggle" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <p class="hint">"Exit through" routes <b>all</b> your internet traffic via
+          that peer (you appear as its IP). Needs the peer to allow it.</p>
         <button id="stop" class="secondary">Stop node</button>
       </section>
 

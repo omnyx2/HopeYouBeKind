@@ -67,6 +67,25 @@ async function refresh() {
     li.appendChild(right);
     ul.appendChild(li);
   }
+
+  updateExitSelect(peers, status.exit_node);
+  el("exit-toggle").checked = !!status.is_exit;
+}
+
+// Rebuild the exit dropdown only when the peer set changes (so it doesn't snap
+// shut while you're choosing), and reflect the daemon's current selection.
+function updateExitSelect(peers, exitNode) {
+  const sel = el("exit-select");
+  const sig = ["", ...peers.map((p) => p.node_id)].join(",");
+  if (sel.dataset.sig !== sig) {
+    sel.innerHTML = "";
+    sel.add(new Option("Direct (no exit)", ""));
+    for (const p of peers) {
+      sel.add(new Option(`${p.fingerprint} · ${p.virtual_ip}`, p.node_id));
+    }
+    sel.dataset.sig = sig;
+  }
+  sel.value = exitNode ?? "";
 }
 
 el("start").addEventListener("click", async () => {
@@ -114,6 +133,24 @@ el("node-id").addEventListener("click", () => {
   if (full) copy(full);
 });
 
+el("exit-select").addEventListener("change", async (e) => {
+  try {
+    await invoke("set_exit", { nodeId: e.target.value || null });
+  } catch (err) {
+    toast(String(err));
+  }
+  refresh();
+});
+
+el("exit-toggle").addEventListener("change", async (e) => {
+  try {
+    await invoke("allow_exit", { enabled: e.target.checked });
+  } catch (err) {
+    toast(String(err));
+  }
+  refresh();
+});
+
 async function copy(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -143,23 +180,26 @@ refresh();
 setInterval(refresh, 2000);
 
 // ---- development mock (only when not running inside Tauri) ----
-function mockInvoke(cmd) {
-  const s = (mockInvoke.s ??= { up: false, mesh: true });
+function mockInvoke(cmd, args) {
+  const s = (mockInvoke.s ??= { up: false, mesh: true, exit: null, isExit: false });
   switch (cmd) {
     case "start_daemon": s.up = true; return Promise.resolve();
     case "stop_daemon": s.up = false; return Promise.resolve();
     case "mesh_up": s.mesh = true; return Promise.resolve();
     case "mesh_down": s.mesh = false; return Promise.resolve();
+    case "set_exit": s.exit = args?.nodeId ?? null; return Promise.resolve();
+    case "allow_exit": s.isExit = !!args?.enabled; return Promise.resolve();
     case "get_status":
       return s.up
         ? Promise.resolve({
             running: s.mesh, virtual_ip: "100.95.128.129", fingerprint: "a3f1c290",
             node_id: "a3f1c290".repeat(8), public_addr: "203.247.167.58:47251",
+            exit_node: s.exit, is_exit: s.isExit,
           })
         : Promise.reject("daemon not running");
     case "list_peers":
       return Promise.resolve(s.up ? [
-        { virtual_ip: "100.86.168.223", fingerprint: "db16a8df", status: "connected", endpoint: "10.32.161.153:56681" },
+        { virtual_ip: "100.86.168.223", fingerprint: "db16a8df", status: "connected", endpoint: "10.32.161.153:56681", node_id: "db16a8df".repeat(8) },
       ] : []);
     default: return Promise.resolve(null);
   }

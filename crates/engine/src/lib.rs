@@ -79,6 +79,10 @@ pub struct Engine {
     enabled: Arc<AtomicBool>,
     /// Our public (reflexive) address from STUN, set by the daemon once known.
     public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    /// The peer we route internet-bound traffic through (exit node), if any.
+    exit_node: Arc<std::sync::Mutex<Option<NodeId>>>,
+    /// Whether we forward other nodes' internet traffic (act as an exit node).
+    allow_exit: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -97,6 +101,8 @@ impl Engine {
             running: Arc::new(AtomicBool::new(false)),
             enabled: Arc::new(AtomicBool::new(true)),
             public_addr: Arc::new(std::sync::Mutex::new(None)),
+            exit_node: Arc::new(std::sync::Mutex::new(None)),
+            allow_exit: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -118,6 +124,8 @@ impl Engine {
             running: Arc::clone(&self.running),
             enabled: Arc::clone(&self.enabled),
             public_addr: Arc::clone(&self.public_addr),
+            exit_node: Arc::clone(&self.exit_node),
+            allow_exit: Arc::clone(&self.allow_exit),
         }
     }
 
@@ -247,27 +255,48 @@ impl Engine {
         if !self.enabled.load(Ordering::Relaxed) {
             return Ok(()); // mesh administratively down
         }
-        let (peer_id, fallback) = {
-            let overlay = self.overlay.lock().await;
-            match overlay.route(&dst) {
-                Ok(peer) => (peer.id, peer.endpoints.first().copied()),
+
+        // Which peer carries this packet?
+        let peer_id = if is_overlay_ip(dst) {
+            // Mesh traffic → the peer that owns the destination virtual IP.
+            match self.overlay.lock().await.route(&dst) {
+                Ok(peer) => peer.id,
                 Err(_) => return Ok(()),
             }
+        } else {
+            // Internet-bound traffic → our exit node, if one is selected.
+            // (No exit set ⇒ drop, so nothing leaks outside the tunnel.)
+            match *self.exit_node.lock().unwrap() {
+                Some(id) => id,
+                None => return Ok(()),
+            }
         };
-        // Prefer the endpoint whose session is live; fall back to the first
-        // candidate while the handshake is still settling.
-        let Some(endpoint) = self.connected.get(&peer_id).copied().or(fallback) else {
-            return Ok(()); // no route yet
+
+        let Some(endpoint) = self.endpoint_for(&peer_id).await else {
+            return Ok(()); // no path to this peer yet
         };
         let Some(session) = self.sessions.get_mut(&endpoint) else {
-            // Session still being established; drop (like a real net during setup).
-            return Ok(());
+            return Ok(()); // session still being established
         };
         let sealed = session.encrypt(packet)?;
         transport
             .send_to(&wire::encode(MessageType::Transport, &sealed), endpoint)
             .await?;
         Ok(())
+    }
+
+    /// The best endpoint to reach `peer_id`: its live-session endpoint, else its
+    /// first known candidate.
+    async fn endpoint_for(&self, peer_id: &NodeId) -> Option<SocketAddr> {
+        if let Some(ep) = self.connected.get(peer_id) {
+            return Some(*ep);
+        }
+        self.overlay
+            .lock()
+            .await
+            .peers()
+            .find(|p| &p.id == peer_id)
+            .and_then(|p| p.endpoints.first().copied())
     }
 
     /// A datagram from a peer: a handshake step or an encrypted overlay packet.
@@ -325,6 +354,14 @@ impl Engine {
                     Some(session) => session.decrypt(payload)?,
                     None => return Ok(()), // no session for this source
                 };
+                // Internet-bound traffic from a peer is only forwarded to the OS
+                // (to be NAT'd out) when we've volunteered as an exit node;
+                // otherwise drop it so we never relay strangers' traffic.
+                if let Some(dst) = ipv4_dst(&plaintext) {
+                    if !is_overlay_ip(dst) && !self.allow_exit.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                }
                 tun.write_packet(&plaintext).await?;
             }
             MessageType::Keepalive => { /* v0.7: liveness tracking */ }
@@ -393,13 +430,17 @@ pub struct EngineHandle {
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
     public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    exit_node: Arc<std::sync::Mutex<Option<NodeId>>>,
+    allow_exit: Arc<AtomicBool>,
 }
 
 impl EngineHandle {
     pub async fn status(&self) -> NodeStatus {
         let up = self.running.load(Ordering::Relaxed) && self.enabled.load(Ordering::Relaxed);
-        // Read the std-Mutex into a local so no guard is held across the await.
+        // Read the std-Mutexes into locals so no guard is held across the await.
         let public_addr = *self.public_addr.lock().unwrap();
+        let exit_node = *self.exit_node.lock().unwrap();
+        let is_exit = self.allow_exit.load(Ordering::Relaxed);
         let peer_count = self.overlay.lock().await.peer_count();
         NodeStatus {
             id: self.node_id,
@@ -407,12 +448,24 @@ impl EngineHandle {
             public_addr,
             running: up,
             peer_count,
+            exit_node,
+            is_exit,
         }
     }
 
     /// Record our public (reflexive) address, learned via STUN.
     pub fn set_public_addr(&self, addr: SocketAddr) {
         *self.public_addr.lock().unwrap() = Some(addr);
+    }
+
+    /// Route this node's internet traffic through `node_id` (or `None` for direct).
+    pub fn set_exit_node(&self, node_id: Option<NodeId>) {
+        *self.exit_node.lock().unwrap() = node_id;
+    }
+
+    /// Volunteer (or stop volunteering) as an exit node for other peers.
+    pub fn set_allow_exit(&self, allow: bool) {
+        self.allow_exit.store(allow, Ordering::Relaxed);
     }
 
     pub async fn peers(&self) -> Vec<PeerInfo> {
@@ -424,6 +477,13 @@ impl EngineHandle {
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
     }
+}
+
+/// Whether an address is in the overlay range `100.64.0.0/10` (mesh traffic);
+/// anything else is internet-bound and only flows through an exit node.
+fn is_overlay_ip(ip: VirtualIp) -> bool {
+    let o = ip.0.octets();
+    o[0] == 100 && (64..=127).contains(&o[1])
 }
 
 /// Extract the IPv4 destination address from a raw IP packet, if it is IPv4.
@@ -517,6 +577,62 @@ mod tests {
         assert_eq!(
             received, packet,
             "B must receive A's original packet decrypted"
+        );
+    }
+
+    /// A routes internet-bound traffic through B (its exit node): a packet to a
+    /// public IP injected into A's TUN arrives at B's TUN to be forwarded out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_node_tunnels_internet_traffic_to_the_exit() {
+        let id_a = Identity::generate().unwrap();
+        let id_b = Identity::generate().unwrap();
+        let vip_a = derive_virtual_ip(&id_a.node_id());
+        let b_nodeid = id_b.node_id();
+
+        let addr_a: SocketAddr = "10.0.0.1:701".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:701".parse().unwrap();
+        let (ta, tb) = duplex(addr_a, addr_b);
+
+        let (tun_a, handle_a) = MemoryTun::new();
+        let (tun_b, mut handle_b) = MemoryTun::new();
+
+        let disc_a = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: b_nodeid,
+            endpoints: vec![addr_b],
+        }]);
+        let disc_b = StaticDiscovery::new(vec![]);
+
+        let mut engine_a = Engine::new(id_a, EngineConfig::default());
+        let mut engine_b = Engine::new(id_b, EngineConfig::default());
+
+        // A sends its internet traffic through B; B agrees to be an exit node.
+        engine_a.handle().set_exit_node(Some(b_nodeid));
+        engine_b.handle().set_allow_exit(true);
+
+        tokio::spawn(async move {
+            let _ = engine_a.run(tun_a, ta, disc_a).await;
+        });
+        tokio::spawn(async move {
+            let _ = engine_b.run(tun_b, tb, disc_b).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A packet bound for the public internet (8.8.8.8) — not the overlay.
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[12..16].copy_from_slice(&vip_a.0.octets());
+        packet[16..20].copy_from_slice(&[8, 8, 8, 8]);
+
+        handle_a.inject.send(packet.clone()).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), handle_b.observe.recv())
+            .await
+            .expect("internet-bound packet should reach the exit node")
+            .expect("B's TUN channel stayed open");
+        assert_eq!(
+            received, packet,
+            "exit node receives A's internet packet to forward"
         );
     }
 }
