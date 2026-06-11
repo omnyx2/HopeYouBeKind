@@ -123,6 +123,8 @@ mod tests {
                         public_addr: None,
                         running: true,
                         peer_count: 3,
+                        exit_node: None,
+                        is_exit: false,
                     }),
                     _ => Response::Done,
                 }

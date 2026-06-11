@@ -23,6 +23,8 @@ use lattice_tun::TunConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+mod exit;
+
 /// Lattice background service.
 #[derive(Parser, Debug)]
 #[command(name = "lattice-daemon", version, about)]
@@ -101,6 +103,8 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to open TUN device (need sudo?): {e}"))?
     };
+    // Captured for exit-node routing before the engine takes ownership of `tun`.
+    let tun_name = tun.name().map(|s| s.to_string());
 
     let transport = UdpTransport::bind(args.bind.parse()?).await?;
     let udp_addr = transport.local_addr()?;
@@ -159,8 +163,10 @@ async fn main() -> Result<()> {
     // IPC server lets the GUI/CLI query status and toggle the mesh while the
     // engine runs. The handler captures a cloneable handle to the engine.
     let ipc_handle = engine.handle();
+    let ipc_tun = tun_name.clone();
     let ipc = lattice_ipc::serve(&args.ipc_socket, move |req| {
         let handle = ipc_handle.clone();
+        let tun_name = ipc_tun.clone();
         async move {
             use lattice_proto::ipc::{Request, Response};
             match req {
@@ -172,6 +178,34 @@ async fn main() -> Result<()> {
                 }
                 Request::Down => {
                     handle.set_enabled(false);
+                    Response::Done
+                }
+                Request::SetExit { node_id } => {
+                    handle.set_exit_node(node_id);
+                    match node_id {
+                        Some(id) => {
+                            let endpoint_ip = handle
+                                .peers()
+                                .await
+                                .iter()
+                                .find(|p| p.id == id)
+                                .and_then(|p| p.endpoints.first().map(|e| e.ip()));
+                            match (tun_name.as_deref(), endpoint_ip) {
+                                (Some(name), Some(ip)) => exit::route_through(name, ip),
+                                _ => tracing::warn!("cannot route via exit (no tun or endpoint)"),
+                            }
+                        }
+                        None => exit::restore_routes(),
+                    }
+                    Response::Done
+                }
+                Request::AllowExit { enabled } => {
+                    handle.set_allow_exit(enabled);
+                    if enabled {
+                        exit::enable_nat();
+                    } else {
+                        exit::disable_nat();
+                    }
                     Response::Done
                 }
             }
@@ -192,6 +226,11 @@ async fn main() -> Result<()> {
             tracing::info!("shutting down");
         }
     }
+
+    // Always undo exit-node OS changes so we never leave the host's routing or
+    // NAT in a diverted state.
+    exit::restore_routes();
+    exit::disable_nat();
     Ok(())
 }
 

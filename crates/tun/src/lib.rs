@@ -54,6 +54,11 @@ impl Default for TunConfig {
 pub trait TunDevice: Send {
     async fn read_packet(&mut self) -> Result<Vec<u8>, TunError>;
     async fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunError>;
+    /// The OS interface name (e.g. `utun6`, `tun0`) if this is a real device —
+    /// needed to install exit-node routes. `None` for fakes / null devices.
+    fn name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A TUN device that never yields a packet and discards writes. Lets the daemon
@@ -80,6 +85,9 @@ impl TunDevice for Box<dyn TunDevice> {
     }
     async fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunError> {
         (**self).write_packet(packet).await
+    }
+    fn name(&self) -> Option<&str> {
+        (**self).name()
     }
 }
 

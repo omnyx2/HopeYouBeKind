@@ -85,8 +85,10 @@ Connectivity (makes the mesh reach anywhere, reliably):
   keepalive/liveness + stale-peer cleanup is now implemented.)*
 
 Capabilities:
-- **Exit-node mode:** route a node's full internet traffic out through another
-  node (appear on the internet as that node).
+- **Exit-node mode** ⚠️ *(engine + IPC + GUI done & tested; OS route/NAT
+  plumbing implemented but needs a real two-machine verification — see
+  `docs/EXIT_NODE.md`)*: route a node's full internet traffic out through
+  another node (appear on the internet as that node).
 - **Per-port vs. all-port policy (ACLs):** the "지정된 포트 또는 전포트" control
   as overlay firewall rules in the GUI.
 - **Mobile (iOS/Android)** via the same `engine` core behind a platform VPN API.

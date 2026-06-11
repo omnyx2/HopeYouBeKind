@@ -22,6 +22,8 @@ struct StatusView {
     fingerprint: String,
     node_id: String,
     public_addr: Option<String>,
+    exit_node: Option<String>,
+    is_exit: bool,
 }
 
 #[derive(Serialize)]
@@ -30,6 +32,7 @@ struct PeerView {
     fingerprint: String,
     status: String,
     endpoint: Option<String>,
+    node_id: String,
 }
 
 #[tauri::command]
@@ -41,6 +44,8 @@ async fn get_status() -> Result<StatusView, String> {
             fingerprint: s.id.fingerprint(),
             node_id: s.id.to_hex(),
             public_addr: s.public_addr.map(|a| a.to_string()),
+            exit_node: s.exit_node.map(|id| id.to_hex()),
+            is_exit: s.is_exit,
         }),
         Ok(Response::Error { message }) => Err(message),
         Ok(_) => Err("unexpected response".into()),
@@ -58,6 +63,7 @@ async fn list_peers() -> Result<Vec<PeerView>, String> {
                 fingerprint: p.id.fingerprint(),
                 status: format!("{:?}", p.status).to_lowercase(),
                 endpoint: p.endpoints.first().map(|e| e.to_string()),
+                node_id: p.id.to_hex(),
             })
             .collect()),
         Ok(Response::Error { message }) => Err(message),
@@ -81,6 +87,34 @@ async fn send(req: Request) -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn parse_node_id(hex: &str) -> Option<lattice_proto::NodeId> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    for (i, b) in id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(lattice_proto::NodeId(id))
+}
+
+/// Route this node's internet traffic through a peer (by full hex id), or
+/// `None` to go direct again.
+#[tauri::command]
+async fn set_exit(node_id: Option<String>) -> Result<(), String> {
+    let parsed = match node_id {
+        Some(hex) => Some(parse_node_id(&hex).ok_or("invalid node id")?),
+        None => None,
+    };
+    send(Request::SetExit { node_id: parsed }).await
+}
+
+/// Volunteer (or stop) as an exit node for other peers.
+#[tauri::command]
+async fn allow_exit(enabled: bool) -> Result<(), String> {
+    send(Request::AllowExit { enabled }).await
 }
 
 /// Start the bundled daemon as root via the macOS admin prompt. Creating the TUN
@@ -145,7 +179,9 @@ fn main() {
             mesh_up,
             mesh_down,
             start_daemon,
-            stop_daemon
+            stop_daemon,
+            set_exit,
+            allow_exit
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");
