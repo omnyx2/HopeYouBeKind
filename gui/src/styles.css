@@ -138,6 +138,41 @@ button.secondary:hover { border-color: var(--off); background: #1f2430; }
 .dot.lost { background: var(--bad); }
 .small { font-size: 11px; }
 
+/* ---------- traffic monitor ---------- */
+.live-toggle {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 16px;
+  font-size: 12px; color: var(--muted); cursor: pointer; user-select: none;
+}
+.live-toggle input { accent-color: var(--accent); cursor: pointer; }
+
+.totals { display: flex; gap: 24px; padding: 14px 18px; }
+.total { display: flex; flex-direction: column; gap: 4px; }
+.total-label { font-size: 11px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: 0.04em; }
+.total-val { font-size: 18px; font-weight: 600; }
+
+table.flows { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.flows th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+table.flows th.num, table.flows td.num { text-align: right; }
+table.flows td {
+  padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 220px;
+}
+table.flows tr.hot td:first-child { box-shadow: inset 2px 0 0 var(--ok); }
+table.flows tbody tr:hover { background: #1b2030; }
+
+.proto {
+  display: inline-block; padding: 1px 7px; border-radius: 6px; font-size: 11px;
+  font-weight: 600; background: #232a3a; color: var(--muted);
+}
+.proto.tcp { background: rgba(91,140,255,0.18); color: #8fb0ff; }
+.proto.udp { background: rgba(52,211,153,0.16); color: #5fe0b0; }
+.proto.icmp { background: rgba(217,162,58,0.18); color: #e0b865; }
+
 /* toast */
 .toast {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);

@@ -19,6 +19,9 @@
             <span class="nav-ico">⧉</span> Peers
             <span id="nav-peer-count" class="nav-badge hidden">0</span>
           </button>
+          <button class="nav-item" data-tab="traffic">
+            <span class="nav-ico">📊</span> Traffic
+          </button>
           <button class="nav-item" data-tab="network">
             <span class="nav-ico">⇄</span> Network
           </button>
@@ -90,6 +93,48 @@
             <p class="hint">Direct needs a public ip:port (port-forwarded). Via
               relay needs a relay set in Network.</p>
           </div>
+        </section>
+
+        <!-- ===== TRAFFIC ===== -->
+        <section data-panel="traffic" class="panel hidden">
+          <div class="panel-head">
+            <h1 class="panel-title">Traffic <span id="flow-count" class="muted">(0)</span></h1>
+            <label class="live-toggle">
+              <input type="checkbox" id="traffic-live" checked />
+              <span>live</span>
+            </label>
+          </div>
+
+          <div class="card totals">
+            <div class="total">
+              <span class="total-label">▲ Sent</span>
+              <span id="total-tx" class="total-val mono">0 B</span>
+            </div>
+            <div class="total">
+              <span class="total-label">▼ Received</span>
+              <span id="total-rx" class="total-val mono">0 B</span>
+            </div>
+            <div class="total">
+              <span class="total-label">Flows</span>
+              <span id="total-flows" class="total-val mono">0</span>
+            </div>
+          </div>
+
+          <table class="flows">
+            <thead>
+              <tr>
+                <th>Proto</th>
+                <th>Local</th>
+                <th>Remote (peer)</th>
+                <th class="num">▲ Tx</th>
+                <th class="num">▼ Rx</th>
+                <th class="num">Last</th>
+              </tr>
+            </thead>
+            <tbody id="flows"></tbody>
+          </table>
+          <p id="flows-empty" class="hint">No traffic seen yet. Once apps talk over
+            the tunnel (ping, ssh, http…), every flow shows up here.</p>
         </section>
 
         <!-- ===== NETWORK ===== -->

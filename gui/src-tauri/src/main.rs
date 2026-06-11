@@ -28,6 +28,19 @@ struct StatusView {
 }
 
 #[derive(Serialize)]
+struct FlowView {
+    peer: Option<String>,
+    protocol: String,
+    local: String,
+    remote: String,
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    last_active_secs: u64,
+}
+
+#[derive(Serialize)]
 struct PeerView {
     virtual_ip: String,
     fingerprint: String,
@@ -68,6 +81,29 @@ async fn list_peers() -> Result<Vec<PeerView>, String> {
                 endpoint: p.endpoints.first().map(|e| e.to_string()),
                 node_id: p.id.to_hex(),
                 os: p.os,
+            })
+            .collect()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn list_flows() -> Result<Vec<FlowView>, String> {
+    match lattice_ipc::request(SOCKET, Request::Flows).await {
+        Ok(Response::Flows(flows)) => Ok(flows
+            .into_iter()
+            .map(|f| FlowView {
+                peer: f.peer.map(|id| id.fingerprint()),
+                protocol: f.protocol,
+                local: f.local,
+                remote: f.remote,
+                tx_packets: f.tx_packets,
+                tx_bytes: f.tx_bytes,
+                rx_packets: f.rx_packets,
+                rx_bytes: f.rx_bytes,
+                last_active_secs: f.last_active_secs,
             })
             .collect()),
         Ok(Response::Error { message }) => Err(message),
@@ -220,6 +256,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             list_peers,
+            list_flows,
             mesh_up,
             mesh_down,
             start_daemon,

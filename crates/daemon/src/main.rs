@@ -285,6 +285,7 @@ async fn main() -> Result<()> {
                     Response::Status(s)
                 }
                 Request::Peers => Response::Peers(handle.peers().await),
+                Request::Flows => Response::Flows(handle.flows()),
                 Request::Up => {
                     handle.set_enabled(true);
                     Response::Done

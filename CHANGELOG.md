@@ -11,6 +11,18 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 ## [Unreleased]
 
 ### Added
+- **Traffic monitor**: a passive per-flow observer of everything crossing the
+  tunnel. `lattice-engine` gained a `monitor` module (`TrafficMonitor`) that
+  records each plaintext packet on the outbound (pre-encrypt) and inbound
+  (post-decrypt) paths, aggregating by `(peer, protocol, local, remote)` with
+  per-direction packet/byte counters; both directions collapse onto one flow.
+  Bounded to 512 flows. Surfaced over IPC (`Request::Flows`/`Response::Flows`,
+  `FlowRecord`), via the CLI (`lattice flows`), and in a new GUI **Traffic** tab
+  (live table + sent/received totals, with a freeze toggle). The on-wire peer
+  protocol is unchanged — the monitor is passive and the IPC addition is
+  backward-compatible. Verified live over a real Mac↔Ubuntu LAN tunnel
+  (ICMP/TCP/UDP flows captured with correct ports and bidirectional counts).
+
 - **`lattice-dht`**: a Kademlia DHT for serverless peer rendezvous — XOR distance
   metric, k-bucket routing table, iterative node/value lookup, and a
   `Rendezvous` impl (publish candidates to the k closest nodes; look them up by
