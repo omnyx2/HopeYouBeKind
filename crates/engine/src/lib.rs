@@ -340,6 +340,21 @@ impl Engine {
                 let private = self.identity.private_key().to_vec();
                 let pending = respond(&private, payload, &local_meta())?;
                 let peer_id = node_id_from_pubkey(&pending.remote_static);
+
+                // Dedup: if we already have a live session with this peer (e.g. a
+                // duplicate INIT from multi-candidate hole punch), ignore this
+                // one — adopting it would clobber the working session and desync.
+                if let Some(&ep) = self.connected.get(&peer_id) {
+                    let fresh = self
+                        .last_seen
+                        .get(&ep)
+                        .map(|t| t.elapsed() < Duration::from_secs(15))
+                        .unwrap_or(false);
+                    if fresh && self.sessions.contains_key(&ep) {
+                        return Ok(());
+                    }
+                }
+
                 let info = PeerInfo {
                     id: peer_id,
                     virtual_ip: derive_virtual_ip(&peer_id),

@@ -174,13 +174,21 @@ pub mod discovery {
         id.copy_from_slice(&pk);
 
         let port = info.get_port();
-        // Our transport binds IPv4 (0.0.0.0), so skip IPv6 candidates — sending
-        // to one from an IPv4 socket fails with EINVAL, and link-local fe80::
-        // addresses are unusable without a scope id anyway.
+        // Keep only usable *physical* IPv4 candidates: skip IPv6 (our socket is
+        // IPv4, and fe80:: link-local needs a scope id), and skip the overlay
+        // range 100.64.0.0/10 — those are virtual mesh IPs, not ways to reach
+        // the node physically (dialing one loops back through the tunnel and
+        // spawns a duplicate handshake).
         let endpoints: Vec<SocketAddr> = info
             .get_addresses()
             .iter()
-            .filter(|ip| ip.is_ipv4())
+            .filter(|ip| match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let o = v4.octets();
+                    !(o[0] == 100 && (64..=127).contains(&o[1]))
+                }
+                std::net::IpAddr::V6(_) => false,
+            })
             .map(|ip| SocketAddr::new(*ip, port))
             .collect();
         if endpoints.is_empty() {
