@@ -38,6 +38,7 @@ A snapshot of what Lattice does today (v0.7.0). Legend: ✅ working & tested ·
 | Kademlia DHT rendezvous (XOR, k-buckets, lookup) | ✅ | `crates/dht` |
 | DHT over real UDP (request-id demux server) | ✅ | `crates/dht` (`server.rs`) |
 | Daemon DHT wiring (`--dht-bind/-bootstrap/--peer`) | ✅ | `crates/daemon` |
+| Manual peer pin (`--peer-addr <id>@<ip:port>`, GUI add) | ✅ | `crates/daemon`, `gui/` |
 | Public bootstrap node (stable internet entry point) | 🔜 | operational, not code |
 | Relay fallback when hole punching fails (DERP-style) | 🔜 | future spec |
 

@@ -117,6 +117,18 @@ async fn allow_exit(enabled: bool) -> Result<(), String> {
     send(Request::AllowExit { enabled }).await
 }
 
+/// Manually pin a peer from a `<node-id>@<ip:port>` string — connect across the
+/// internet without discovery (e.g. to a port-forwarded node).
+#[tauri::command]
+async fn add_peer(spec: String) -> Result<(), String> {
+    let (id_hex, addr_str) = spec
+        .split_once('@')
+        .ok_or("format: <node-id>@<ip:port>")?;
+    let node_id = parse_node_id(id_hex.trim()).ok_or("invalid node id (need 64 hex chars)")?;
+    let addr: std::net::SocketAddr = addr_str.trim().parse().map_err(|_| "invalid ip:port")?;
+    send(Request::AddPeer { node_id, addr }).await
+}
+
 /// Start the bundled daemon as root via the macOS admin prompt. Creating the TUN
 /// device requires privileges; this is the one moment the user authenticates.
 #[cfg(target_os = "macos")]
@@ -181,7 +193,8 @@ fn main() {
             start_daemon,
             stop_daemon,
             set_exit,
-            allow_exit
+            allow_exit,
+            add_peer
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");

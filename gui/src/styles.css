@@ -60,6 +60,14 @@ h2 { font-size: 15px; margin: 0 0 12px; }
 .switch input:checked + .slider { background: var(--ok); }
 .switch input:checked + .slider::before { transform: translateX(18px); }
 
+.add-peer { display: flex; gap: 8px; margin-top: 12px; }
+.add-peer input {
+  flex: 1; min-width: 0; background: #11141b; color: var(--text);
+  border: 1px solid #3a3f4d; border-radius: 8px; padding: 8px 10px;
+  font-size: 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.add-peer button { width: auto; margin: 0; padding: 8px 14px; }
+
 .select {
   background: #11141b; color: var(--text); border: 1px solid #3a3f4d;
   border-radius: 8px; padding: 5px 8px; font-size: 13px; max-width: 60%;
