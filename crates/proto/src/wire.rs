@@ -14,6 +14,8 @@ pub enum MessageType {
     HandshakeResp = 0x02,
     Transport = 0x03,
     Keepalive = 0x04,
+    /// Gossiped revocation list — propagates member evictions across the mesh.
+    Revocation = 0x05,
 }
 
 impl MessageType {
@@ -23,6 +25,7 @@ impl MessageType {
             0x02 => Some(Self::HandshakeResp),
             0x03 => Some(Self::Transport),
             0x04 => Some(Self::Keepalive),
+            0x05 => Some(Self::Revocation),
             _ => None,
         }
     }

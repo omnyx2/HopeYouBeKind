@@ -9,6 +9,7 @@ description = "The Lattice node runtime: wires the data, transport, and control 
 [dependencies]
 lattice-proto.workspace = true
 lattice-crypto.workspace = true
+lattice-membership.workspace = true
 lattice-tun.workspace = true
 lattice-net.workspace = true
 lattice-overlay.workspace = true

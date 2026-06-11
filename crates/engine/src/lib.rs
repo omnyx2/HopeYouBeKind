@@ -19,9 +19,10 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lattice_crypto::{CryptoSuite, HandshakeState, Identity, NoiseSuite, TunnelSession};
+use lattice_membership::{MemberCert, NetworkId, Revocation, RevocationList};
 use lattice_net::{DiscoveredPeer, Discovery, Transport};
 use lattice_overlay::{derive_virtual_ip, Overlay};
 use lattice_proto::ipc::{FlowRecord, NodeStatus};
@@ -92,6 +93,18 @@ pub struct Engine {
     /// Passive observer of every packet crossing the tunnel — feeds the GUI's
     /// traffic monitor.
     monitor: Arc<TrafficMonitor>,
+    /// The network we belong to and verify peers against. `None` = open mode
+    /// (no membership gate — any peer that completes the handshake is admitted).
+    network: Arc<std::sync::Mutex<Option<NetworkId>>>,
+    /// Our own membership certificate, presented in the handshake. `None` in
+    /// open mode.
+    cert: Option<MemberCert>,
+    /// Revocations we know about, gossiped across the mesh. Shared so the IPC
+    /// handle can inject new ones (the admin evicting a member).
+    revocations: Arc<std::sync::Mutex<RevocationList>>,
+    /// Cert serial of each connected peer, so a gossiped revocation can be
+    /// matched to a live session and the peer dropped.
+    peer_serial: HashMap<NodeId, u64>,
 }
 
 impl Engine {
@@ -125,7 +138,19 @@ impl Engine {
             exit_node: Arc::new(std::sync::Mutex::new(None)),
             allow_exit: Arc::new(AtomicBool::new(false)),
             monitor: Arc::new(TrafficMonitor::new()),
+            network: Arc::new(std::sync::Mutex::new(None)),
+            cert: None,
+            revocations: Arc::new(std::sync::Mutex::new(RevocationList::new())),
+            peer_serial: HashMap::new(),
         }
+    }
+
+    /// Join a network: present `cert` (signed by the network CA) on every
+    /// handshake and require peers to present a valid, unrevoked cert for the
+    /// same `network`. Without this, the node runs in open mode (no gate).
+    pub fn set_membership(&mut self, network: NetworkId, cert: MemberCert) {
+        *self.network.lock().unwrap() = Some(network);
+        self.cert = Some(cert);
     }
 
     pub fn virtual_ip(&self) -> VirtualIp {
@@ -149,6 +174,8 @@ impl Engine {
             exit_node: Arc::clone(&self.exit_node),
             allow_exit: Arc::clone(&self.allow_exit),
             monitor: Arc::clone(&self.monitor),
+            network: Arc::clone(&self.network),
+            revocations: Arc::clone(&self.revocations),
         }
     }
 
@@ -265,7 +292,7 @@ impl Engine {
         self.overlay.lock().await.upsert_peer(info)?;
 
         let private = self.identity.private_key().to_vec();
-        let meta = local_meta();
+        let meta = self.local_payload();
         // Hole punch: initiate a handshake toward every candidate endpoint at
         // once. The first to answer wins — its NAT binding is the working path.
         // A single unreachable candidate must not abort the others.
@@ -364,8 +391,19 @@ impl Engine {
         match msg_type {
             MessageType::HandshakeInit => {
                 let private = self.identity.private_key().to_vec();
-                let accepted = self.suite.respond(&private, payload, &local_meta())?;
+                let accepted = self.suite.respond(&private, payload, &self.local_payload())?;
                 let peer_id = node_id_from_pubkey(&accepted.peer_identity);
+
+                // Membership gate: in a network, the initiator must present a
+                // valid, unrevoked cert for it, bound to its identity key.
+                let (peer_cert, os_bytes) = decode_payload(&accepted.peer_payload);
+                let serial = match self.verify_membership(&accepted.peer_identity, &peer_cert) {
+                    Ok(serial) => serial,
+                    Err(e) => {
+                        tracing::warn!(peer = %peer_id.fingerprint(), %from, error = %e, "rejected handshake: membership");
+                        return Ok(());
+                    }
+                };
 
                 // Dedup: if we already have a live session with this peer (e.g. a
                 // duplicate INIT from multi-candidate hole punch), ignore this
@@ -387,11 +425,14 @@ impl Engine {
                     public_key: accepted.peer_identity,
                     endpoints: vec![from],
                     status: PeerStatus::Connected,
-                    os: decode_os(&accepted.peer_payload),
+                    os: decode_os(&os_bytes),
                 };
                 self.overlay.lock().await.upsert_peer(info)?;
                 self.sessions.insert(from, accepted.session);
                 self.connected.insert(peer_id, from);
+                if let Some(serial) = serial {
+                    self.peer_serial.insert(peer_id, serial);
+                }
                 transport
                     .send_to(
                         &wire::encode(MessageType::HandshakeResp, &accepted.response),
@@ -403,12 +444,29 @@ impl Engine {
             MessageType::HandshakeResp => {
                 if let Some(handshake) = self.pending.remove(&from) {
                     let (session, peer_meta) = handshake.complete(payload)?;
+                    let peer_id = self.peer_id_at(from).await;
+
+                    // Membership gate: verify the responder's cert against the
+                    // identity key we initiated to (peer_id == its public key).
+                    let (peer_cert, os_bytes) = decode_payload(&peer_meta);
+                    let expected = peer_id.map(|p| p.0).unwrap_or([0u8; 32]);
+                    let serial = match self.verify_membership(&expected, &peer_cert) {
+                        Ok(serial) => serial,
+                        Err(e) => {
+                            tracing::warn!(%from, error = %e, "rejected handshake response: membership");
+                            return Ok(());
+                        }
+                    };
+
                     self.sessions.insert(from, session);
-                    if let Some(peer_id) = self.peer_id_at(from).await {
+                    if let Some(peer_id) = peer_id {
                         self.connected.insert(peer_id, from);
+                        if let Some(serial) = serial {
+                            self.peer_serial.insert(peer_id, serial);
+                        }
                         let mut overlay = self.overlay.lock().await;
                         overlay.set_status(&peer_id, PeerStatus::Connected);
-                        if let Some(os) = decode_os(&peer_meta) {
+                        if let Some(os) = decode_os(&os_bytes) {
                             overlay.set_os(&peer_id, os);
                         }
                     }
@@ -436,8 +494,50 @@ impl Engine {
                 tun.write_packet(&plaintext).await?;
             }
             MessageType::Keepalive => { /* v0.7: liveness tracking */ }
+            MessageType::Revocation => {
+                // A peer gossiped its revocation list — merge any new, validly
+                // signed entries, then drop connected peers they evict.
+                if let (Some(network), Ok(incoming)) =
+                    (self.network_id(), RevocationList::from_bytes(payload))
+                {
+                    let added = self
+                        .revocations
+                        .lock()
+                        .unwrap()
+                        .merge(&incoming, &network);
+                    if added > 0 {
+                        tracing::info!(added, "learned revocations from peer");
+                        self.enforce_revocations().await;
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Drop every connected peer whose cert serial has been revoked — closes the
+    /// session, forgets the endpoint, and removes it from the overlay.
+    async fn enforce_revocations(&mut self) {
+        let revoked: Vec<(NodeId, SocketAddr)> = {
+            let crl = self.revocations.lock().unwrap();
+            self.peer_serial
+                .iter()
+                .filter(|(_, &serial)| crl.is_revoked(serial))
+                .filter_map(|(id, _)| self.connected.get(id).map(|ep| (*id, *ep)))
+                .collect()
+        };
+        if revoked.is_empty() {
+            return;
+        }
+        let mut overlay = self.overlay.lock().await;
+        for (id, ep) in revoked {
+            self.sessions.remove(&ep);
+            self.connected.remove(&id);
+            self.last_seen.remove(&ep);
+            self.peer_serial.remove(&id);
+            overlay.remove_peer(&id);
+            tracing::info!(peer = %id.fingerprint(), "peer revoked, session dropped");
+        }
     }
 
     /// Send a keepalive to every connected peer, then refresh reachability from
@@ -453,6 +553,20 @@ impl Engine {
         let endpoints: Vec<SocketAddr> = self.sessions.keys().copied().collect();
         for ep in &endpoints {
             let _ = transport.send_to(&frame, *ep).await;
+        }
+
+        // Gossip our revocation list so evictions propagate across the mesh, then
+        // drop any peer it now revokes.
+        let crl_bytes = {
+            let crl = self.revocations.lock().unwrap();
+            (!crl.is_empty()).then(|| crl.to_bytes())
+        };
+        if let Some(bytes) = crl_bytes {
+            let frame = wire::encode(MessageType::Revocation, &bytes);
+            for ep in &endpoints {
+                let _ = transport.send_to(&frame, *ep).await;
+            }
+            self.enforce_revocations().await;
         }
 
         // Re-classify peers by how recently we heard from their endpoint.
@@ -475,8 +589,41 @@ impl Engine {
             self.sessions.remove(&ep);
             self.connected.remove(&id);
             self.last_seen.remove(&ep);
+            self.peer_serial.remove(&id);
             tracing::info!(peer = %id.fingerprint(), "peer timed out, removed");
         }
+    }
+
+    /// The network we belong to, if any (open mode otherwise).
+    fn network_id(&self) -> Option<NetworkId> {
+        *self.network.lock().unwrap()
+    }
+
+    /// Our handshake payload: membership cert (if any) + OS.
+    fn local_payload(&self) -> Vec<u8> {
+        encode_payload(self.cert.as_ref(), std::env::consts::OS.as_bytes())
+    }
+
+    /// Decide whether a peer presenting `cert` may join. In open mode (no
+    /// network) everyone is admitted (`Ok(None)`). In a network the cert must be
+    /// present, valid for our network, bound to `peer_identity`, and unrevoked;
+    /// on success returns its serial so the session can be matched to future
+    /// revocations.
+    fn verify_membership(
+        &self,
+        peer_identity: &[u8],
+        cert: &Option<MemberCert>,
+    ) -> Result<Option<u64>, lattice_membership::MembershipError> {
+        use lattice_membership::MembershipError;
+        let Some(network) = self.network_id() else {
+            return Ok(None); // open mode
+        };
+        let cert = cert.as_ref().ok_or(MembershipError::WrongNetwork)?;
+        cert.verify(&network, peer_identity, now_unix())?;
+        if self.revocations.lock().unwrap().is_revoked(cert.serial()) {
+            return Err(MembershipError::Revoked);
+        }
+        Ok(Some(cert.serial()))
     }
 
     /// Which connected peer owns this transport `endpoint` — the reverse of the
@@ -513,6 +660,8 @@ pub struct EngineHandle {
     exit_node: Arc<std::sync::Mutex<Option<NodeId>>>,
     allow_exit: Arc<AtomicBool>,
     monitor: Arc<TrafficMonitor>,
+    network: Arc<std::sync::Mutex<Option<NetworkId>>>,
+    revocations: Arc<std::sync::Mutex<RevocationList>>,
 }
 
 impl EngineHandle {
@@ -559,6 +708,26 @@ impl EngineHandle {
         self.monitor.snapshot()
     }
 
+    /// The network this node belongs to, if any.
+    pub fn network_id(&self) -> Option<NetworkId> {
+        *self.network.lock().unwrap()
+    }
+
+    /// Inject a revocation (the admin evicting a member). It's verified against
+    /// our network before being accepted; once added, the engine loop gossips it
+    /// and drops the evicted peer. Returns true if newly added.
+    pub fn add_revocation(&self, rev: Revocation) -> bool {
+        let Some(network) = self.network_id() else {
+            return false;
+        };
+        self.revocations.lock().unwrap().add(rev, &network)
+    }
+
+    /// How many revocations this node currently knows about.
+    pub fn revocation_count(&self) -> usize {
+        self.revocations.lock().unwrap().len()
+    }
+
     /// Bring the mesh up (`true`) or down (`false`). When down, the engine keeps
     /// running but stops forwarding overlay packets.
     pub fn set_enabled(&self, on: bool) {
@@ -566,9 +735,44 @@ impl EngineHandle {
     }
 }
 
-/// Our own metadata advertised to peers in the handshake (currently the OS).
-fn local_meta() -> Vec<u8> {
-    std::env::consts::OS.as_bytes().to_vec()
+/// Current wall-clock time in unix seconds, for cert expiry checks.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Build the authenticated handshake payload: an optional membership cert
+/// followed by our OS string. Self-describing so open mode (no cert) and
+/// membership mode share one format.
+///
+/// Layout: `[has_cert: 1][cert: 152 if has_cert][os: utf8 remainder]`.
+fn encode_payload(cert: Option<&MemberCert>, os: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 152 + os.len());
+    match cert {
+        Some(c) => {
+            out.push(1);
+            out.extend_from_slice(&c.to_bytes());
+        }
+        None => out.push(0),
+    }
+    out.extend_from_slice(os);
+    out
+}
+
+/// Inverse of [`encode_payload`]: split a handshake payload into the peer's cert
+/// (if present and well-formed) and its OS bytes.
+fn decode_payload(payload: &[u8]) -> (Option<MemberCert>, Vec<u8>) {
+    match payload.split_first() {
+        Some((1, rest)) if rest.len() >= 152 => {
+            let cert = MemberCert::from_bytes(&rest[..152]).ok();
+            (cert, rest[152..].to_vec())
+        }
+        Some((0, rest)) => (None, rest.to_vec()),
+        // Unknown/legacy format: treat the whole thing as OS metadata, no cert.
+        _ => (None, payload.to_vec()),
+    }
 }
 
 /// Decode a peer's handshake metadata payload into an OS string, if present.
@@ -760,5 +964,85 @@ mod tests {
             received, packet,
             "exit node receives A's internet packet to forward"
         );
+    }
+
+    /// Build a minimal IPv4 packet from `src` → `dst` (version + addrs only).
+    fn ipv4(src: VirtualIp, dst: VirtualIp) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[12..16].copy_from_slice(&src.0.octets());
+        p[16..20].copy_from_slice(&dst.0.octets());
+        p
+    }
+
+    /// Two nodes carrying valid certs for the same network form a tunnel, and
+    /// once connected, revoking one tears its session down (eviction).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_network_connects_then_revocation_evicts() {
+        use lattice_membership::NetworkKey;
+
+        let net = NetworkKey::generate();
+        let net_id = net.network_id();
+
+        let id_a = Identity::generate().unwrap();
+        let id_b = Identity::generate().unwrap();
+        let (a_id, b_id) = (id_a.node_id(), id_b.node_id());
+        let vip_a = derive_virtual_ip(&a_id);
+        let vip_b = derive_virtual_ip(&b_id);
+
+        // The CA admits both nodes (serials 1 and 2, no expiry).
+        let cert_a = net.issue_cert(&a_id.0, 1, 0, 0);
+        let cert_b = net.issue_cert(&b_id.0, 2, 0, 0);
+
+        let addr_a: SocketAddr = "10.0.0.1:702".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:702".parse().unwrap();
+        let (ta, tb) = duplex(addr_a, addr_b);
+        let (tun_a, handle_a) = MemoryTun::new();
+        let (tun_b, mut handle_b) = MemoryTun::new();
+
+        let disc_a = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: b_id,
+            endpoints: vec![addr_b],
+        }]);
+        let disc_b = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: a_id,
+            endpoints: vec![addr_a],
+        }]);
+
+        let mut engine_a = Engine::new(id_a, EngineConfig::default());
+        let mut engine_b = Engine::new(id_b, EngineConfig::default());
+        engine_a.set_membership(net_id, cert_a);
+        engine_b.set_membership(net_id, cert_b);
+        let a_ctl = engine_a.handle();
+
+        tokio::spawn(async move {
+            let _ = engine_a.run(tun_a, ta, disc_a).await;
+        });
+        tokio::spawn(async move {
+            let _ = engine_b.run(tun_b, tb, disc_b).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Same network → the cert check passes both ways and a packet tunnels.
+        handle_a.inject.send(ipv4(vip_a, vip_b)).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), handle_b.observe.recv())
+            .await
+            .expect("packet should arrive once membership is verified")
+            .expect("B's TUN open");
+        assert_eq!(got, ipv4(vip_a, vip_b));
+        assert_eq!(a_ctl.peers().await.len(), 1, "B is a connected peer of A");
+
+        // The admin evicts B (revokes serial 2). A learns it and drops B.
+        assert!(a_ctl.add_revocation(net.revoke(2, 0)));
+        let mut evicted = false;
+        for _ in 0..14 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            if a_ctl.peers().await.is_empty() {
+                evicted = true;
+                break;
+            }
+        }
+        assert!(evicted, "revoked peer B must be dropped from A within ~8s");
     }
 }
