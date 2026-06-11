@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use lattice_crypto::{respond, Handshake, Identity, NoiseSession, TunnelSession};
 use lattice_net::{DiscoveredPeer, Discovery, Transport};
@@ -68,6 +69,9 @@ pub struct Engine {
     /// The endpoint each peer is actually reachable at, learned when its session
     /// establishes — the candidate whose NAT binding won the hole punch.
     connected: HashMap<NodeId, SocketAddr>,
+    /// When we last received any datagram from each endpoint — drives
+    /// reachability (and keepalives keep NAT bindings open).
+    last_seen: HashMap<SocketAddr, Instant>,
     config: EngineConfig,
     /// Whether the engine loop is live (set while `run` is executing).
     running: Arc<AtomicBool>,
@@ -88,6 +92,7 @@ impl Engine {
             sessions: HashMap::new(),
             pending: HashMap::new(),
             connected: HashMap::new(),
+            last_seen: HashMap::new(),
             config,
             running: Arc::new(AtomicBool::new(false)),
             enabled: Arc::new(AtomicBool::new(true)),
@@ -136,9 +141,16 @@ impl Engine {
         self.running.store(true, Ordering::Relaxed);
         tracing::info!(virtual_ip = %self.virtual_ip, "engine started");
 
+        // Periodic keepalive: detects reachability and keeps NAT bindings open.
+        let mut keepalive = tokio::time::interval(Duration::from_secs(5));
+
         let mut discovery_done = false;
         loop {
             tokio::select! {
+                // Every tick: probe peers and refresh their reachability.
+                _ = keepalive.tick() => {
+                    self.on_keepalive_tick(&transport).await;
+                }
                 // A peer was discovered → start a handshake with it.
                 maybe_peer = discovery.next_peer(), if !discovery_done => {
                     match maybe_peer {
@@ -269,6 +281,8 @@ impl Engine {
         let Some((msg_type, payload)) = wire::decode(data) else {
             return Ok(());
         };
+        // Any datagram from a peer proves it's alive right now.
+        self.last_seen.insert(from, Instant::now());
         match msg_type {
             MessageType::HandshakeInit => {
                 let private = self.identity.private_key().to_vec();
@@ -316,6 +330,45 @@ impl Engine {
             MessageType::Keepalive => { /* v0.7: liveness tracking */ }
         }
         Ok(())
+    }
+
+    /// Send a keepalive to every connected peer, then refresh reachability from
+    /// how recently each was heard from. Peers unseen past a threshold are marked
+    /// Lost; long-dead ones are dropped (clears stale "ghost" entries).
+    async fn on_keepalive_tick<X: Transport>(&mut self, transport: &X) {
+        const STALE: Duration = Duration::from_secs(15);
+        const DEAD: Duration = Duration::from_secs(60);
+        let now = Instant::now();
+
+        // Probe each live session (also refreshes the NAT binding both ways).
+        let frame = wire::encode(MessageType::Keepalive, &[]);
+        let endpoints: Vec<SocketAddr> = self.sessions.keys().copied().collect();
+        for ep in &endpoints {
+            let _ = transport.send_to(&frame, *ep).await;
+        }
+
+        // Re-classify peers by how recently we heard from their endpoint.
+        let mut dead: Vec<(NodeId, SocketAddr)> = Vec::new();
+        {
+            let mut overlay = self.overlay.lock().await;
+            for (node_id, ep) in &self.connected {
+                let age = self.last_seen.get(ep).map(|t| now.duration_since(*t));
+                match age {
+                    Some(a) if a < STALE => overlay.set_status(node_id, PeerStatus::Connected),
+                    Some(a) if a >= DEAD => dead.push((*node_id, *ep)),
+                    _ => overlay.set_status(node_id, PeerStatus::Lost),
+                }
+            }
+            for (id, _) in &dead {
+                overlay.remove_peer(id);
+            }
+        }
+        for (id, ep) in dead {
+            self.sessions.remove(&ep);
+            self.connected.remove(&id);
+            self.last_seen.remove(&ep);
+            tracing::info!(peer = %id.fingerprint(), "peer timed out, removed");
+        }
     }
 
     /// Find which known peer currently lives at `endpoint`.
