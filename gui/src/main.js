@@ -67,6 +67,61 @@ async function refresh() {
   renderPeers(peers);
   updateExitSelect(peers, status.exit_node);
   el("exit-toggle").checked = !!status.is_exit;
+
+  // traffic — only when the user hasn't paused the live view
+  if (el("traffic-live").checked) {
+    let flows = [];
+    try {
+      flows = await invoke("list_flows");
+    } catch {
+      /* transient */
+    }
+    renderFlows(flows);
+  }
+}
+
+function renderFlows(flows) {
+  el("flow-count").textContent = `(${flows.length})`;
+  el("total-flows").textContent = flows.length;
+
+  let txBytes = 0, rxBytes = 0;
+  for (const f of flows) {
+    txBytes += f.tx_bytes;
+    rxBytes += f.rx_bytes;
+  }
+  el("total-tx").textContent = fmtBytes(txBytes);
+  el("total-rx").textContent = fmtBytes(rxBytes);
+
+  const tbody = el("flows");
+  tbody.innerHTML = "";
+  el("flows-empty").classList.toggle("hidden", flows.length > 0);
+  for (const f of flows) {
+    const tr = document.createElement("tr");
+    if (f.last_active_secs <= 3) tr.className = "hot";
+    const peer = f.peer ? ` <span class="muted small">(${f.peer})</span>` : "";
+    tr.innerHTML =
+      `<td><span class="proto ${f.protocol.toLowerCase().replace(/\W/g, "")}">${f.protocol}</span></td>` +
+      `<td class="mono small">${f.local}</td>` +
+      `<td class="mono small">${f.remote}${peer}</td>` +
+      `<td class="num mono small">${fmtBytes(f.tx_bytes)}<span class="muted"> / ${f.tx_packets}p</span></td>` +
+      `<td class="num mono small">${fmtBytes(f.rx_bytes)}<span class="muted"> / ${f.rx_packets}p</span></td>` +
+      `<td class="num mono small muted">${fmtAge(f.last_active_secs)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function fmtAge(secs) {
+  if (secs <= 1) return "now";
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  return `${Math.floor(secs / 3600)}h`;
 }
 
 function setPeerBadge(n) {
@@ -275,6 +330,12 @@ function mockInvoke(cmd, args) {
     case "list_peers":
       return Promise.resolve(s.up ? [
         { virtual_ip: "0.0.0.0 (DEMO)", fingerprint: "demo", status: "known", endpoint: null, node_id: "00".repeat(32), os: "demo" },
+      ] : []);
+    case "list_flows":
+      return Promise.resolve(s.up ? [
+        { peer: "demo", protocol: "TCP", local: "100.64.0.1:54012", remote: "100.64.0.2:22", tx_packets: 128, tx_bytes: 18432, rx_packets: 140, rx_bytes: 196608, last_active_secs: 0 },
+        { peer: "demo", protocol: "ICMP", local: "100.64.0.1", remote: "100.64.0.2", tx_packets: 50, tx_bytes: 4200, rx_packets: 50, rx_bytes: 4200, last_active_secs: 2 },
+        { peer: "demo", protocol: "UDP", local: "100.64.0.1:51820", remote: "100.64.0.2:443", tx_packets: 12, tx_bytes: 1536, rx_packets: 9, rx_bytes: 12000, last_active_secs: 40 },
       ] : []);
     default: return Promise.resolve(null);
   }

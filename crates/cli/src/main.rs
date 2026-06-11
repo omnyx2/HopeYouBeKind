@@ -27,6 +27,8 @@ enum Command {
     Status,
     /// List known peers.
     Peers,
+    /// Show live traffic flows crossing the tunnel.
+    Flows,
 }
 
 impl Command {
@@ -36,6 +38,7 @@ impl Command {
             Command::Down => Request::Down,
             Command::Status => Request::Status,
             Command::Peers => Request::Peers,
+            Command::Flows => Request::Flows,
         }
     }
 }
@@ -78,6 +81,24 @@ fn print_response(response: Response) {
                     p.virtual_ip,
                     p.os.as_deref().unwrap_or("?"),
                     p.status
+                );
+            }
+        }
+        Response::Flows(flows) => {
+            if flows.is_empty() {
+                println!("no traffic yet");
+            }
+            for f in flows {
+                println!(
+                    "{:<5}  {:<22} <-> {:<22}  ↑{}p/{}B ↓{}p/{}B  {}s ago",
+                    f.protocol,
+                    f.local,
+                    f.remote,
+                    f.tx_packets,
+                    f.tx_bytes,
+                    f.rx_packets,
+                    f.rx_bytes,
+                    f.last_active_secs
                 );
             }
         }

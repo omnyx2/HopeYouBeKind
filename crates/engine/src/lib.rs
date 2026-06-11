@@ -24,11 +24,14 @@ use std::time::{Duration, Instant};
 use lattice_crypto::{respond, Handshake, Identity, NoiseSession, TunnelSession};
 use lattice_net::{DiscoveredPeer, Discovery, Transport};
 use lattice_overlay::{derive_virtual_ip, Overlay};
-use lattice_proto::ipc::NodeStatus;
+use lattice_proto::ipc::{FlowRecord, NodeStatus};
 use lattice_proto::wire::{self, MessageType};
 use lattice_proto::{NodeId, PeerInfo, PeerStatus, VirtualIp};
 use lattice_tun::TunDevice;
 use tokio::sync::Mutex;
+
+pub mod monitor;
+use monitor::{Direction, TrafficMonitor};
 
 #[derive(thiserror::Error, Debug)]
 pub enum EngineError {
@@ -83,6 +86,9 @@ pub struct Engine {
     exit_node: Arc<std::sync::Mutex<Option<NodeId>>>,
     /// Whether we forward other nodes' internet traffic (act as an exit node).
     allow_exit: Arc<AtomicBool>,
+    /// Passive observer of every packet crossing the tunnel — feeds the GUI's
+    /// traffic monitor.
+    monitor: Arc<TrafficMonitor>,
 }
 
 impl Engine {
@@ -103,6 +109,7 @@ impl Engine {
             public_addr: Arc::new(std::sync::Mutex::new(None)),
             exit_node: Arc::new(std::sync::Mutex::new(None)),
             allow_exit: Arc::new(AtomicBool::new(false)),
+            monitor: Arc::new(TrafficMonitor::new()),
         }
     }
 
@@ -126,6 +133,7 @@ impl Engine {
             public_addr: Arc::clone(&self.public_addr),
             exit_node: Arc::clone(&self.exit_node),
             allow_exit: Arc::clone(&self.allow_exit),
+            monitor: Arc::clone(&self.monitor),
         }
     }
 
@@ -301,6 +309,9 @@ impl Engine {
         let Some(session) = self.sessions.get_mut(&endpoint) else {
             return Ok(()); // session still being established
         };
+        // Observe what we're sending before it's sealed (the monitor needs the
+        // plaintext IP header to classify the flow).
+        self.monitor.record(peer_id, Direction::Tx, packet);
         let sealed = session.encrypt(packet)?;
         transport
             .send_to(&wire::encode(MessageType::Transport, &sealed), endpoint)
@@ -394,6 +405,11 @@ impl Engine {
                     Some(session) => session.decrypt(payload)?,
                     None => return Ok(()), // no session for this source
                 };
+                // Observe everything that arrives over the tunnel, regardless of
+                // whether we ultimately forward it locally.
+                if let Some(peer_id) = self.peer_at_endpoint(from) {
+                    self.monitor.record(peer_id, Direction::Rx, &plaintext);
+                }
                 // Internet-bound traffic from a peer is only forwarded to the OS
                 // (to be NAT'd out) when we've volunteered as an exit node;
                 // otherwise drop it so we never relay strangers' traffic.
@@ -448,6 +464,15 @@ impl Engine {
         }
     }
 
+    /// Which connected peer owns this transport `endpoint` — the reverse of the
+    /// `connected` map, for attributing inbound packets to a peer.
+    fn peer_at_endpoint(&self, endpoint: SocketAddr) -> Option<NodeId> {
+        self.connected
+            .iter()
+            .find(|(_, &ep)| ep == endpoint)
+            .map(|(id, _)| *id)
+    }
+
     /// Find which known peer currently lives at `endpoint`.
     async fn peer_id_at(&self, endpoint: SocketAddr) -> Option<NodeId> {
         self.overlay
@@ -472,6 +497,7 @@ pub struct EngineHandle {
     public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     exit_node: Arc<std::sync::Mutex<Option<NodeId>>>,
     allow_exit: Arc<AtomicBool>,
+    monitor: Arc<TrafficMonitor>,
 }
 
 impl EngineHandle {
@@ -511,6 +537,11 @@ impl EngineHandle {
 
     pub async fn peers(&self) -> Vec<PeerInfo> {
         self.overlay.lock().await.peers().cloned().collect()
+    }
+
+    /// Live traffic flows observed crossing the tunnel, most-recent first.
+    pub fn flows(&self) -> Vec<FlowRecord> {
+        self.monitor.snapshot()
     }
 
     /// Bring the mesh up (`true`) or down (`false`). When down, the engine keeps
@@ -609,6 +640,8 @@ mod tests {
 
         let mut engine_a = Engine::new(id_a, EngineConfig::default());
         let mut engine_b = Engine::new(id_b, EngineConfig::default());
+        // Keep a handle to A so we can inspect the traffic monitor afterwards.
+        let handle_a_mon = engine_a.handle();
 
         tokio::spawn(async move {
             let _ = engine_a.run(tun_a, ta, disc_a).await;
@@ -636,6 +669,20 @@ mod tests {
         assert_eq!(
             received, packet,
             "B must receive A's original packet decrypted"
+        );
+
+        // The traffic monitor must have observed A's outbound packet as a flow
+        // from A's virtual IP to B's.
+        let flows = handle_a_mon.flows();
+        let flow = flows
+            .iter()
+            .find(|f| f.local.starts_with(&vip_a.to_string()))
+            .expect("A's monitor should have recorded the tunneled packet");
+        assert_eq!(flow.tx_packets, 1, "exactly one packet was sent");
+        assert!(
+            flow.remote.starts_with(&vip_b.to_string()),
+            "flow's remote end is B's virtual IP, got {}",
+            flow.remote
         );
     }
 
