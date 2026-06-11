@@ -123,13 +123,32 @@ pub mod discovery {
             let instance = &pk_hex[..pk_hex.len().min(12)];
             let host = format!("{instance}.local.");
 
-            // Advertise ourselves. `enable_addr_auto` lets the daemon fill in our
-            // LAN addresses; the TXT "pk" carries our full identity.
+            // Advertise ourselves. We publish our real LAN IPv4 *explicitly*:
+            // `enable_addr_auto` proved unreliable on hosts with many virtual
+            // interfaces (e.g. a Mac with several utun devices), where it
+            // published only IPv6 link-local — so peers had no usable address
+            // and could never dial us. Fall back to addr_auto only if we can't
+            // determine a v4. The TXT "pk" carries our full identity.
             let props = [("pk", pk_hex.as_str())];
-            let service =
-                mdns_sd::ServiceInfo::new(SERVICE_TYPE, instance, &host, "", port, &props[..])
+            let service = match local_ipv4() {
+                Some(ip) => {
+                    let addr = ip.to_string();
+                    mdns_sd::ServiceInfo::new(
+                        SERVICE_TYPE,
+                        instance,
+                        &host,
+                        addr.as_str(),
+                        port,
+                        &props[..],
+                    )
                     .map_err(|e| NetError::Discovery(e.to_string()))?
-                    .enable_addr_auto();
+                }
+                None => {
+                    mdns_sd::ServiceInfo::new(SERVICE_TYPE, instance, &host, "", port, &props[..])
+                        .map_err(|e| NetError::Discovery(e.to_string()))?
+                        .enable_addr_auto()
+                }
+            };
             daemon
                 .register(service)
                 .map_err(|e| NetError::Discovery(e.to_string()))?;
@@ -157,6 +176,19 @@ pub mod discovery {
                 _daemon: daemon,
                 rx,
             })
+        }
+    }
+
+    /// Best-effort primary LAN IPv4: ask the OS which source address it would
+    /// use to reach a public host. No packets are sent — a UDP `connect` just
+    /// consults the routing table. We advertise this so peers have a reachable
+    /// address even when interface auto-detection misfires.
+    fn local_ipv4() -> Option<std::net::Ipv4Addr> {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.connect("8.8.8.8:80").ok()?;
+        match sock.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
+            _ => None,
         }
     }
 
