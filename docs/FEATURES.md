@@ -40,7 +40,10 @@ A snapshot of what Lattice does today (v0.7.0). Legend: ✅ working & tested ·
 | Daemon DHT wiring (`--dht-bind/-bootstrap/--peer`) | ✅ | `crates/daemon` |
 | Manual peer pin (`--peer-addr <id>@<ip:port>`, GUI add) | ✅ | `crates/daemon`, `gui/` |
 | Public bootstrap node (stable internet entry point) | 🔜 | operational, not code |
-| Relay fallback when hole punching fails (DERP-style) | 🔜 | future spec |
+| Manual peer pin (`--peer-addr <id>@<ip:port>`) | ✅ | `crates/daemon` |
+| Relay (DERP-style) — forward via a third node for CGNAT | ⚠️ transport+relay tested; needs cross-network test | `crates/net` (`relay.rs`), `crates/daemon` |
+| Stable persisted node identity | ✅ | `crates/crypto`, `crates/daemon` |
+| Per-peer OS shown (carried in the handshake) | ✅ | `crates/engine`, `gui/`, `crates/cli` |
 
 ## Process & user experience
 

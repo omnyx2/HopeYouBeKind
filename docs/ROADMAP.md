@@ -76,9 +76,11 @@ holds the interface up but surfaces no peers.
 ## Backlog / future specs (deferred)
 
 Connectivity (makes the mesh reach anywhere, reliably):
-- **Relay fallback (DERP-style):** when two peers can't connect directly, route
-  their *still end-to-end encrypted* packets through a third node both can reach.
-  Any node can volunteer; no dedicated server. This is the cross-NAT safety net.
+- **Relay (DERP-style)** ⚠️ *(implemented — `--relay-bind` / `--relay` /
+  `--peer-relay`, transport + forwarding tested over real UDP; needs a
+  two-machine field test — see `docs/RELAY.md`)*: forward two peers' still
+  end-to-end-encrypted packets through a third node both can reach.
+- *Remaining:* automatic direct→relay fallback promotion (today it's explicit).
 - **Multi-hop mesh routing:** forward packets through several mesh nodes toward
   the destination (a generalization of relay).
 - **Public bootstrap node** (stable internet entry point). *(Peer

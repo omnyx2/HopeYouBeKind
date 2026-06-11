@@ -66,6 +66,21 @@ struct Args {
     /// node's public address.
     #[arg(long)]
     peer_addr: Vec<String>,
+
+    /// Run a relay forwarder on this UDP address (e.g. `0.0.0.0:42000`). A relay
+    /// shuttles encrypted packets between peers that can't connect directly.
+    #[arg(long)]
+    relay_bind: Option<String>,
+
+    /// Use this relay's address (`ip:port`) to reach peers that can't be reached
+    /// directly (CGNAT/symmetric NAT).
+    #[arg(long)]
+    relay: Option<String>,
+
+    /// Node ids (64-hex) of peers to reach *through* the configured `--relay`
+    /// (repeatable). The other peer must also use the same relay.
+    #[arg(long)]
+    peer_relay: Vec<String>,
 }
 
 #[tokio::main]
@@ -118,9 +133,35 @@ async fn main() -> Result<()> {
     // Captured for exit-node routing before the engine takes ownership of `tun`.
     let tun_name = tun.name().map(|s| s.to_string());
 
-    let transport = UdpTransport::bind(args.bind.parse()?).await?;
-    let udp_addr = transport.local_addr()?;
+    let udp = UdpTransport::bind(args.bind.parse()?).await?;
+    let udp_addr = udp.local_addr()?;
     tracing::info!(udp = %udp_addr, "transport bound");
+
+    // Optionally run a relay forwarder for peers who can't connect directly.
+    if let Some(relay_bind) = args.relay_bind.clone() {
+        let sock = UdpSocket::bind(&relay_bind).await?;
+        tracing::info!(relay = %sock.local_addr()?, "relay forwarder listening");
+        tokio::spawn(async move {
+            let _ = lattice_net::relay::run_relay(sock).await;
+        });
+    }
+
+    // Wrap the transport so relayed peers look direct to the engine. `--relay`
+    // sets the relay address; without it this is a pure pass-through.
+    let relay_addr: Option<SocketAddr> = args.relay.as_deref().and_then(|s| s.parse().ok());
+    let transport = std::sync::Arc::new(lattice_net::relay::RelayTransport::new(
+        udp, relay_addr, node_id.0,
+    ));
+    // Keep our address registered with the relay so peers can be forwarded to us.
+    if relay_addr.is_some() {
+        let reg = std::sync::Arc::clone(&transport);
+        tokio::spawn(async move {
+            loop {
+                let _ = reg.register().await;
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
+    }
 
     // Best-effort: learn our public (reflexive) address via STUN — a WAN
     // candidate we publish to the DHT for NAT hole punching.
@@ -192,6 +233,30 @@ async fn main() -> Result<()> {
                 tracing::info!(peer = %id.fingerprint(), %addr, "pinned peer");
             }
             None => tracing::warn!(spec, "ignoring invalid --peer-addr (need <id>@<ip:port>)"),
+        }
+    }
+
+    // Peers reached through the relay (`--peer-relay <id>`): hand the engine a
+    // synthetic endpoint that the RelayTransport routes via the relay.
+    for id_hex in &args.peer_relay {
+        match parse_hex_id(id_hex) {
+            Some(id) => {
+                let synth = transport.endpoint_for(id);
+                let tx = disc_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let _ = tx
+                            .send(DiscoveredPeer {
+                                id: NodeId(id),
+                                endpoints: vec![synth],
+                            })
+                            .await;
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                    }
+                });
+                tracing::info!(peer = %NodeId(id).fingerprint(), "reaching peer via relay");
+            }
+            None => tracing::warn!(id_hex, "invalid --peer-relay id (need 64 hex)"),
         }
     }
 

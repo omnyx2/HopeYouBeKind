@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use lattice_proto::NodeId;
 
 pub mod nat;
+pub mod relay;
 
 #[derive(thiserror::Error, Debug)]
 pub enum NetError {
@@ -27,6 +28,22 @@ pub trait Transport: Send + Sync {
     async fn send_to(&self, data: &[u8], dest: SocketAddr) -> Result<(), NetError>;
     async fn recv_from(&self) -> Result<(Vec<u8>, SocketAddr), NetError>;
     fn local_addr(&self) -> Result<SocketAddr, NetError>;
+}
+
+/// Lets an `Arc<Transport>` be used where a `Transport` is expected — so the
+/// daemon can share one transport between the engine and a background task
+/// (e.g. relay registration).
+#[async_trait::async_trait]
+impl<T: Transport> Transport for std::sync::Arc<T> {
+    async fn send_to(&self, data: &[u8], dest: SocketAddr) -> Result<(), NetError> {
+        (**self).send_to(data, dest).await
+    }
+    async fn recv_from(&self) -> Result<(Vec<u8>, SocketAddr), NetError> {
+        (**self).recv_from().await
+    }
+    fn local_addr(&self) -> Result<SocketAddr, NetError> {
+        (**self).local_addr()
+    }
 }
 
 /// A peer learned from discovery: who they are and where to reach them.
