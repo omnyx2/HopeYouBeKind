@@ -39,6 +39,19 @@ pub enum Request {
     RelayPeer { node_id: NodeId },
     /// Live traffic flows seen crossing the tunnel — what is talking to what.
     Flows,
+    /// This node's membership / network status.
+    NetworkInfo,
+    /// Adopt a membership certificate (hex token) issued for us — join its network.
+    JoinNetwork { token: String },
+    /// Admin only: issue a membership cert for `node_id`; returns a join token.
+    IssueCert {
+        node_id: NodeId,
+        label: Option<String>,
+    },
+    /// Admin only: evict a member (revoke its certificate) by node id.
+    RevokeMember { node_id: NodeId },
+    /// Admin only: list the members this node's CA has issued certs to.
+    Members,
 }
 
 /// The daemon's reply.
@@ -52,6 +65,10 @@ pub enum Response {
     Status(NodeStatus),
     Peers(Vec<PeerInfo>),
     Flows(Vec<FlowRecord>),
+    NetworkInfo(NetworkInfo),
+    Members(Vec<MemberEntry>),
+    /// A join token (hex-encoded membership cert) handed back from `IssueCert`.
+    Token(String),
     /// A command that returns no data succeeded.
     Done,
     /// Something went wrong; `message` is human-readable.
@@ -75,6 +92,31 @@ pub struct NodeStatus {
     pub is_exit: bool,
     /// The relay address currently configured, if any.
     pub relay: Option<std::net::SocketAddr>,
+}
+
+/// This node's membership status for the GUI/CLI network panel.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    /// The network (mesh) id this node belongs to, hex — `None` in open mode.
+    pub network_id: Option<String>,
+    /// Short fingerprint of the network id, for display.
+    pub fingerprint: Option<String>,
+    /// Whether this node holds the network CA key (can issue/revoke).
+    pub is_admin: bool,
+    /// How many members the CA has issued certs to (admin only; else 0).
+    pub member_count: usize,
+    /// How many revocations this node currently knows about.
+    pub revocation_count: usize,
+}
+
+/// One member in an admin node's registry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemberEntry {
+    pub node_id: String,
+    pub fingerprint: String,
+    pub serial: u64,
+    pub label: Option<String>,
+    pub revoked: bool,
 }
 
 /// One aggregated traffic flow observed crossing the tunnel. The engine groups

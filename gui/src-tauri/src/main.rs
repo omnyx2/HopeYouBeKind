@@ -41,6 +41,24 @@ struct FlowView {
 }
 
 #[derive(Serialize)]
+struct NetworkInfoView {
+    network_id: Option<String>,
+    fingerprint: Option<String>,
+    is_admin: bool,
+    member_count: usize,
+    revocation_count: usize,
+}
+
+#[derive(Serialize)]
+struct MemberView {
+    node_id: String,
+    fingerprint: String,
+    serial: u64,
+    label: Option<String>,
+    revoked: bool,
+}
+
+#[derive(Serialize)]
 struct PeerView {
     virtual_ip: String,
     fingerprint: String,
@@ -110,6 +128,70 @@ async fn list_flows() -> Result<Vec<FlowView>, String> {
         Ok(_) => Err("unexpected response".into()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+#[tauri::command]
+async fn network_info() -> Result<NetworkInfoView, String> {
+    match lattice_ipc::request(SOCKET, Request::NetworkInfo).await {
+        Ok(Response::NetworkInfo(n)) => Ok(NetworkInfoView {
+            network_id: n.network_id,
+            fingerprint: n.fingerprint,
+            is_admin: n.is_admin,
+            member_count: n.member_count,
+            revocation_count: n.revocation_count,
+        }),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn list_members() -> Result<Vec<MemberView>, String> {
+    match lattice_ipc::request(SOCKET, Request::Members).await {
+        Ok(Response::Members(members)) => Ok(members
+            .into_iter()
+            .map(|m| MemberView {
+                node_id: m.node_id,
+                fingerprint: m.fingerprint,
+                serial: m.serial,
+                label: m.label,
+                revoked: m.revoked,
+            })
+            .collect()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Admin: issue a join token (membership cert) for a node id.
+#[tauri::command]
+async fn issue_cert(node_id: String, label: Option<String>) -> Result<String, String> {
+    let id = parse_node_id(node_id.trim()).ok_or("invalid node id (need 64 hex chars)")?;
+    let label = label.filter(|s| !s.trim().is_empty());
+    match lattice_ipc::request(SOCKET, Request::IssueCert { node_id: id, label }).await {
+        Ok(Response::Token(token)) => Ok(token),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Adopt a join token issued for this node.
+#[tauri::command]
+async fn join_network(token: String) -> Result<(), String> {
+    send(Request::JoinNetwork {
+        token: token.trim().to_string(),
+    })
+    .await
+}
+
+/// Admin: evict a member by node id.
+#[tauri::command]
+async fn revoke_member(node_id: String) -> Result<(), String> {
+    let id = parse_node_id(node_id.trim()).ok_or("invalid node id (need 64 hex chars)")?;
+    send(Request::RevokeMember { node_id: id }).await
 }
 
 #[tauri::command]
@@ -257,6 +339,11 @@ fn main() {
             get_status,
             list_peers,
             list_flows,
+            network_info,
+            list_members,
+            issue_cert,
+            join_network,
+            revoke_member,
             mesh_up,
             mesh_down,
             start_daemon,

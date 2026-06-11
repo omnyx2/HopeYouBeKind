@@ -23,7 +23,12 @@ use lattice_tun::TunConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use lattice_membership::MemberCert;
+
 mod exit;
+mod membership;
+
+use membership::Admin;
 
 /// Lattice background service.
 #[derive(Parser, Debug)]
@@ -81,6 +86,48 @@ struct Args {
     /// (repeatable). The other peer must also use the same relay.
     #[arg(long)]
     peer_relay: Vec<String>,
+
+    /// Be this mesh's admin: hold the network CA key at this path (generated +
+    /// saved on first run — that one act *creates* the network). Lets this node
+    /// issue join tokens and evict members. Self-issues our own cert.
+    #[arg(long)]
+    network_key: Option<String>,
+
+    /// Join an existing network by loading a membership cert (a join token a
+    /// network admin issued for us) from this path. Persisted here when joining
+    /// via the GUI/CLI at runtime.
+    #[arg(long)]
+    member_cert: Option<String>,
+}
+
+/// Hex-encode bytes (for join tokens on the wire).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Hex-decode a string, or `None` if it isn't valid hex.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+/// Load a member cert from a file (raw 152 bytes or a hex token).
+fn load_member_cert(path: &str) -> Option<MemberCert> {
+    let bytes = std::fs::read(path).ok()?;
+    MemberCert::from_bytes(&bytes).ok().or_else(|| {
+        hex_decode(std::str::from_utf8(&bytes).ok()?.trim())
+            .and_then(|b| MemberCert::from_bytes(&b).ok())
+    })
 }
 
 #[tokio::main]
@@ -119,6 +166,30 @@ async fn main() -> Result<()> {
         ipc = %args.ipc_socket,
         "lattice-daemon starting"
     );
+
+    // Membership. `--network-key` makes us the admin (hold the CA, self-issue a
+    // cert). Otherwise `--member-cert` joins an existing network. Neither = open
+    // mode (any peer that completes the handshake is admitted).
+    let admin: Option<Arc<std::sync::Mutex<Admin>>> = if let Some(kp) = args.network_key.clone() {
+        let mut a = Admin::load_or_create(&kp);
+        let net = a.network_id();
+        let cert = a.issue(&node_id, Some("admin".into()));
+        engine.set_membership(net, cert);
+        tracing::info!(network = %net.to_hex(), "admin: holding network CA, membership active");
+        Some(Arc::new(std::sync::Mutex::new(a)))
+    } else {
+        if let Some(cp) = args.member_cert.clone() {
+            match load_member_cert(&cp) {
+                Some(cert) => {
+                    let net = cert.network_id();
+                    engine.set_membership(net, cert);
+                    tracing::info!(network = %net.to_hex(), "joined network via member cert");
+                }
+                None => tracing::warn!(path = %cp, "could not load --member-cert (running open)"),
+            }
+        }
+        None
+    };
 
     // Bring up the data plane. Creating a real TUN device needs root; --no-tun
     // runs a headless node (IPC + discovery only) without it.
@@ -271,13 +342,17 @@ async fn main() -> Result<()> {
     let ipc_tun = tun_name.clone();
     let ipc_disc = disc_tx.clone();
     let ipc_transport = std::sync::Arc::clone(&transport);
+    let ipc_admin = admin.clone();
+    let ipc_member_cert = args.member_cert.clone();
     let ipc = lattice_ipc::serve(&args.ipc_socket, move |req| {
         let handle = ipc_handle.clone();
         let tun_name = ipc_tun.clone();
         let disc_tx = ipc_disc.clone();
         let transport = std::sync::Arc::clone(&ipc_transport);
+        let admin = ipc_admin.clone();
+        let member_cert_path = ipc_member_cert.clone();
         async move {
-            use lattice_proto::ipc::{Request, Response};
+            use lattice_proto::ipc::{MemberEntry, NetworkInfo, Request, Response};
             match req {
                 Request::Status => {
                     let mut s = handle.status().await;
@@ -286,6 +361,79 @@ async fn main() -> Result<()> {
                 }
                 Request::Peers => Response::Peers(handle.peers().await),
                 Request::Flows => Response::Flows(handle.flows()),
+                Request::NetworkInfo => {
+                    let net = handle.network_id();
+                    let member_count = admin.as_ref().map(|a| a.lock().unwrap().members().len());
+                    Response::NetworkInfo(NetworkInfo {
+                        network_id: net.map(|n| n.to_hex()),
+                        fingerprint: net.map(|n| n.fingerprint()),
+                        is_admin: admin.is_some(),
+                        member_count: member_count.unwrap_or(0),
+                        revocation_count: handle.revocation_count(),
+                    })
+                }
+                Request::IssueCert { node_id, label } => match &admin {
+                    Some(a) => {
+                        let cert = a.lock().unwrap().issue(&node_id, label);
+                        Response::Token(hex_encode(&cert.to_bytes()))
+                    }
+                    None => Response::Error {
+                        message: "not an admin node (start with --network-key to issue certs)"
+                            .into(),
+                    },
+                },
+                Request::JoinNetwork { token } => {
+                    match hex_decode(&token).and_then(|b| MemberCert::from_bytes(&b).ok()) {
+                        Some(cert) => {
+                            let net = cert.network_id();
+                            handle.join_network(cert);
+                            // Persist so the membership survives a restart.
+                            if let Some(path) = &member_cert_path {
+                                let _ = std::fs::write(path, &token);
+                            }
+                            tracing::info!(network = %net.to_hex(), "joined network via token");
+                            Response::Done
+                        }
+                        None => Response::Error {
+                            message: "invalid join token".into(),
+                        },
+                    }
+                }
+                Request::RevokeMember { node_id } => match &admin {
+                    Some(a) => match a.lock().unwrap().revoke(&node_id) {
+                        Some(rev) => {
+                            handle.add_revocation(rev);
+                            Response::Done
+                        }
+                        None => Response::Error {
+                            message: "no such member to revoke".into(),
+                        },
+                    },
+                    None => Response::Error {
+                        message: "not an admin node".into(),
+                    },
+                },
+                Request::Members => match &admin {
+                    Some(a) => {
+                        let members = a
+                            .lock()
+                            .unwrap()
+                            .members()
+                            .iter()
+                            .map(|m| MemberEntry {
+                                node_id: m.node_id.clone(),
+                                fingerprint: m.node_id.chars().take(8).collect(),
+                                serial: m.serial,
+                                label: m.label.clone(),
+                                revoked: m.revoked,
+                            })
+                            .collect();
+                        Response::Members(members)
+                    }
+                    None => Response::Error {
+                        message: "not an admin node".into(),
+                    },
+                },
                 Request::Up => {
                     handle.set_enabled(true);
                     Response::Done

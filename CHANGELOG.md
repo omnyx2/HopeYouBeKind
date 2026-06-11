@@ -25,6 +25,13 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
   gossip across the mesh (`MessageType::Revocation`) and drop evicted peers.
   Membership is orthogonal to the crypto suite. Open mode (no network) keeps the
   prior behaviour.
+- **Mesh management UX** (daemon/CLI/GUI): `--network-key` makes a node the admin
+  (holds the CA, self-issues its cert); `--member-cert` joins with an issued
+  token. IPC + `lattice net {info,issue,join,revoke,members}` + a GUI **Mesh**
+  tab drive the serverless enrollment flow: admin issues a join token for a
+  node id, that node pastes it to join, and the admin can list and revoke
+  members (eviction propagates over the mesh). Admins keep a member registry so
+  serials stay stable across restarts.
 
 - **Traffic monitor**: a passive per-flow observer of everything crossing the
   tunnel. `lattice-engine` gained a `monitor` module (`TrafficMonitor`) that

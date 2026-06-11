@@ -4,6 +4,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use lattice_proto::ipc::{Request, Response};
+use lattice_proto::NodeId;
 
 /// Control the Lattice mesh from the terminal.
 #[derive(Parser, Debug)]
@@ -29,24 +30,77 @@ enum Command {
     Peers,
     /// Show live traffic flows crossing the tunnel.
     Flows,
+    /// Manage mesh membership (network identity, enrollment, eviction).
+    #[command(subcommand)]
+    Net(NetCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum NetCommand {
+    /// Show this node's network id and membership status.
+    Info,
+    /// Admin: issue a join token (membership cert) for a node id.
+    Issue {
+        /// The joining node's 64-hex node id (from its Status panel).
+        node_id: String,
+        /// Optional human label to remember this member by.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Adopt a join token issued for this node — join its network now.
+    Join {
+        /// The hex token printed by `net issue` on the admin node.
+        token: String,
+    },
+    /// Admin: evict a member by node id (revoke its certificate).
+    Revoke {
+        /// The member's 64-hex node id.
+        node_id: String,
+    },
+    /// Admin: list members this node's CA has enrolled.
+    Members,
+}
+
+fn parse_id(hex: &str) -> Result<NodeId> {
+    if hex.len() != 64 {
+        anyhow::bail!("node id must be 64 hex chars");
+    }
+    let mut id = [0u8; 32];
+    for (i, b) in id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| anyhow::anyhow!("invalid hex in node id"))?;
+    }
+    Ok(NodeId(id))
 }
 
 impl Command {
-    fn to_request(&self) -> Request {
-        match self {
+    fn to_request(&self) -> Result<Request> {
+        Ok(match self {
             Command::Up => Request::Up,
             Command::Down => Request::Down,
             Command::Status => Request::Status,
             Command::Peers => Request::Peers,
             Command::Flows => Request::Flows,
-        }
+            Command::Net(NetCommand::Info) => Request::NetworkInfo,
+            Command::Net(NetCommand::Members) => Request::Members,
+            Command::Net(NetCommand::Issue { node_id, label }) => Request::IssueCert {
+                node_id: parse_id(node_id)?,
+                label: label.clone(),
+            },
+            Command::Net(NetCommand::Join { token }) => Request::JoinNetwork {
+                token: token.clone(),
+            },
+            Command::Net(NetCommand::Revoke { node_id }) => Request::RevokeMember {
+                node_id: parse_id(node_id)?,
+            },
+        })
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let request = cli.command.to_request();
+    let request = cli.command.to_request()?;
 
     let response = lattice_ipc::request(&cli.ipc_socket, request)
         .await
@@ -101,6 +155,38 @@ fn print_response(response: Response) {
                     f.last_active_secs
                 );
             }
+        }
+        Response::NetworkInfo(n) => match n.network_id {
+            Some(id) => {
+                println!("network   {}", id);
+                println!("fingerprint {}", n.fingerprint.unwrap_or_default());
+                println!(
+                    "role      {}",
+                    if n.is_admin { "admin (CA)" } else { "member" }
+                );
+                if n.is_admin {
+                    println!("members   {}", n.member_count);
+                }
+                println!("revoked   {}", n.revocation_count);
+            }
+            None => println!("open mode (no network — any peer may join)"),
+        },
+        Response::Members(members) => {
+            if members.is_empty() {
+                println!("no members enrolled");
+            }
+            for m in members {
+                println!(
+                    "{}  serial {:<4} {:<16} {}",
+                    m.fingerprint,
+                    m.serial,
+                    m.label.as_deref().unwrap_or("-"),
+                    if m.revoked { "REVOKED" } else { "active" }
+                );
+            }
+        }
+        Response::Token(token) => {
+            println!("join token (give to the node, then `lattice net join <token>`):\n{token}");
         }
         Response::Done => println!("ok"),
         Response::Error { message } => eprintln!("error: {message}"),

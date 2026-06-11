@@ -97,8 +97,8 @@ pub struct Engine {
     /// (no membership gate — any peer that completes the handshake is admitted).
     network: Arc<std::sync::Mutex<Option<NetworkId>>>,
     /// Our own membership certificate, presented in the handshake. `None` in
-    /// open mode.
-    cert: Option<MemberCert>,
+    /// open mode. Shared so the IPC handle can join a network at runtime.
+    cert: Arc<std::sync::Mutex<Option<MemberCert>>>,
     /// Revocations we know about, gossiped across the mesh. Shared so the IPC
     /// handle can inject new ones (the admin evicting a member).
     revocations: Arc<std::sync::Mutex<RevocationList>>,
@@ -139,7 +139,7 @@ impl Engine {
             allow_exit: Arc::new(AtomicBool::new(false)),
             monitor: Arc::new(TrafficMonitor::new()),
             network: Arc::new(std::sync::Mutex::new(None)),
-            cert: None,
+            cert: Arc::new(std::sync::Mutex::new(None)),
             revocations: Arc::new(std::sync::Mutex::new(RevocationList::new())),
             peer_serial: HashMap::new(),
         }
@@ -150,7 +150,7 @@ impl Engine {
     /// same `network`. Without this, the node runs in open mode (no gate).
     pub fn set_membership(&mut self, network: NetworkId, cert: MemberCert) {
         *self.network.lock().unwrap() = Some(network);
-        self.cert = Some(cert);
+        *self.cert.lock().unwrap() = Some(cert);
     }
 
     pub fn virtual_ip(&self) -> VirtualIp {
@@ -175,6 +175,7 @@ impl Engine {
             allow_exit: Arc::clone(&self.allow_exit),
             monitor: Arc::clone(&self.monitor),
             network: Arc::clone(&self.network),
+            cert: Arc::clone(&self.cert),
             revocations: Arc::clone(&self.revocations),
         }
     }
@@ -391,7 +392,9 @@ impl Engine {
         match msg_type {
             MessageType::HandshakeInit => {
                 let private = self.identity.private_key().to_vec();
-                let accepted = self.suite.respond(&private, payload, &self.local_payload())?;
+                let accepted = self
+                    .suite
+                    .respond(&private, payload, &self.local_payload())?;
                 let peer_id = node_id_from_pubkey(&accepted.peer_identity);
 
                 // Membership gate: in a network, the initiator must present a
@@ -500,11 +503,7 @@ impl Engine {
                 if let (Some(network), Ok(incoming)) =
                     (self.network_id(), RevocationList::from_bytes(payload))
                 {
-                    let added = self
-                        .revocations
-                        .lock()
-                        .unwrap()
-                        .merge(&incoming, &network);
+                    let added = self.revocations.lock().unwrap().merge(&incoming, &network);
                     if added > 0 {
                         tracing::info!(added, "learned revocations from peer");
                         self.enforce_revocations().await;
@@ -601,7 +600,8 @@ impl Engine {
 
     /// Our handshake payload: membership cert (if any) + OS.
     fn local_payload(&self) -> Vec<u8> {
-        encode_payload(self.cert.as_ref(), std::env::consts::OS.as_bytes())
+        let cert = self.cert.lock().unwrap();
+        encode_payload(cert.as_ref(), std::env::consts::OS.as_bytes())
     }
 
     /// Decide whether a peer presenting `cert` may join. In open mode (no
@@ -661,6 +661,7 @@ pub struct EngineHandle {
     allow_exit: Arc<AtomicBool>,
     monitor: Arc<TrafficMonitor>,
     network: Arc<std::sync::Mutex<Option<NetworkId>>>,
+    cert: Arc<std::sync::Mutex<Option<MemberCert>>>,
     revocations: Arc<std::sync::Mutex<RevocationList>>,
 }
 
@@ -711,6 +712,13 @@ impl EngineHandle {
     /// The network this node belongs to, if any.
     pub fn network_id(&self) -> Option<NetworkId> {
         *self.network.lock().unwrap()
+    }
+
+    /// Join a network at runtime by adopting a cert issued for us (the cert's
+    /// own `network_id` becomes the network we verify peers against).
+    pub fn join_network(&self, cert: MemberCert) {
+        *self.network.lock().unwrap() = Some(cert.network_id());
+        *self.cert.lock().unwrap() = Some(cert);
     }
 
     /// Inject a revocation (the admin evicting a member). It's verified against

@@ -137,6 +137,7 @@ button.secondary:hover { border-color: var(--off); background: #1f2430; }
 .dot.known { background: var(--off); }
 .dot.lost { background: var(--bad); }
 .small { font-size: 11px; }
+button.small-btn { padding: 5px 10px; font-size: 12px; }
 
 /* ---------- traffic monitor ---------- */
 .live-toggle {

@@ -22,6 +22,9 @@
           <button class="nav-item" data-tab="traffic">
             <span class="nav-ico">📊</span> Traffic
           </button>
+          <button class="nav-item" data-tab="mesh">
+            <span class="nav-ico">⬡</span> Mesh
+          </button>
           <button class="nav-item" data-tab="network">
             <span class="nav-ico">⇄</span> Network
           </button>
@@ -135,6 +138,53 @@
           </table>
           <p id="flows-empty" class="hint">No traffic seen yet. Once apps talk over
             the tunnel (ping, ssh, http…), every flow shows up here.</p>
+        </section>
+
+        <!-- ===== MESH (membership) ===== -->
+        <section data-panel="mesh" class="panel hidden">
+          <h1 class="panel-title">Mesh network</h1>
+
+          <div class="card">
+            <h2>Network identity</h2>
+            <div class="kv">
+              <span class="label">Status</span>
+              <span id="mesh-role" class="mono muted">—</span>
+            </div>
+            <div class="kv">
+              <span class="label">Network ID</span>
+              <span id="mesh-id" class="mono copy" title="Click to copy — share so others can be enrolled">—</span>
+            </div>
+            <p class="hint">A network is identified by this id. The admin (whoever
+              holds the network key) enrolls nodes and can evict them. Without a
+              network the node runs <b>open</b> (any peer may join).</p>
+          </div>
+
+          <div class="card">
+            <h2>Join a network</h2>
+            <div class="add-row">
+              <input id="join-token" placeholder="paste join token" spellcheck="false" />
+              <button id="join-net" class="secondary">Join</button>
+            </div>
+            <p class="hint">Ask the network admin to issue a token for your Node ID
+              (shown on the Status tab), then paste it here.</p>
+          </div>
+
+          <!-- admin-only -->
+          <div id="admin-card" class="card hidden">
+            <h2>Members <span id="member-count" class="muted">(0)</span></h2>
+            <ul id="members" class="peers"></ul>
+            <div class="add-row">
+              <input id="issue-node-id" placeholder="node ID to enroll (64 hex)" spellcheck="false" />
+              <input id="issue-label" placeholder="label" spellcheck="false" style="max-width:30%" />
+              <button id="issue-cert" class="secondary">Issue</button>
+            </div>
+            <div id="issued-token-row" class="add-row hidden">
+              <input id="issued-token" class="mono" readonly />
+              <button id="copy-token" class="secondary">Copy</button>
+            </div>
+            <p class="hint">Issue a token, then send it to that node to paste into
+              "Join". Revoke evicts a member — it's dropped across the mesh.</p>
+          </div>
         </section>
 
         <!-- ===== NETWORK ===== -->

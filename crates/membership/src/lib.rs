@@ -533,9 +533,15 @@ mod tests {
         let imposter = NetworkKey::generate();
 
         let mut crl = RevocationList::new();
-        assert!(crl.add(net.revoke(42, 3000), &id), "valid revocation admitted");
+        assert!(
+            crl.add(net.revoke(42, 3000), &id),
+            "valid revocation admitted"
+        );
         assert!(crl.is_revoked(42));
-        assert!(!crl.add(net.revoke(42, 3000), &id), "duplicate not re-added");
+        assert!(
+            !crl.add(net.revoke(42, 3000), &id),
+            "duplicate not re-added"
+        );
 
         // a revocation signed by a different network is rejected
         assert!(!crl.add(imposter.revoke(99, 3000), &id));
