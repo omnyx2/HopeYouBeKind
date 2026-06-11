@@ -1,0 +1,18 @@
+[package]
+name = "lattice-membership"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Network identity, membership certificates, and revocation for Lattice meshes."
+
+[dependencies]
+lattice-proto.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+blake2.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
