@@ -144,7 +144,7 @@ async fn start_daemon(app: tauri::AppHandle) -> Result<(), String> {
     }
     // Run detached, logging to /tmp, with administrator privileges.
     let script = format!(
-        "do shell script \"'{path}' > /tmp/lattice-daemon.log 2>&1 &\" with administrator privileges"
+        "do shell script \"'{path}' --bind 0.0.0.0:41000 > /tmp/lattice-daemon.log 2>&1 &\" with administrator privileges"
     );
     let status = std::process::Command::new("osascript")
         .arg("-e")
