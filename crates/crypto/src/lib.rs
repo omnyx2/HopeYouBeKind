@@ -15,11 +15,13 @@ pub mod cookie;
 pub mod rekey;
 pub mod replay;
 pub mod session;
+pub mod suite;
 
 pub use cookie::CookieMaker;
 pub use rekey::RekeyPolicy;
 pub use replay::ReplayWindow;
 pub use session::{respond, Handshake, NoiseSession, PendingHandshake};
+pub use suite::{Accepted, CryptoSuite, HandshakeState, NoiseSuite};
 
 /// The Noise pattern + primitive suite LTP uses. Mirrors WireGuard's choices
 /// because they are well analyzed: mutual auth, forward secrecy, AEAD.
@@ -122,7 +124,11 @@ impl Drop for Identity {
 
 /// A live, authenticated tunnel to one peer. Encrypts outbound overlay packets
 /// and decrypts inbound ones. Implementations own the AEAD/replay state.
-pub trait TunnelSession: Send {
+///
+/// `Send + Sync` because the engine keeps sessions in shared state and its async
+/// loop holds `&self` across `.await` points; sessions are only ever mutated
+/// through `&mut`, so this is sound.
+pub trait TunnelSession: Send + Sync {
     fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError>;
     fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError>;
 }
