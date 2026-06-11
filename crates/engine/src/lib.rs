@@ -454,6 +454,7 @@ impl EngineHandle {
             peer_count,
             exit_node,
             is_exit,
+            relay: None, // patched in by the daemon (lives in the transport)
         }
     }
 

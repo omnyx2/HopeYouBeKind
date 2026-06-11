@@ -36,6 +36,7 @@ async function refresh() {
 
   el("virtual-ip").textContent = status.virtual_ip ?? "—";
   el("public-addr").textContent = status.public_addr ?? "not detected (LAN only)";
+  el("relay-status").textContent = status.relay ?? "off";
   const nodeId = status.node_id ?? "";
   el("node-id").textContent = nodeId ? nodeId.slice(0, 16) + "…" : "—";
   el("node-id").dataset.full = nodeId;
@@ -166,6 +167,29 @@ el("add-peer").addEventListener("click", async () => {
   refresh();
 });
 
+el("set-relay").addEventListener("click", async () => {
+  try {
+    await invoke("set_relay", { addr: el("relay-addr").value.trim() });
+    toast(el("relay-addr").value.trim() ? "relay set" : "relay cleared");
+  } catch (err) {
+    toast(String(err));
+  }
+  refresh();
+});
+
+el("add-relay-peer").addEventListener("click", async () => {
+  const id = el("relay-peer-id").value.trim();
+  if (!id) return;
+  try {
+    await invoke("relay_peer", { nodeId: id });
+    el("relay-peer-id").value = "";
+    toast("peer added via relay");
+  } catch (err) {
+    toast(String(err));
+  }
+  refresh();
+});
+
 async function copy(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -212,13 +236,14 @@ function mockInvoke(cmd, args) {
     case "mesh_down": s.mesh = false; return Promise.resolve();
     case "set_exit": s.exit = args?.nodeId ?? null; return Promise.resolve();
     case "allow_exit": s.isExit = !!args?.enabled; return Promise.resolve();
-    case "add_peer": return Promise.resolve();
+    case "set_relay": s.relay = args?.addr || null; return Promise.resolve();
+    case "add_peer": case "relay_peer": return Promise.resolve();
     case "get_status":
       return s.up
         ? Promise.resolve({
             running: s.mesh, virtual_ip: "100.95.128.129", fingerprint: "a3f1c290",
             node_id: "a3f1c290".repeat(8), public_addr: "203.247.167.58:47251",
-            exit_node: s.exit, is_exit: s.isExit,
+            exit_node: s.exit, is_exit: s.isExit, relay: s.relay,
           })
         : Promise.reject("daemon not running");
     case "list_peers":
