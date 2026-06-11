@@ -105,6 +105,9 @@ pub struct Engine {
     /// Cert serial of each connected peer, so a gossiped revocation can be
     /// matched to a live session and the peer dropped.
     peer_serial: HashMap<NodeId, u64>,
+    /// Set when membership changes at runtime (a join): the loop drops all
+    /// sessions on the next tick so they re-handshake under the new network.
+    resync: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -142,6 +145,7 @@ impl Engine {
             cert: Arc::new(std::sync::Mutex::new(None)),
             revocations: Arc::new(std::sync::Mutex::new(RevocationList::new())),
             peer_serial: HashMap::new(),
+            resync: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -177,6 +181,7 @@ impl Engine {
             network: Arc::clone(&self.network),
             cert: Arc::clone(&self.cert),
             revocations: Arc::clone(&self.revocations),
+            resync: Arc::clone(&self.resync),
         }
     }
 
@@ -547,6 +552,24 @@ impl Engine {
         const DEAD: Duration = Duration::from_secs(60);
         let now = Instant::now();
 
+        // Membership just changed (joined a network): drop every existing session
+        // so it re-handshakes and is re-verified under the new network. Without
+        // this, a session formed in open mode keeps running unauthenticated and
+        // isn't bound to a cert serial, so a later revocation can't evict it. We
+        // keep the overlay peers (their endpoints) so the re-init below reconnects.
+        if self.resync.swap(false, Ordering::Relaxed) {
+            self.sessions.clear();
+            self.pending.clear();
+            self.connected.clear();
+            self.peer_serial.clear();
+            let ids: Vec<NodeId> = self.overlay.lock().await.peers().map(|p| p.id).collect();
+            let mut overlay = self.overlay.lock().await;
+            for id in &ids {
+                overlay.set_status(id, PeerStatus::Connecting);
+            }
+            tracing::info!("membership changed — re-handshaking all peers");
+        }
+
         // Probe each live session (also refreshes the NAT binding both ways).
         let frame = wire::encode(MessageType::Keepalive, &[]);
         let endpoints: Vec<SocketAddr> = self.sessions.keys().copied().collect();
@@ -590,6 +613,27 @@ impl Engine {
             self.last_seen.remove(&ep);
             self.peer_serial.remove(&id);
             tracing::info!(peer = %id.fingerprint(), "peer timed out, removed");
+        }
+
+        // Re-initiate handshakes to known peers we have no live session with, so
+        // reconnection is prompt (~one tick) instead of waiting for a slow
+        // discovery re-emit — covers reconnect after a membership resync, a
+        // dropped session, or a peer that came up after us. `on_peer_discovered`
+        // applies the skip-if-connected guard and the id tie-break, so this is a
+        // no-op for healthy sessions and for the responder side of each pair.
+        let stale_peers: Vec<DiscoveredPeer> = {
+            let overlay = self.overlay.lock().await;
+            overlay
+                .peers()
+                .filter(|p| !self.connected.contains_key(&p.id) && !p.endpoints.is_empty())
+                .map(|p| DiscoveredPeer {
+                    id: p.id,
+                    endpoints: p.endpoints.clone(),
+                })
+                .collect()
+        };
+        for peer in stale_peers {
+            let _ = self.on_peer_discovered(peer, transport).await;
         }
     }
 
@@ -663,6 +707,7 @@ pub struct EngineHandle {
     network: Arc<std::sync::Mutex<Option<NetworkId>>>,
     cert: Arc<std::sync::Mutex<Option<MemberCert>>>,
     revocations: Arc<std::sync::Mutex<RevocationList>>,
+    resync: Arc<AtomicBool>,
 }
 
 impl EngineHandle {
@@ -715,10 +760,14 @@ impl EngineHandle {
     }
 
     /// Join a network at runtime by adopting a cert issued for us (the cert's
-    /// own `network_id` becomes the network we verify peers against).
+    /// own `network_id` becomes the network we verify peers against). Signals the
+    /// engine to drop existing sessions so they re-handshake under the network —
+    /// otherwise pre-join open-mode sessions would persist unauthenticated and
+    /// couldn't be revoked.
     pub fn join_network(&self, cert: MemberCert) {
         *self.network.lock().unwrap() = Some(cert.network_id());
         *self.cert.lock().unwrap() = Some(cert);
+        self.resync.store(true, Ordering::Relaxed);
     }
 
     /// Inject a revocation (the admin evicting a member). It's verified against
@@ -877,8 +926,9 @@ mod tests {
             let _ = engine_b.run(tun_b, tb, disc_b).await;
         });
 
-        // Let the handshake settle (in-memory: sub-millisecond).
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the handshake to establish before injecting (the packet is
+        // dropped if no session exists yet).
+        wait_connected(&handle_a_mon, 1).await;
 
         // A minimal IPv4 packet from vip_a → vip_b (only version + dst matter here).
         let mut packet = vec![0u8; 20];
@@ -888,7 +938,7 @@ mod tests {
 
         handle_a.inject.send(packet.clone()).await.unwrap();
 
-        let received = tokio::time::timeout(Duration::from_secs(2), handle_b.observe.recv())
+        let received = tokio::time::timeout(Duration::from_secs(8), handle_b.observe.recv())
             .await
             .expect("packet should arrive at B within timeout")
             .expect("B's TUN channel stayed open");
@@ -944,7 +994,8 @@ mod tests {
         let mut engine_b = Engine::new(id_b, EngineConfig::default());
 
         // A sends its internet traffic through B; B agrees to be an exit node.
-        engine_a.handle().set_exit_node(Some(b_nodeid));
+        let a_mon = engine_a.handle();
+        a_mon.set_exit_node(Some(b_nodeid));
         engine_b.handle().set_allow_exit(true);
 
         tokio::spawn(async move {
@@ -954,7 +1005,7 @@ mod tests {
             let _ = engine_b.run(tun_b, tb, disc_b).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_connected(&a_mon, 1).await;
 
         // A packet bound for the public internet (8.8.8.8) — not the overlay.
         let mut packet = vec![0u8; 20];
@@ -964,7 +1015,7 @@ mod tests {
 
         handle_a.inject.send(packet.clone()).await.unwrap();
 
-        let received = tokio::time::timeout(Duration::from_secs(2), handle_b.observe.recv())
+        let received = tokio::time::timeout(Duration::from_secs(8), handle_b.observe.recv())
             .await
             .expect("internet-bound packet should reach the exit node")
             .expect("B's TUN channel stayed open");
@@ -972,6 +1023,23 @@ mod tests {
             received, packet,
             "exit node receives A's internet packet to forward"
         );
+    }
+
+    /// Poll until `h` reports at least `want` Connected peers (robust to CI load
+    /// where the handshake can take longer than a fixed sleep).
+    async fn wait_connected(h: &EngineHandle, want: usize) {
+        for _ in 0..200 {
+            let n = h
+                .peers()
+                .await
+                .iter()
+                .filter(|p| p.status == PeerStatus::Connected)
+                .count();
+            if n >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Build a minimal IPv4 packet from `src` → `dst` (version + addrs only).
@@ -1030,11 +1098,11 @@ mod tests {
             let _ = engine_b.run(tun_b, tb, disc_b).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_connected(&a_ctl, 1).await;
 
         // Same network → the cert check passes both ways and a packet tunnels.
         handle_a.inject.send(ipv4(vip_a, vip_b)).await.unwrap();
-        let got = tokio::time::timeout(Duration::from_secs(2), handle_b.observe.recv())
+        let got = tokio::time::timeout(Duration::from_secs(8), handle_b.observe.recv())
             .await
             .expect("packet should arrive once membership is verified")
             .expect("B's TUN open");
@@ -1052,5 +1120,88 @@ mod tests {
             }
         }
         assert!(evicted, "revoked peer B must be dropped from A within ~8s");
+    }
+
+    /// Regression guard for the membership soundness gap: two nodes connect in
+    /// OPEN mode (no serial bound), then both join the same network at runtime.
+    /// The join must drop and re-handshake the open session so it becomes
+    /// membership-bound — otherwise a later revocation couldn't evict it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_session_becomes_revocable_after_join() {
+        use lattice_membership::NetworkKey;
+
+        let net = NetworkKey::generate();
+        let id_a = Identity::generate().unwrap();
+        let id_b = Identity::generate().unwrap();
+        let (a_id, b_id) = (id_a.node_id(), id_b.node_id());
+        let cert_a = net.issue_cert(&a_id.0, 1, 0, 0);
+        let cert_b = net.issue_cert(&b_id.0, 2, 0, 0);
+
+        let addr_a: SocketAddr = "10.0.0.1:703".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:703".parse().unwrap();
+        let (ta, tb) = duplex(addr_a, addr_b);
+        let (tun_a, _ha) = MemoryTun::new();
+        let (tun_b, _hb) = MemoryTun::new();
+        let disc_a = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: b_id,
+            endpoints: vec![addr_b],
+        }]);
+        let disc_b = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: a_id,
+            endpoints: vec![addr_a],
+        }]);
+
+        // Both start in OPEN mode (no membership set).
+        let mut engine_a = Engine::new(id_a, EngineConfig::default());
+        let mut engine_b = Engine::new(id_b, EngineConfig::default());
+        let a_ctl = engine_a.handle();
+        let b_ctl = engine_b.handle();
+
+        tokio::spawn(async move {
+            let _ = engine_a.run(tun_a, ta, disc_a).await;
+        });
+        tokio::spawn(async move {
+            let _ = engine_b.run(tun_b, tb, disc_b).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(a_ctl.peers().await.len(), 1, "open-mode session forms");
+
+        // Both join the network at runtime — the open session must be dropped and
+        // re-handshaked under membership (so it becomes cert-serial-bound).
+        a_ctl.join_network(cert_a);
+        b_ctl.join_network(cert_b);
+
+        // Wait for the membership-bound session to re-form.
+        let mut rebound = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let peers = a_ctl.peers().await;
+            if peers.iter().any(|p| p.status == PeerStatus::Connected) {
+                rebound = true;
+                break;
+            }
+        }
+        assert!(
+            rebound,
+            "open session must re-handshake as a member after join"
+        );
+
+        // Now eviction must work on the re-bound session.
+        a_ctl.add_revocation(net.revoke(2, 0));
+        let mut evicted = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            if !a_ctl
+                .peers()
+                .await
+                .iter()
+                .any(|p| p.status == PeerStatus::Connected)
+            {
+                evicted = true;
+                break;
+            }
+        }
+        assert!(evicted, "revoking the re-bound member must evict it");
     }
 }
