@@ -208,6 +208,27 @@ impl Engine {
         if peer.endpoints.is_empty() {
             return Ok(()); // no address to reach them yet
         }
+
+        // Already have a live session with this peer? Don't re-handshake — that
+        // churns the Noise session and causes decrypt failures.
+        if let Some(&ep) = self.connected.get(&peer.id) {
+            let fresh = self
+                .last_seen
+                .get(&ep)
+                .map(|t| t.elapsed() < Duration::from_secs(15))
+                .unwrap_or(false);
+            if fresh && self.sessions.contains_key(&ep) {
+                return Ok(());
+            }
+        }
+
+        // Tie-break: only the node with the smaller id initiates; the other just
+        // waits for the INIT. Without this, both sides handshake at once and the
+        // sessions desync (each overwrites the other) → decrypt errors.
+        if self.identity.node_id().0 >= peer.id.0 {
+            return Ok(());
+        }
+
         // Identity == public key in v0, so discovery carries everything we need.
         let public_key = peer.id.0.to_vec();
         let info = PeerInfo {
@@ -550,6 +571,7 @@ mod tests {
         let id_b = Identity::generate().unwrap();
         let vip_a = derive_virtual_ip(&id_a.node_id());
         let vip_b = derive_virtual_ip(&id_b.node_id());
+        let id_a_nodeid = id_a.node_id();
         let id_b_nodeid = id_b.node_id();
 
         let addr_a: SocketAddr = "10.0.0.1:700".parse().unwrap();
@@ -559,13 +581,16 @@ mod tests {
         let (tun_a, handle_a) = MemoryTun::new();
         let (tun_b, mut handle_b) = MemoryTun::new();
 
-        // A discovers B (reachable at addr_b); B discovers nobody (learns A from
-        // the incoming handshake).
+        // Both discover each other; the tie-break picks whichever id is smaller
+        // to initiate, so this works regardless of the random id ordering.
         let disc_a = StaticDiscovery::new(vec![DiscoveredPeer {
             id: id_b_nodeid,
             endpoints: vec![addr_b],
         }]);
-        let disc_b = StaticDiscovery::new(vec![]);
+        let disc_b = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: id_a_nodeid,
+            endpoints: vec![addr_a],
+        }]);
 
         let mut engine_a = Engine::new(id_a, EngineConfig::default());
         let mut engine_b = Engine::new(id_b, EngineConfig::default());
@@ -606,6 +631,7 @@ mod tests {
         let id_a = Identity::generate().unwrap();
         let id_b = Identity::generate().unwrap();
         let vip_a = derive_virtual_ip(&id_a.node_id());
+        let a_nodeid = id_a.node_id();
         let b_nodeid = id_b.node_id();
 
         let addr_a: SocketAddr = "10.0.0.1:701".parse().unwrap();
@@ -615,11 +641,15 @@ mod tests {
         let (tun_a, handle_a) = MemoryTun::new();
         let (tun_b, mut handle_b) = MemoryTun::new();
 
+        // Both discover each other so the id tie-break can pick the initiator.
         let disc_a = StaticDiscovery::new(vec![DiscoveredPeer {
             id: b_nodeid,
             endpoints: vec![addr_b],
         }]);
-        let disc_b = StaticDiscovery::new(vec![]);
+        let disc_b = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: a_nodeid,
+            endpoints: vec![addr_a],
+        }]);
 
         let mut engine_a = Engine::new(id_a, EngineConfig::default());
         let mut engine_b = Engine::new(id_b, EngineConfig::default());
