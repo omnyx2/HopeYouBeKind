@@ -188,10 +188,12 @@ async fn start_daemon(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 #[tauri::command]
 async fn stop_daemon() -> Result<(), String> {
-    // `killall` matches by basename; the daemon's process command is its full
-    // path, so `pkill -x lattice-daemon` would miss it. Fall back to pkill -f.
-    let script = "do shell script \"killall lattice-daemon 2>/dev/null; \
-                  pkill -f 'resources/lattice-daemon' 2>/dev/null; true\" \
+    // Kill by PID file and by the bound UDP port — NOT by process-name pattern.
+    // The daemon's process command is its full path (so killall/pkill -x miss
+    // it), and pkill -f '…lattice-daemon…' self-matches the shell running it.
+    let script = "do shell script \"kill $(cat /tmp/lattice-daemon.pid 2>/dev/null) 2>/dev/null; \
+                  lsof -ti udp:41000 2>/dev/null | xargs kill 2>/dev/null; \
+                  rm -f /tmp/lattice.sock /tmp/lattice-daemon.pid; true\" \
                   with administrator privileges"
         .to_string();
     let _ = std::process::Command::new("osascript")
