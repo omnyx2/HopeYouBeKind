@@ -188,8 +188,12 @@ async fn start_daemon(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 #[tauri::command]
 async fn stop_daemon() -> Result<(), String> {
-    let script =
-        "do shell script \"pkill -x lattice-daemon\" with administrator privileges".to_string();
+    // `killall` matches by basename; the daemon's process command is its full
+    // path, so `pkill -x lattice-daemon` would miss it. Fall back to pkill -f.
+    let script = "do shell script \"killall lattice-daemon 2>/dev/null; \
+                  pkill -f 'resources/lattice-daemon' 2>/dev/null; true\" \
+                  with administrator privileges"
+        .to_string();
     let _ = std::process::Command::new("osascript")
         .arg("-e")
         .arg(&script)
