@@ -5,6 +5,9 @@
 // everything else — mesh on/off, peer list, copy IP — is one click.
 
 const invoke = window.__TAURI__?.invoke ?? mockInvoke;
+if (!window.__TAURI__) {
+  console.warn("Lattice: Tauri API not found — showing DEMO data, NOT a real daemon.");
+}
 
 const el = (id) => document.getElementById(id);
 let starting = false;
@@ -241,14 +244,14 @@ function mockInvoke(cmd, args) {
     case "get_status":
       return s.up
         ? Promise.resolve({
-            running: s.mesh, virtual_ip: "100.95.128.129", fingerprint: "a3f1c290",
-            node_id: "a3f1c290".repeat(8), public_addr: "203.247.167.58:47251",
+            running: s.mesh, virtual_ip: "0.0.0.0 (DEMO)", fingerprint: "demo",
+            node_id: "00".repeat(32), public_addr: null,
             exit_node: s.exit, is_exit: s.isExit, relay: s.relay,
           })
         : Promise.reject("daemon not running");
     case "list_peers":
       return Promise.resolve(s.up ? [
-        { virtual_ip: "100.86.168.223", fingerprint: "db16a8df", status: "connected", endpoint: "10.32.161.153:56681", node_id: "db16a8df".repeat(8), os: "linux" },
+        { virtual_ip: "0.0.0.0 (DEMO)", fingerprint: "demo", status: "known", endpoint: null, node_id: "00".repeat(32), os: "demo" },
       ] : []);
     default: return Promise.resolve(null);
   }
