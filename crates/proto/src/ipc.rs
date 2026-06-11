@@ -46,6 +46,8 @@ pub enum Response {
 pub struct NodeStatus {
     pub id: NodeId,
     pub virtual_ip: Option<VirtualIp>,
+    /// Our public (reflexive) address as seen via STUN, if known.
+    pub public_addr: Option<std::net::SocketAddr>,
     pub running: bool,
     pub peer_count: usize,
 }
@@ -62,6 +64,7 @@ mod tests {
             Response::Status(NodeStatus {
                 id: NodeId([1u8; 32]),
                 virtual_ip: None,
+                public_addr: None,
                 running: true,
                 peer_count: 0,
             }),

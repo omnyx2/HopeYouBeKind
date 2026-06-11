@@ -120,6 +120,7 @@ mod tests {
                     Request::Status => Response::Status(NodeStatus {
                         id: NodeId([7u8; 32]),
                         virtual_ip: None,
+                        public_addr: None,
                         running: true,
                         peer_count: 3,
                     }),

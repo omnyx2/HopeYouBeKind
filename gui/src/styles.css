@@ -86,6 +86,7 @@ button.secondary:hover { border-color: var(--off); }
   padding: 8px 0;
 }
 .label { color: var(--muted); }
+.small { font-size: 11px; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 .muted { color: var(--muted); font-weight: normal; }
 

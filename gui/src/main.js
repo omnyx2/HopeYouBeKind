@@ -35,7 +35,10 @@ async function refresh() {
   pill.className = "pill " + (meshUp ? "on" : "warn");
 
   el("virtual-ip").textContent = status.virtual_ip ?? "—";
-  el("fingerprint").textContent = status.fingerprint ?? "—";
+  el("public-addr").textContent = status.public_addr ?? "not detected (LAN only)";
+  const nodeId = status.node_id ?? "";
+  el("node-id").textContent = nodeId ? nodeId.slice(0, 16) + "…" : "—";
+  el("node-id").dataset.full = nodeId;
   el("mesh-toggle").checked = meshUp;
 
   let peers = [];
@@ -58,8 +61,8 @@ async function refresh() {
     left.innerHTML = `<span class="dot ${p.status}"></span>`;
     left.appendChild(ip);
     const right = document.createElement("span");
-    right.className = "muted mono";
-    right.textContent = p.fingerprint;
+    right.className = "muted mono small";
+    right.textContent = p.endpoint ? `${p.fingerprint} · ${p.endpoint}` : p.fingerprint;
     li.appendChild(left);
     li.appendChild(right);
     ul.appendChild(li);
@@ -106,6 +109,11 @@ el("virtual-ip").addEventListener("click", () => {
   if (ip && ip !== "—") copy(ip);
 });
 
+el("node-id").addEventListener("click", () => {
+  const full = el("node-id").dataset.full;
+  if (full) copy(full);
+});
+
 async function copy(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -144,11 +152,14 @@ function mockInvoke(cmd) {
     case "mesh_down": s.mesh = false; return Promise.resolve();
     case "get_status":
       return s.up
-        ? Promise.resolve({ running: s.mesh, virtual_ip: "100.95.128.129", fingerprint: "a3f1c290" })
+        ? Promise.resolve({
+            running: s.mesh, virtual_ip: "100.95.128.129", fingerprint: "a3f1c290",
+            node_id: "a3f1c290".repeat(8), public_addr: "203.247.167.58:47251",
+          })
         : Promise.reject("daemon not running");
     case "list_peers":
       return Promise.resolve(s.up ? [
-        { virtual_ip: "100.86.168.223", fingerprint: "db16a8df", status: "connected" },
+        { virtual_ip: "100.86.168.223", fingerprint: "db16a8df", status: "connected", endpoint: "10.32.161.153:56681" },
       ] : []);
     default: return Promise.resolve(null);
   }

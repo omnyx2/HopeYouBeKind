@@ -20,6 +20,8 @@ struct StatusView {
     running: bool,
     virtual_ip: Option<String>,
     fingerprint: String,
+    node_id: String,
+    public_addr: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -27,6 +29,7 @@ struct PeerView {
     virtual_ip: String,
     fingerprint: String,
     status: String,
+    endpoint: Option<String>,
 }
 
 #[tauri::command]
@@ -36,6 +39,8 @@ async fn get_status() -> Result<StatusView, String> {
             running: s.running,
             virtual_ip: s.virtual_ip.map(|v| v.to_string()),
             fingerprint: s.id.fingerprint(),
+            node_id: s.id.to_hex(),
+            public_addr: s.public_addr.map(|a| a.to_string()),
         }),
         Ok(Response::Error { message }) => Err(message),
         Ok(_) => Err("unexpected response".into()),
@@ -52,6 +57,7 @@ async fn list_peers() -> Result<Vec<PeerView>, String> {
                 virtual_ip: p.virtual_ip.to_string(),
                 fingerprint: p.id.fingerprint(),
                 status: format!("{:?}", p.status).to_lowercase(),
+                endpoint: p.endpoints.first().map(|e| e.to_string()),
             })
             .collect()),
         Ok(Response::Error { message }) => Err(message),

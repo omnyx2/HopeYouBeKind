@@ -29,6 +29,16 @@ impl NodeId {
         }
         s
     }
+
+    /// Full 64-character hex id — what a peer passes to `--peer` to reach you.
+    pub fn to_hex(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(64);
+        for b in &self.0 {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
 }
 
 impl std::fmt::Debug for NodeId {
