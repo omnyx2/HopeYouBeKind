@@ -67,6 +67,9 @@ pub struct PeerInfo {
     /// Best-known physical endpoints to reach this peer, most-preferred first.
     pub endpoints: Vec<SocketAddr>,
     pub status: PeerStatus,
+    /// The peer's operating system (e.g. "macos", "linux"), learned in the
+    /// handshake — `None` until known.
+    pub os: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

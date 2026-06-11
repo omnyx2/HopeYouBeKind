@@ -72,7 +72,13 @@ fn print_response(response: Response) {
                 println!("no peers yet");
             }
             for p in peers {
-                println!("{}  {}  {:?}", p.id.fingerprint(), p.virtual_ip, p.status);
+                println!(
+                    "{}  {}  {:<10}  {:?}",
+                    p.id.fingerprint(),
+                    p.virtual_ip,
+                    p.os.as_deref().unwrap_or("?"),
+                    p.status
+                );
             }
         }
         Response::Done => println!("ok"),

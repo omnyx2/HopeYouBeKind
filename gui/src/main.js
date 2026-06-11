@@ -62,7 +62,9 @@ async function refresh() {
     left.appendChild(ip);
     const right = document.createElement("span");
     right.className = "muted mono small";
-    right.textContent = p.endpoint ? `${p.fingerprint} · ${p.endpoint}` : p.fingerprint;
+    right.textContent = [osLabel(p.os), p.fingerprint, p.endpoint]
+      .filter(Boolean)
+      .join(" · ");
     li.appendChild(left);
     li.appendChild(right);
     ul.appendChild(li);
@@ -187,6 +189,14 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.add("hidden"), 1800);
 }
 
+function osLabel(os) {
+  if (!os) return "";
+  return (
+    { macos: "🍎 macOS", linux: "🐧 Linux", windows: "🪟 Windows", ios: "📱 iOS", android: "🤖 Android" }[os] ||
+    os
+  );
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 refresh();
@@ -213,7 +223,7 @@ function mockInvoke(cmd, args) {
         : Promise.reject("daemon not running");
     case "list_peers":
       return Promise.resolve(s.up ? [
-        { virtual_ip: "100.86.168.223", fingerprint: "db16a8df", status: "connected", endpoint: "10.0.0.5:56681", node_id: "db16a8df".repeat(8) },
+        { virtual_ip: "100.86.168.223", fingerprint: "db16a8df", status: "connected", endpoint: "10.0.0.5:56681", node_id: "db16a8df".repeat(8), os: "linux" },
       ] : []);
     default: return Promise.resolve(null);
   }
