@@ -61,8 +61,13 @@
       <section id="peers-card" class="card hidden">
         <h2>Peers <span id="peer-count" class="muted">(0)</span></h2>
         <ul id="peers" class="peers"></ul>
-        <p class="hint">Click a peer's IP to copy it — then use it like any
-          address (ssh, http://&lt;ip&gt;:port, …).</p>
+        <div class="add-peer">
+          <input id="peer-spec" placeholder="nodeID@ip:port" spellcheck="false" />
+          <button id="add-peer" class="secondary">Add</button>
+        </div>
+        <p class="hint">Add a peer across the internet by its
+          <b>node ID @ public ip:port</b> (port-forward a UDP port on the router).
+          Click a peer's IP to copy it.</p>
       </section>
     </main>
     <div id="toast" class="toast hidden"></div>

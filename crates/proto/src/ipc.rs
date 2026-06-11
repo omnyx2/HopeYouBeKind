@@ -26,6 +26,12 @@ pub enum Request {
     SetExit { node_id: Option<NodeId> },
     /// Allow (or stop allowing) this node to act as an exit for others.
     AllowExit { enabled: bool },
+    /// Manually pin a peer by node id + physical address — connect across the
+    /// internet without discovery (e.g. to a port-forwarded node).
+    AddPeer {
+        node_id: NodeId,
+        addr: std::net::SocketAddr,
+    },
 }
 
 /// The daemon's reply.

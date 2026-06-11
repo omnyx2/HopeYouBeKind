@@ -151,6 +151,19 @@ el("exit-toggle").addEventListener("change", async (e) => {
   refresh();
 });
 
+el("add-peer").addEventListener("click", async () => {
+  const spec = el("peer-spec").value.trim();
+  if (!spec) return;
+  try {
+    await invoke("add_peer", { spec });
+    el("peer-spec").value = "";
+    toast("peer added");
+  } catch (err) {
+    toast(String(err));
+  }
+  refresh();
+});
+
 async function copy(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -189,6 +202,7 @@ function mockInvoke(cmd, args) {
     case "mesh_down": s.mesh = false; return Promise.resolve();
     case "set_exit": s.exit = args?.nodeId ?? null; return Promise.resolve();
     case "allow_exit": s.isExit = !!args?.enabled; return Promise.resolve();
+    case "add_peer": return Promise.resolve();
     case "get_status":
       return s.up
         ? Promise.resolve({

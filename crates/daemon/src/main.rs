@@ -55,6 +55,12 @@ struct Args {
     /// (repeatable). Their candidate addresses are looked up and fed to the engine.
     #[arg(long)]
     peer: Vec<String>,
+
+    /// Manually pin a peer by `<node-id-hex>@<ip:port>` (repeatable). Connect
+    /// across the internet without discovery — point this at a port-forwarded
+    /// node's public address.
+    #[arg(long)]
+    peer_addr: Vec<String>,
 }
 
 #[tokio::main]
@@ -160,13 +166,38 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Manually pinned peers (`--peer-addr <id>@<ip:port>`): re-announce each
+    // periodically so the handshake retries until the remote is up.
+    for spec in &args.peer_addr {
+        match parse_peer_spec(spec) {
+            Some((id, addr)) => {
+                let tx = disc_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let _ = tx
+                            .send(DiscoveredPeer {
+                                id,
+                                endpoints: vec![addr],
+                            })
+                            .await;
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                    }
+                });
+                tracing::info!(peer = %id.fingerprint(), %addr, "pinned peer");
+            }
+            None => tracing::warn!(spec, "ignoring invalid --peer-addr (need <id>@<ip:port>)"),
+        }
+    }
+
     // IPC server lets the GUI/CLI query status and toggle the mesh while the
     // engine runs. The handler captures a cloneable handle to the engine.
     let ipc_handle = engine.handle();
     let ipc_tun = tun_name.clone();
+    let ipc_disc = disc_tx.clone();
     let ipc = lattice_ipc::serve(&args.ipc_socket, move |req| {
         let handle = ipc_handle.clone();
         let tun_name = ipc_tun.clone();
+        let disc_tx = ipc_disc.clone();
         async move {
             use lattice_proto::ipc::{Request, Response};
             match req {
@@ -206,6 +237,15 @@ async fn main() -> Result<()> {
                     } else {
                         exit::disable_nat();
                     }
+                    Response::Done
+                }
+                Request::AddPeer { node_id, addr } => {
+                    let _ = disc_tx
+                        .send(DiscoveredPeer {
+                            id: node_id,
+                            endpoints: vec![addr],
+                        })
+                        .await;
                     Response::Done
                 }
             }
@@ -297,6 +337,13 @@ async fn start_dht(
     }
 
     Ok(())
+}
+
+/// Parse a `<node-id-hex>@<ip:port>` peer pin.
+fn parse_peer_spec(s: &str) -> Option<(NodeId, SocketAddr)> {
+    let (id_hex, addr) = s.split_once('@')?;
+    let id = parse_hex_id(id_hex)?;
+    Some((NodeId(id), addr.parse().ok()?))
 }
 
 /// Parse a 64-character hex node id into 32 bytes.
