@@ -179,6 +179,15 @@ el("set-relay").addEventListener("click", async () => {
   refresh();
 });
 
+el("refresh-peers").addEventListener("click", async () => {
+  const btn = el("refresh-peers");
+  btn.classList.remove("spin");
+  void btn.offsetWidth; // restart the animation
+  btn.classList.add("spin");
+  await refresh();
+  toast("refreshed");
+});
+
 bindAdd("add-peer", "peer-spec", (v) => invoke("add_peer", { spec: v }), "peer added");
 bindAdd("add-relay-peer", "relay-peer-id", (v) => invoke("relay_peer", { nodeId: v }), "peer added via relay");
 

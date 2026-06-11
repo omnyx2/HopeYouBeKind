@@ -72,7 +72,10 @@
 
         <!-- ===== PEERS ===== -->
         <section data-panel="peers" class="panel hidden">
-          <h1 class="panel-title">Peers <span id="peer-count" class="muted">(0)</span></h1>
+          <div class="panel-head">
+            <h1 class="panel-title">Peers <span id="peer-count" class="muted">(0)</span></h1>
+            <button id="refresh-peers" class="icon-btn" title="Refresh now">↻</button>
+          </div>
           <ul id="peers" class="peers"></ul>
           <div class="card">
             <h2>Add a peer</h2>
