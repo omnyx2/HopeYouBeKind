@@ -1,7 +1,13 @@
 # Implemented features
 
-A snapshot of what Lattice does today (v0.7.0). Legend: ✅ working & tested ·
+A snapshot of what Lattice does today. Legend: ✅ working & tested ·
 ⚠️ working subset / needs integration · 🔜 designed, not built.
+
+New since v0.7.0: a **pluggable crypto suite** seam, **mesh membership** (network
+CA + certs + revocation), and a **traffic monitor**. Per-feature guides:
+[USAGE](USAGE.md) · [MEMBERSHIP](MEMBERSHIP.md) · [CRYPTO_SUITE](CRYPTO_SUITE.md) ·
+[TRAFFIC_MONITOR](TRAFFIC_MONITOR.md) · [EXIT_NODE](EXIT_NODE.md) ·
+[RELAY](RELAY.md) (index: [docs/README.md](README.md)).
 
 ## Data plane (moving the packets)
 
@@ -12,7 +18,9 @@ A snapshot of what Lattice does today (v0.7.0). Legend: ✅ working & tested ·
 | Virtual NIC — Windows Wintun | ⚠️ compiles; needs a Windows test pass | `crates/tun` (`windows.rs`) |
 | Custom encrypted tunnel (Noise-IK handshake) | ✅ | `crates/crypto` (`session.rs`) |
 | AEAD transport session (ChaCha20-Poly1305) | ✅ | `crates/crypto` |
+| Pluggable crypto suite (`CryptoSuite`; Noise default) | ✅ | `crates/crypto` (`suite.rs`), `crates/engine` |
 | Packet loop: TUN ⇄ route ⇄ encrypt ⇄ transport | ✅ | `crates/engine` |
+| Traffic monitor (per-flow, passive) | ✅ | `crates/engine` (`monitor.rs`), `gui/`, `crates/cli` |
 | Headless mode (`--no-tun`, no root) | ✅ | `crates/daemon`, `crates/tun` (`NullTun`) |
 
 ## Control plane (deciding the topology)
@@ -64,6 +72,10 @@ A snapshot of what Lattice does today (v0.7.0). Legend: ✅ working & tested ·
 | Feature | Status | Where |
 | --- | --- | --- |
 | Mutual auth + forward secrecy (Noise IK) | ✅ | `crates/crypto` |
+| Mesh membership: network CA (Ed25519) + signed certs | ✅ | `crates/membership`, `crates/engine` |
+| Enrollment via join token (`net issue` / `net join`) | ✅ | `crates/daemon`, `crates/cli`, `gui/` |
+| Eviction via gossiped revocation (`net revoke`) | ✅ | `crates/membership`, `crates/engine` |
+| Re-verify sessions on join (no stale open-mode tunnels) | ✅ | `crates/engine` |
 | Tamper detection (AEAD), tested | ✅ | `crates/crypto` |
 | Replay window (sliding anti-replay) | ⚠️ component done; AEAD-binding pending | `crates/crypto` (`replay.rs`) |
 | Rekey policy (count/age), wired into sessions | ✅ | `crates/crypto` (`rekey.rs`) |
@@ -93,8 +105,14 @@ These are intentionally future work — see `docs/ROADMAP.md`:
 
 ## Verification at a glance
 
-- 35 unit/integration tests pass (crypto handshake, replay window, Kademlia
-  publish→lookup over real UDP, IPC round-trip, engine end-to-end tunnel, …).
+- 49 unit/integration tests pass (crypto handshake + crypto-suite round-trip,
+  replay window, membership cert issue/verify/revoke, engine end-to-end tunnel,
+  same-network connect + revocation eviction, open-session-revocable-after-join,
+  Kademlia publish→lookup over real UDP, IPC round-trip, traffic monitor, …).
 - `clippy -D warnings` and `rustfmt --check` clean.
-- Live-verified: two real machines on a LAN auto-discover, handshake, and carry
-  encrypted `ping` traffic by virtual IP.
+- Live-verified: two real machines (Mac ↔ Ubuntu) on a LAN auto-discover,
+  handshake, and carry encrypted `ping`/`ssh` traffic by virtual IP, with the
+  traffic monitor showing the flows.
+- Live-verified: a **3-node SDN** (three Docker nodes) — create network → issue
+  join tokens → join → full mesh → revoke → the evicted node is dropped across
+  the whole mesh (0% loss before, 100% loss after).

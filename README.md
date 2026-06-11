@@ -81,12 +81,22 @@ GUI setup lives in [`gui/README.md`](gui/README.md).
 | `crates/net`        | UDP transport, NAT traversal, mDNS/DHT peer discovery   |
 | `crates/overlay`    | SDN control plane: virtual-IP allocation, routing table |
 | `crates/engine`     | Node runtime that wires the planes together             |
+| `crates/membership` | Network CA: identity, member certs, revocation          |
 | `crates/dht`        | Kademlia DHT for serverless peer rendezvous             |
 | `crates/ipc`        | Local daemon⇄GUI/CLI control protocol (Unix socket)     |
 | `crates/daemon`     | Privileged background service + IPC server              |
 | `crates/cli`        | Terminal control client                                 |
 | `gui/`              | Tauri desktop application                                |
-| `docs/`             | Features, architecture, protocol spec, roadmap, security |
+| `docs/`             | Guides, architecture, protocol spec, roadmap, security  |
+
+## Documentation
+
+Start with **[`docs/USAGE.md`](docs/USAGE.md)** (build & run, every workflow),
+then the per-feature guides indexed in **[`docs/README.md`](docs/README.md)**:
+[membership](docs/MEMBERSHIP.md), [pluggable crypto](docs/CRYPTO_SUITE.md),
+[traffic monitor](docs/TRAFFIC_MONITOR.md), [exit node](docs/EXIT_NODE.md),
+[relay](docs/RELAY.md). There's also a write-up of the design in
+[`docs/blog/`](docs/blog/building-a-serverless-mesh-vpn.md).
 
 ## License
 
