@@ -25,9 +25,18 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 - **`--no-tun`** headless daemon mode (control plane without root) and
   `ChannelDiscovery` for merging discovery sources.
 
+- **GUI dashboard expansion**: shows the node's public (STUN) address, full
+  copyable node id (to share for `--peer`), and each peer's physical endpoint.
+  `NodeStatus` gained a `public_addr` field (set by the daemon after STUN).
+- **`docs/FEATURES.md`**: a categorized status table of everything implemented.
+
 ### Fixed
 - IPC `Response` now uses adjacent serde tagging so the `Peers(Vec)` payload
   serializes (internal tagging cannot tag a sequence); regression test added.
+- mDNS surfaced IPv6 candidates that an IPv4 socket couldn't dial (EINVAL),
+  aborting handshakes — now filtered to IPv4, and a bad candidate no longer
+  aborts the others.
+- IPC socket is chmod 0666 so the unprivileged CLI/GUI connect without sudo.
 
 ## [0.7.0] — 2026-06-09
 

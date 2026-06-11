@@ -73,6 +73,8 @@ pub struct Engine {
     running: Arc<AtomicBool>,
     /// Whether the mesh is administratively up (toggled via the IPC `up`/`down`).
     enabled: Arc<AtomicBool>,
+    /// Our public (reflexive) address from STUN, set by the daemon once known.
+    public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
 }
 
 impl Engine {
@@ -89,6 +91,7 @@ impl Engine {
             config,
             running: Arc::new(AtomicBool::new(false)),
             enabled: Arc::new(AtomicBool::new(true)),
+            public_addr: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -109,6 +112,7 @@ impl Engine {
             overlay: Arc::clone(&self.overlay),
             running: Arc::clone(&self.running),
             enabled: Arc::clone(&self.enabled),
+            public_addr: Arc::clone(&self.public_addr),
         }
     }
 
@@ -335,17 +339,27 @@ pub struct EngineHandle {
     overlay: Arc<Mutex<Overlay>>,
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
+    public_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
 }
 
 impl EngineHandle {
     pub async fn status(&self) -> NodeStatus {
         let up = self.running.load(Ordering::Relaxed) && self.enabled.load(Ordering::Relaxed);
+        // Read the std-Mutex into a local so no guard is held across the await.
+        let public_addr = *self.public_addr.lock().unwrap();
+        let peer_count = self.overlay.lock().await.peer_count();
         NodeStatus {
             id: self.node_id,
             virtual_ip: Some(self.virtual_ip),
+            public_addr,
             running: up,
-            peer_count: self.overlay.lock().await.peer_count(),
+            peer_count,
         }
+    }
+
+    /// Record our public (reflexive) address, learned via STUN.
+    pub fn set_public_addr(&self, addr: SocketAddr) {
+        *self.public_addr.lock().unwrap() = Some(addr);
     }
 
     pub async fn peers(&self) -> Vec<PeerInfo> {

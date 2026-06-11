@@ -73,8 +73,23 @@ Peer-to-peer discovery over the LAN (so two machines find each other and the
 tunnel carries real ping traffic) is the v0.3 milestone — until then the daemon
 holds the interface up but surfaces no peers.
 
-## Backlog / stretch
-- Per-port vs. all-port policy (ACLs): expose the "지정된 포트 또는 전포트"
-  control as overlay firewall rules in the GUI.
-- Exit-node mode (route a peer's full internet traffic through another node).
-- Mobile (iOS/Android) via the same `engine` core behind a platform VPN API.
+## Backlog / future specs (deferred)
+
+Connectivity (makes the mesh reach anywhere, reliably):
+- **Relay fallback (DERP-style):** when two peers can't connect directly, route
+  their *still end-to-end encrypted* packets through a third node both can reach.
+  Any node can volunteer; no dedicated server. This is the cross-NAT safety net.
+- **Multi-hop mesh routing:** forward packets through several mesh nodes toward
+  the destination (a generalization of relay).
+- **Public bootstrap node + peer keepalive/liveness** (drop stale peers).
+
+Capabilities:
+- **Exit-node mode:** route a node's full internet traffic out through another
+  node (appear on the internet as that node).
+- **Per-port vs. all-port policy (ACLs):** the "지정된 포트 또는 전포트" control
+  as overlay firewall rules in the GUI.
+- **Mobile (iOS/Android)** via the same `engine` core behind a platform VPN API.
+
+Hardening / packaging:
+- Bind the replay counter to the AEAD nonce; wire the cookie into the flood path.
+- Signed/notarized installers; Windows named-pipe IPC.

@@ -119,6 +119,9 @@ async fn main() -> Result<()> {
                 None
             }
         };
+    if let Some(public) = reflexive {
+        engine.handle().set_public_addr(public);
+    }
 
     // All discovery sources feed one channel the engine consumes.
     let (disc_tx, discovery) = ChannelDiscovery::new();

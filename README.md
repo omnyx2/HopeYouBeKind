@@ -86,7 +86,7 @@ GUI setup lives in [`gui/README.md`](gui/README.md).
 | `crates/daemon`     | Privileged background service + IPC server              |
 | `crates/cli`        | Terminal control client                                 |
 | `gui/`              | Tauri desktop application                                |
-| `docs/`             | Architecture, protocol spec, roadmap, security model    |
+| `docs/`             | Features, architecture, protocol spec, roadmap, security |
 
 ## License
 
