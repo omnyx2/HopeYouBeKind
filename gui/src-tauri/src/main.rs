@@ -24,6 +24,7 @@ struct StatusView {
     public_addr: Option<String>,
     exit_node: Option<String>,
     is_exit: bool,
+    relay: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -47,6 +48,7 @@ async fn get_status() -> Result<StatusView, String> {
             public_addr: s.public_addr.map(|a| a.to_string()),
             exit_node: s.exit_node.map(|id| id.to_hex()),
             is_exit: s.is_exit,
+            relay: s.relay.map(|a| a.to_string()),
         }),
         Ok(Response::Error { message }) => Err(message),
         Ok(_) => Err("unexpected response".into()),
@@ -117,6 +119,28 @@ async fn set_exit(node_id: Option<String>) -> Result<(), String> {
 #[tauri::command]
 async fn allow_exit(enabled: bool) -> Result<(), String> {
     send(Request::AllowExit { enabled }).await
+}
+
+/// Set (empty string clears) the relay used to reach hard-NAT peers.
+#[tauri::command]
+async fn set_relay(addr: String) -> Result<(), String> {
+    let parsed = if addr.trim().is_empty() {
+        None
+    } else {
+        Some(
+            addr.trim()
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| "invalid relay address (need ip:port)")?,
+        )
+    };
+    send(Request::SetRelay { addr: parsed }).await
+}
+
+/// Reach a peer (by full hex node id) through the configured relay.
+#[tauri::command]
+async fn relay_peer(node_id: String) -> Result<(), String> {
+    let id = parse_node_id(node_id.trim()).ok_or("invalid node id (need 64 hex chars)")?;
+    send(Request::RelayPeer { node_id: id }).await
 }
 
 /// Manually pin a peer from a `<node-id>@<ip:port>` string — connect across the
@@ -196,7 +220,9 @@ fn main() {
             stop_daemon,
             set_exit,
             allow_exit,
-            add_peer
+            add_peer,
+            set_relay,
+            relay_peer
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");

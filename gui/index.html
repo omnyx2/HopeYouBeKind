@@ -55,6 +55,17 @@
         </div>
         <p class="hint">"Exit through" routes <b>all</b> your internet traffic via
           that peer (you appear as its IP). Needs the peer to allow it.</p>
+        <div class="row">
+          <span class="label">Relay</span>
+          <span id="relay-status" class="mono muted">off</span>
+        </div>
+        <div class="add-peer">
+          <input id="relay-addr" placeholder="relay ip:port (empty = off)" spellcheck="false" />
+          <button id="set-relay" class="secondary">Set</button>
+        </div>
+        <p class="hint">A relay forwards your encrypted traffic when a peer can't
+          be reached directly (CGNAT). Set it on both ends, then use "via relay"
+          below.</p>
         <button id="stop" class="secondary">Stop node</button>
       </section>
 
@@ -62,11 +73,15 @@
         <h2>Peers <span id="peer-count" class="muted">(0)</span></h2>
         <ul id="peers" class="peers"></ul>
         <div class="add-peer">
-          <input id="peer-spec" placeholder="nodeID@ip:port" spellcheck="false" />
+          <input id="peer-spec" placeholder="direct: nodeID@ip:port" spellcheck="false" />
           <button id="add-peer" class="secondary">Add</button>
         </div>
-        <p class="hint">Add a peer across the internet by its
-          <b>node ID @ public ip:port</b> (port-forward a UDP port on the router).
+        <div class="add-peer">
+          <input id="relay-peer-id" placeholder="via relay: nodeID" spellcheck="false" />
+          <button id="add-relay-peer" class="secondary">Add</button>
+        </div>
+        <p class="hint">Add a peer <b>directly</b> by node ID @ public ip:port
+          (port-forwarded), or <b>via relay</b> by node ID (a relay must be set).
           Click a peer's IP to copy it.</p>
       </section>
     </main>

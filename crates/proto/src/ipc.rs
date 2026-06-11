@@ -32,6 +32,11 @@ pub enum Request {
         node_id: NodeId,
         addr: std::net::SocketAddr,
     },
+    /// Set (or clear with `None`) the relay this node uses to reach peers that
+    /// can't be connected to directly.
+    SetRelay { addr: Option<std::net::SocketAddr> },
+    /// Reach a peer (by node id) through the configured relay.
+    RelayPeer { node_id: NodeId },
 }
 
 /// The daemon's reply.
@@ -65,6 +70,8 @@ pub struct NodeStatus {
     pub exit_node: Option<NodeId>,
     /// Whether we're acting as an exit node for others.
     pub is_exit: bool,
+    /// The relay address currently configured, if any.
+    pub relay: Option<std::net::SocketAddr>,
 }
 
 #[cfg(test)]
@@ -84,6 +91,7 @@ mod tests {
                 peer_count: 0,
                 exit_node: None,
                 is_exit: false,
+                relay: None,
             }),
             Response::Peers(vec![]),
             Response::Done,

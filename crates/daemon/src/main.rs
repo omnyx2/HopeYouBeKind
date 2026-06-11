@@ -152,8 +152,9 @@ async fn main() -> Result<()> {
     let transport = std::sync::Arc::new(lattice_net::relay::RelayTransport::new(
         udp, relay_addr, node_id.0,
     ));
-    // Keep our address registered with the relay so peers can be forwarded to us.
-    if relay_addr.is_some() {
+    // Keep our address registered with the relay so peers can be forwarded to
+    // us. Runs always; `register` is a no-op until a relay is configured.
+    {
         let reg = std::sync::Arc::clone(&transport);
         tokio::spawn(async move {
             loop {
@@ -265,14 +266,20 @@ async fn main() -> Result<()> {
     let ipc_handle = engine.handle();
     let ipc_tun = tun_name.clone();
     let ipc_disc = disc_tx.clone();
+    let ipc_transport = std::sync::Arc::clone(&transport);
     let ipc = lattice_ipc::serve(&args.ipc_socket, move |req| {
         let handle = ipc_handle.clone();
         let tun_name = ipc_tun.clone();
         let disc_tx = ipc_disc.clone();
+        let transport = std::sync::Arc::clone(&ipc_transport);
         async move {
             use lattice_proto::ipc::{Request, Response};
             match req {
-                Request::Status => Response::Status(handle.status().await),
+                Request::Status => {
+                    let mut s = handle.status().await;
+                    s.relay = transport.current_relay();
+                    Response::Status(s)
+                }
                 Request::Peers => Response::Peers(handle.peers().await),
                 Request::Up => {
                     handle.set_enabled(true);
@@ -315,6 +322,20 @@ async fn main() -> Result<()> {
                         .send(DiscoveredPeer {
                             id: node_id,
                             endpoints: vec![addr],
+                        })
+                        .await;
+                    Response::Done
+                }
+                Request::SetRelay { addr } => {
+                    transport.set_relay(addr);
+                    Response::Done
+                }
+                Request::RelayPeer { node_id } => {
+                    let synth = transport.endpoint_for(node_id.0);
+                    let _ = disc_tx
+                        .send(DiscoveredPeer {
+                            id: node_id,
+                            endpoints: vec![synth],
                         })
                         .await;
                     Response::Done

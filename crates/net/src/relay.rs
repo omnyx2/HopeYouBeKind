@@ -76,7 +76,7 @@ struct Synth {
 /// Wraps a transport so relayed peers look direct to the engine.
 pub struct RelayTransport<T> {
     inner: T,
-    relay_addr: Option<SocketAddr>,
+    relay_addr: Mutex<Option<SocketAddr>>,
     self_id: [u8; 32],
     synth: Mutex<Synth>,
 }
@@ -86,10 +86,20 @@ impl<T: Transport> RelayTransport<T> {
     pub fn new(inner: T, relay_addr: Option<SocketAddr>, self_id: [u8; 32]) -> Self {
         Self {
             inner,
-            relay_addr,
+            relay_addr: Mutex::new(relay_addr),
             self_id,
             synth: Mutex::new(Synth::default()),
         }
+    }
+
+    /// Set (or clear) the relay address at runtime.
+    pub fn set_relay(&self, addr: Option<SocketAddr>) {
+        *self.relay_addr.lock().unwrap() = addr;
+    }
+
+    /// The relay address currently in use, if any.
+    pub fn current_relay(&self) -> Option<SocketAddr> {
+        *self.relay_addr.lock().unwrap()
     }
 
     /// The synthetic endpoint the engine should use to reach `peer` via the
@@ -108,7 +118,7 @@ impl<T: Transport> RelayTransport<T> {
 
     /// Tell the relay our address (so peers can be forwarded to us).
     pub async fn register(&self) -> Result<(), NetError> {
-        if let Some(relay) = self.relay_addr {
+        if let Some(relay) = self.current_relay() {
             let frame = encode(&ZERO_ID, &self.self_id, &[]);
             self.inner.send_to(&frame, relay).await?;
         }
@@ -119,7 +129,7 @@ impl<T: Transport> RelayTransport<T> {
 #[async_trait::async_trait]
 impl<T: Transport> Transport for RelayTransport<T> {
     async fn send_to(&self, data: &[u8], dest: SocketAddr) -> Result<(), NetError> {
-        if let Some(relay) = self.relay_addr {
+        if let Some(relay) = self.current_relay() {
             let peer = self.synth.lock().unwrap().to_id.get(&dest).copied();
             if let Some(peer) = peer {
                 // Relayed peer: wrap and send to the relay instead.
@@ -133,7 +143,7 @@ impl<T: Transport> Transport for RelayTransport<T> {
     async fn recv_from(&self) -> Result<(Vec<u8>, SocketAddr), NetError> {
         loop {
             let (data, from) = self.inner.recv_from().await?;
-            if self.relay_addr == Some(from) {
+            if self.current_relay() == Some(from) {
                 if let Some((dest, src, inner)) = decode(&data) {
                     if dest == self.self_id {
                         let synth = self.endpoint_for(src);

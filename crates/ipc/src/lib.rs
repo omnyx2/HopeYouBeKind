@@ -125,6 +125,7 @@ mod tests {
                         peer_count: 3,
                         exit_node: None,
                         is_exit: false,
+                        relay: None,
                     }),
                     _ => Response::Done,
                 }
