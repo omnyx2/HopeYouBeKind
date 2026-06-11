@@ -216,15 +216,17 @@ impl Engine {
             public_key: public_key.clone(),
             endpoints: peer.endpoints.clone(),
             status: PeerStatus::Connecting,
+            os: None, // learned from the handshake response
         };
         self.overlay.lock().await.upsert_peer(info)?;
 
         let private = self.identity.private_key().to_vec();
+        let meta = local_meta();
         // Hole punch: initiate a handshake toward every candidate endpoint at
         // once. The first to answer wins — its NAT binding is the working path.
         // A single unreachable candidate must not abort the others.
         for &endpoint in &peer.endpoints {
-            let (handshake, init_msg) = Handshake::initiate(&private, &public_key)?;
+            let (handshake, init_msg) = Handshake::initiate(&private, &public_key, &meta)?;
             let frame = wire::encode(MessageType::HandshakeInit, &init_msg);
             match transport.send_to(&frame, endpoint).await {
                 Ok(()) => {
@@ -315,7 +317,7 @@ impl Engine {
         match msg_type {
             MessageType::HandshakeInit => {
                 let private = self.identity.private_key().to_vec();
-                let pending = respond(&private, payload)?;
+                let pending = respond(&private, payload, &local_meta())?;
                 let peer_id = node_id_from_pubkey(&pending.remote_static);
                 let info = PeerInfo {
                     id: peer_id,
@@ -323,6 +325,7 @@ impl Engine {
                     public_key: pending.remote_static,
                     endpoints: vec![from],
                     status: PeerStatus::Connected,
+                    os: decode_os(&pending.remote_payload),
                 };
                 self.overlay.lock().await.upsert_peer(info)?;
                 self.sessions.insert(from, pending.session);
@@ -337,14 +340,15 @@ impl Engine {
             }
             MessageType::HandshakeResp => {
                 if let Some(handshake) = self.pending.remove(&from) {
-                    let session = handshake.complete(payload)?;
+                    let (session, peer_meta) = handshake.complete(payload)?;
                     self.sessions.insert(from, session);
                     if let Some(peer_id) = self.peer_id_at(from).await {
                         self.connected.insert(peer_id, from);
-                        self.overlay
-                            .lock()
-                            .await
-                            .set_status(&peer_id, PeerStatus::Connected);
+                        let mut overlay = self.overlay.lock().await;
+                        overlay.set_status(&peer_id, PeerStatus::Connected);
+                        if let Some(os) = decode_os(&peer_meta) {
+                            overlay.set_os(&peer_id, os);
+                        }
                     }
                     tracing::info!(%from, "session established (initiator)");
                 }
@@ -476,6 +480,20 @@ impl EngineHandle {
     /// running but stops forwarding overlay packets.
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
+    }
+}
+
+/// Our own metadata advertised to peers in the handshake (currently the OS).
+fn local_meta() -> Vec<u8> {
+    std::env::consts::OS.as_bytes().to_vec()
+}
+
+/// Decode a peer's handshake metadata payload into an OS string, if present.
+fn decode_os(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(payload).to_string())
     }
 }
 

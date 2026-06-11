@@ -33,6 +33,7 @@ struct PeerView {
     status: String,
     endpoint: Option<String>,
     node_id: String,
+    os: Option<String>,
 }
 
 #[tauri::command]
@@ -64,6 +65,7 @@ async fn list_peers() -> Result<Vec<PeerView>, String> {
                 status: format!("{:?}", p.status).to_lowercase(),
                 endpoint: p.endpoints.first().map(|e| e.to_string()),
                 node_id: p.id.to_hex(),
+                os: p.os,
             })
             .collect()),
         Ok(Response::Error { message }) => Err(message),

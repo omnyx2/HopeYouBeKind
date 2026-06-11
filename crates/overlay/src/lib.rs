@@ -72,6 +72,13 @@ impl Overlay {
         }
     }
 
+    /// Record a known peer's operating system (no-op if unknown).
+    pub fn set_os(&mut self, id: &NodeId, os: String) {
+        if let Some(p) = self.peers.get_mut(id) {
+            p.os = Some(os);
+        }
+    }
+
     /// Which peer should a packet destined for `dst` be tunneled to?
     pub fn route(&self, dst: &VirtualIp) -> Result<&PeerInfo, OverlayError> {
         let id = self.routes.get(dst).ok_or(OverlayError::NoRoute(*dst))?;
@@ -103,6 +110,7 @@ mod tests {
             public_key: id.0.to_vec(),
             endpoints: vec![],
             status: PeerStatus::Known,
+            os: None,
         }
     }
 

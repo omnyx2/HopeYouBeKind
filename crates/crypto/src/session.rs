@@ -42,43 +42,55 @@ pub struct PendingHandshake {
     pub session: NoiseSession,
     pub response: Vec<u8>,
     pub remote_static: Vec<u8>,
+    /// The (authenticated) metadata payload the initiator sent — e.g. its OS.
+    pub remote_payload: Vec<u8>,
 }
 
 impl Handshake {
     /// Begin a handshake toward a peer whose static public key we already know.
-    /// Returns the in-progress handshake and the `HANDSHAKE_INIT` message bytes.
+    /// `payload` is small authenticated metadata (e.g. our OS) carried in the
+    /// init message. Returns the handshake and the `HANDSHAKE_INIT` bytes.
     pub fn initiate(
         local_private: &[u8],
         remote_public: &[u8],
+        payload: &[u8],
     ) -> Result<(Self, Vec<u8>), CryptoError> {
         let mut state = snow::Builder::new(params())
             .local_private_key(local_private)
             .remote_public_key(remote_public)
             .build_initiator()?;
         let mut buf = vec![0u8; 1024];
-        let n = state.write_message(&[], &mut buf)?;
+        let n = state.write_message(payload, &mut buf)?;
         buf.truncate(n);
         Ok((Self { state }, buf))
     }
 
     /// Finish the handshake using the responder's `HANDSHAKE_RESP` message.
-    pub fn complete(mut self, response: &[u8]) -> Result<NoiseSession, CryptoError> {
+    /// Returns the live session and the responder's metadata payload.
+    pub fn complete(mut self, response: &[u8]) -> Result<(NoiseSession, Vec<u8>), CryptoError> {
         let mut scratch = vec![0u8; 1024];
-        self.state.read_message(response, &mut scratch)?;
+        let n = self.state.read_message(response, &mut scratch)?;
+        let peer_payload = scratch[..n].to_vec();
         let transport = self.state.into_transport_mode()?;
-        Ok(NoiseSession::new(transport))
+        Ok((NoiseSession::new(transport), peer_payload))
     }
 }
 
-/// Accept an incoming `HANDSHAKE_INIT` as the responder. Produces the live
-/// session, the `HANDSHAKE_RESP` to send back, and the initiator's static key.
-pub fn respond(local_private: &[u8], init: &[u8]) -> Result<PendingHandshake, CryptoError> {
+/// Accept an incoming `HANDSHAKE_INIT` as the responder. `payload` is our
+/// metadata to send back. Produces the live session, the `HANDSHAKE_RESP`, the
+/// initiator's static key, and the initiator's metadata payload.
+pub fn respond(
+    local_private: &[u8],
+    init: &[u8],
+    payload: &[u8],
+) -> Result<PendingHandshake, CryptoError> {
     let mut state = snow::Builder::new(params())
         .local_private_key(local_private)
         .build_responder()?;
 
     let mut scratch = vec![0u8; 1024];
-    state.read_message(init, &mut scratch)?;
+    let n = state.read_message(init, &mut scratch)?;
+    let remote_payload = scratch[..n].to_vec();
 
     // IK reveals the initiator's static key during the handshake.
     let remote_static = state
@@ -87,7 +99,7 @@ pub fn respond(local_private: &[u8], init: &[u8]) -> Result<PendingHandshake, Cr
         .to_vec();
 
     let mut response = vec![0u8; 1024];
-    let n = state.write_message(&[], &mut response)?;
+    let n = state.write_message(payload, &mut response)?;
     response.truncate(n);
 
     let transport = state.into_transport_mode()?;
@@ -95,6 +107,7 @@ pub fn respond(local_private: &[u8], init: &[u8]) -> Result<PendingHandshake, Cr
         session: NoiseSession::new(transport),
         response,
         remote_static,
+        remote_payload,
     })
 }
 
@@ -154,20 +167,25 @@ mod tests {
         let initiator = Identity::generate().unwrap();
         let responder = Identity::generate().unwrap();
 
-        // 1. initiator → INIT
+        // 1. initiator → INIT (carrying metadata "macos")
         let (hs, init_msg) =
-            Handshake::initiate(initiator.private_key(), responder.public_key()).unwrap();
+            Handshake::initiate(initiator.private_key(), responder.public_key(), b"macos").unwrap();
 
-        // 2. responder accepts, learns initiator identity, → RESP
-        let pending = respond(responder.private_key(), &init_msg).unwrap();
+        // 2. responder accepts, learns initiator identity + metadata, → RESP
+        let pending = respond(responder.private_key(), &init_msg, b"linux").unwrap();
         assert_eq!(
             pending.remote_static,
             initiator.public_key(),
             "responder must authenticate the initiator's static key"
         );
+        assert_eq!(
+            pending.remote_payload, b"macos",
+            "carried the initiator's OS"
+        );
 
-        // 3. initiator completes
-        let mut init_session = hs.complete(&pending.response).unwrap();
+        // 3. initiator completes, learning the responder's metadata
+        let (mut init_session, resp_meta) = hs.complete(&pending.response).unwrap();
+        assert_eq!(resp_meta, b"linux", "carried the responder's OS");
         let mut resp_session = pending.session;
 
         // 4. initiator → responder
@@ -186,9 +204,9 @@ mod tests {
     fn tampered_ciphertext_is_rejected() {
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
-        let (hs, init) = Handshake::initiate(a.private_key(), b.public_key()).unwrap();
-        let pending = respond(b.private_key(), &init).unwrap();
-        let mut sa = hs.complete(&pending.response).unwrap();
+        let (hs, init) = Handshake::initiate(a.private_key(), b.public_key(), b"").unwrap();
+        let pending = respond(b.private_key(), &init, b"").unwrap();
+        let (mut sa, _) = hs.complete(&pending.response).unwrap();
         let mut sb = pending.session;
 
         let mut sealed = sa.encrypt(b"secret").unwrap();
