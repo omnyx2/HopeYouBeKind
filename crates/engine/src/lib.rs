@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lattice_crypto::{respond, Handshake, Identity, NoiseSession, TunnelSession};
+use lattice_crypto::{CryptoSuite, HandshakeState, Identity, NoiseSuite, TunnelSession};
 use lattice_net::{DiscoveredPeer, Discovery, Transport};
 use lattice_overlay::{derive_virtual_ip, Overlay};
 use lattice_proto::ipc::{FlowRecord, NodeStatus};
@@ -65,10 +65,13 @@ pub struct Engine {
     identity: Arc<Identity>,
     virtual_ip: VirtualIp,
     overlay: Arc<Mutex<Overlay>>,
+    /// The pluggable crypto suite driving every handshake + session. Swap this
+    /// to research a different scheme; Noise-IK is the default.
+    suite: Arc<dyn CryptoSuite>,
     /// Live sessions, keyed by the peer's transport endpoint.
-    sessions: HashMap<SocketAddr, NoiseSession>,
+    sessions: HashMap<SocketAddr, Box<dyn TunnelSession>>,
     /// Initiator handshakes awaiting a response, keyed by the peer's endpoint.
-    pending: HashMap<SocketAddr, Handshake>,
+    pending: HashMap<SocketAddr, Box<dyn HandshakeState>>,
     /// The endpoint each peer is actually reachable at, learned when its session
     /// establishes — the candidate whose NAT binding won the hole punch.
     connected: HashMap<NodeId, SocketAddr>,
@@ -92,12 +95,24 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Create a node from an identity. The virtual IP is derived from identity.
+    /// Create a node from an identity, using the default Noise-IK crypto suite.
+    /// The virtual IP is derived from identity.
     pub fn new(identity: Identity, config: EngineConfig) -> Self {
+        Self::with_suite(identity, config, Arc::new(NoiseSuite))
+    }
+
+    /// Create a node with an explicit crypto suite — the seam for researching
+    /// alternative tunnel encryption without touching the engine.
+    pub fn with_suite(
+        identity: Identity,
+        config: EngineConfig,
+        suite: Arc<dyn CryptoSuite>,
+    ) -> Self {
         let virtual_ip = derive_virtual_ip(&identity.node_id());
         Self {
             identity: Arc::new(identity),
             virtual_ip,
+            suite,
             overlay: Arc::new(Mutex::new(Overlay::new())),
             sessions: HashMap::new(),
             pending: HashMap::new(),
@@ -255,7 +270,7 @@ impl Engine {
         // once. The first to answer wins — its NAT binding is the working path.
         // A single unreachable candidate must not abort the others.
         for &endpoint in &peer.endpoints {
-            let (handshake, init_msg) = Handshake::initiate(&private, &public_key, &meta)?;
+            let (handshake, init_msg) = self.suite.initiate(&private, &public_key, &meta)?;
             let frame = wire::encode(MessageType::HandshakeInit, &init_msg);
             match transport.send_to(&frame, endpoint).await {
                 Ok(()) => {
@@ -349,8 +364,8 @@ impl Engine {
         match msg_type {
             MessageType::HandshakeInit => {
                 let private = self.identity.private_key().to_vec();
-                let pending = respond(&private, payload, &local_meta())?;
-                let peer_id = node_id_from_pubkey(&pending.remote_static);
+                let accepted = self.suite.respond(&private, payload, &local_meta())?;
+                let peer_id = node_id_from_pubkey(&accepted.peer_identity);
 
                 // Dedup: if we already have a live session with this peer (e.g. a
                 // duplicate INIT from multi-candidate hole punch), ignore this
@@ -369,17 +384,17 @@ impl Engine {
                 let info = PeerInfo {
                     id: peer_id,
                     virtual_ip: derive_virtual_ip(&peer_id),
-                    public_key: pending.remote_static,
+                    public_key: accepted.peer_identity,
                     endpoints: vec![from],
                     status: PeerStatus::Connected,
-                    os: decode_os(&pending.remote_payload),
+                    os: decode_os(&accepted.peer_payload),
                 };
                 self.overlay.lock().await.upsert_peer(info)?;
-                self.sessions.insert(from, pending.session);
+                self.sessions.insert(from, accepted.session);
                 self.connected.insert(peer_id, from);
                 transport
                     .send_to(
-                        &wire::encode(MessageType::HandshakeResp, &pending.response),
+                        &wire::encode(MessageType::HandshakeResp, &accepted.response),
                         from,
                     )
                     .await?;
