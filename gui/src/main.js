@@ -88,70 +88,16 @@ async function refresh() {
   }
 }
 
+// The user GUI shows membership read-only: the node's role (open / member) and
+// the network id. Admin capabilities (enrolling/revoking members, holding the
+// network CA key) are deliberately NOT in the user surface — they live in the
+// separate admin CLI/tooling. So there's no members list or issue/revoke UI here.
 async function renderMesh(net) {
   const hasNet = !!net.network_id;
-  el("mesh-role").textContent = hasNet
-    ? net.is_admin
-      ? "admin (holds network key)"
-      : "member"
-    : "open mode (no network)";
+  el("mesh-role").textContent = hasNet ? "member" : "open mode (no network)";
   const idEl = el("mesh-id");
   idEl.textContent = hasNet ? net.fingerprint + "…" : "—";
   idEl.dataset.full = net.network_id ?? "";
-
-  el("admin-card").classList.toggle("hidden", !net.is_admin);
-  if (net.is_admin) {
-    let members = [];
-    try {
-      members = await invoke("list_members");
-    } catch {
-      /* transient */
-    }
-    renderMembers(members);
-  }
-}
-
-function renderMembers(members) {
-  el("member-count").textContent = `(${members.length})`;
-  const ul = el("members");
-  ul.innerHTML = "";
-  if (members.length === 0) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = "No members enrolled yet.";
-    ul.appendChild(li);
-    return;
-  }
-  for (const m of members) {
-    const li = document.createElement("li");
-    const left = document.createElement("span");
-    left.innerHTML =
-      `<span class="dot ${m.revoked ? "lost" : "connected"}"></span>` +
-      `<span class="mono">${m.fingerprint}</span> ` +
-      `<span class="muted small">${m.label ?? ""} · #${m.serial}</span>`;
-    const right = document.createElement("span");
-    if (m.revoked) {
-      right.className = "muted small";
-      right.textContent = "revoked";
-    } else {
-      const btn = document.createElement("button");
-      btn.className = "secondary small-btn";
-      btn.textContent = "Revoke";
-      btn.addEventListener("click", async () => {
-        try {
-          await invoke("revoke_member", { nodeId: m.node_id });
-          toast("member revoked");
-        } catch (e) {
-          toast(String(e));
-        }
-        refresh();
-      });
-      right.appendChild(btn);
-    }
-    li.appendChild(left);
-    li.appendChild(right);
-    ul.appendChild(li);
-  }
 }
 
 function renderFlows(flows) {
@@ -335,28 +281,6 @@ el("join-net").addEventListener("click", async () => {
   refresh();
 });
 
-el("issue-cert").addEventListener("click", async () => {
-  const nodeId = el("issue-node-id").value.trim();
-  if (!nodeId) return;
-  const label = el("issue-label").value.trim();
-  try {
-    const token = await invoke("issue_cert", { nodeId, label: label || null });
-    el("issued-token").value = token;
-    el("issued-token-row").classList.remove("hidden");
-    el("issue-node-id").value = "";
-    el("issue-label").value = "";
-    toast("token issued — copy & send it");
-  } catch (e) {
-    toast(String(e));
-  }
-  refresh();
-});
-
-el("copy-token").addEventListener("click", () => {
-  const t = el("issued-token").value;
-  if (t) copy(t);
-});
-
 bindAdd("add-peer", "peer-spec", (v) => invoke("add_peer", { spec: v }), "peer added");
 bindAdd("add-relay-peer", "relay-peer-id", (v) => invoke("relay_peer", { nodeId: v }), "peer added via relay");
 
@@ -447,15 +371,9 @@ function mockInvoke(cmd, args) {
       ] : []);
     case "network_info":
       return Promise.resolve(s.up
-        ? { network_id: "44".repeat(32), fingerprint: "44447777", is_admin: true, member_count: 2, revocation_count: 0 }
+        ? { network_id: "44".repeat(32), fingerprint: "44447777", is_admin: false, member_count: 2, revocation_count: 0 }
         : { network_id: null, fingerprint: null, is_admin: false, member_count: 0, revocation_count: 0 });
-    case "list_members":
-      return Promise.resolve([
-        { node_id: "00".repeat(32), fingerprint: "00112233", serial: 1, label: "admin", revoked: false },
-        { node_id: "ab".repeat(32), fingerprint: "abababab", serial: 2, label: "laptop", revoked: false },
-      ]);
-    case "issue_cert": return Promise.resolve("deadbeef".repeat(38));
-    case "join_network": case "revoke_member": return Promise.resolve();
+    case "join_network": return Promise.resolve();
     case "list_flows":
       return Promise.resolve(s.up ? [
         { peer: "demo", protocol: "TCP", local: "100.64.0.1:54012", remote: "100.64.0.2:22", tx_packets: 128, tx_bytes: 18432, rx_packets: 140, rx_bytes: 196608, last_active_secs: 0 },

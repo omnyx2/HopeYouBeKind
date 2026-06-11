@@ -168,23 +168,6 @@
             <p class="hint">Ask the network admin to issue a token for your Node ID
               (shown on the Status tab), then paste it here.</p>
           </div>
-
-          <!-- admin-only -->
-          <div id="admin-card" class="card hidden">
-            <h2>Members <span id="member-count" class="muted">(0)</span></h2>
-            <ul id="members" class="peers"></ul>
-            <div class="add-row">
-              <input id="issue-node-id" placeholder="node ID to enroll (64 hex)" spellcheck="false" />
-              <input id="issue-label" placeholder="label" spellcheck="false" style="max-width:30%" />
-              <button id="issue-cert" class="secondary">Issue</button>
-            </div>
-            <div id="issued-token-row" class="add-row hidden">
-              <input id="issued-token" class="mono" readonly />
-              <button id="copy-token" class="secondary">Copy</button>
-            </div>
-            <p class="hint">Issue a token, then send it to that node to paste into
-              "Join". Revoke evicts a member — it's dropped across the mesh.</p>
-          </div>
         </section>
 
         <!-- ===== NETWORK ===== -->
