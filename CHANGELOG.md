@@ -33,6 +33,16 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
   members (eviction propagates over the mesh). Admins keep a member registry so
   serials stay stable across restarts.
 
+### Fixed
+- **Membership re-verification on join**: joining a network at runtime now drops
+  existing sessions so they re-handshake and are re-verified under the network —
+  previously a session formed in open mode stayed unauthenticated and wasn't
+  bound to a cert serial, so a later revocation couldn't evict it. Reconnection
+  is now prompt (handshakes are re-initiated to known peers each keepalive tick,
+  not only on a discovery re-emit), which also fixes slow reconnection after a
+  dropped session. Validated live with three Docker nodes: runtime enroll → full
+  mesh → revoke → eviction across the whole mesh.
+
 - **Traffic monitor**: a passive per-flow observer of everything crossing the
   tunnel. `lattice-engine` gained a `monitor` module (`TrafficMonitor`) that
   records each plaintext packet on the outbound (pre-encrypt) and inbound
