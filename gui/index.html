@@ -7,84 +7,126 @@
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
-    <main class="app">
-      <header>
-        <h1>Lattice</h1>
-        <span id="state-pill" class="pill off">stopped</span>
-      </header>
+    <div class="app">
+      <!-- Sidebar / menu -->
+      <nav class="sidebar">
+        <div class="brand"><span class="brand-mark">▦</span> Lattice</div>
+        <div class="nav">
+          <button class="nav-item active" data-tab="status">
+            <span class="nav-ico">◎</span> Status
+          </button>
+          <button class="nav-item" data-tab="peers">
+            <span class="nav-ico">⧉</span> Peers
+            <span id="nav-peer-count" class="nav-badge hidden">0</span>
+          </button>
+          <button class="nav-item" data-tab="network">
+            <span class="nav-ico">⇄</span> Network
+          </button>
+        </div>
+        <div class="sidebar-foot">
+          <span id="conn-dot" class="conn-dot off"></span>
+          <span id="conn-text">stopped</span>
+        </div>
+      </nav>
 
-      <!-- When the daemon is stopped -->
-      <section id="stopped-card" class="card">
-        <p class="muted">The node service is not running.</p>
-        <button id="start" class="primary">Start node</button>
-        <p id="start-hint" class="hint">You'll be asked for your password — the
-          node needs admin rights to create the virtual network interface.</p>
-      </section>
+      <!-- Content -->
+      <main class="content">
+        <!-- ===== STATUS ===== -->
+        <section data-panel="status" class="panel">
+          <h1 class="panel-title">Status</h1>
 
-      <!-- When the daemon is running -->
-      <section id="running-card" class="card hidden">
-        <div class="row">
-          <span class="label">Your virtual IP</span>
-          <span id="virtual-ip" class="mono copy" title="Click to copy">—</span>
-        </div>
-        <div class="row">
-          <span class="label">Public address</span>
-          <span id="public-addr" class="mono muted">—</span>
-        </div>
-        <div class="row">
-          <span class="label">Node ID</span>
-          <span id="node-id" class="mono copy" title="Click to copy — share this so a peer can reach you">—</span>
-        </div>
-        <div class="row">
-          <span class="label">Mesh</span>
-          <label class="switch">
-            <input type="checkbox" id="mesh-toggle" />
-            <span class="slider"></span>
-          </label>
-        </div>
-        <div class="row">
-          <span class="label">Exit through</span>
-          <select id="exit-select" class="select"></select>
-        </div>
-        <div class="row">
-          <span class="label">Act as exit node</span>
-          <label class="switch">
-            <input type="checkbox" id="exit-toggle" />
-            <span class="slider"></span>
-          </label>
-        </div>
-        <p class="hint">"Exit through" routes <b>all</b> your internet traffic via
-          that peer (you appear as its IP). Needs the peer to allow it.</p>
-        <div class="row">
-          <span class="label">Relay</span>
-          <span id="relay-status" class="mono muted">off</span>
-        </div>
-        <div class="add-peer">
-          <input id="relay-addr" placeholder="relay ip:port (empty = off)" spellcheck="false" />
-          <button id="set-relay" class="secondary">Set</button>
-        </div>
-        <p class="hint">A relay forwards your encrypted traffic when a peer can't
-          be reached directly (CGNAT). Set it on both ends, then use "via relay"
-          below.</p>
-        <button id="stop" class="secondary">Stop node</button>
-      </section>
+          <div id="stopped-card" class="card center">
+            <p class="muted">The node service is not running.</p>
+            <button id="start" class="primary">Start node</button>
+            <p class="hint">You'll be asked for your password — the node needs
+              admin rights to create the virtual network interface.</p>
+          </div>
 
-      <section id="peers-card" class="card hidden">
-        <h2>Peers <span id="peer-count" class="muted">(0)</span></h2>
-        <ul id="peers" class="peers"></ul>
-        <div class="add-peer">
-          <input id="peer-spec" placeholder="direct: nodeID@ip:port" spellcheck="false" />
-          <button id="add-peer" class="secondary">Add</button>
-        </div>
-        <div class="add-peer">
-          <input id="relay-peer-id" placeholder="via relay: nodeID" spellcheck="false" />
-          <button id="add-relay-peer" class="secondary">Add</button>
-        </div>
-        <p class="hint">Add a peer <b>directly</b> by node ID @ public ip:port
-          (port-forwarded), or <b>via relay</b> by node ID (a relay must be set).
-          Click a peer's IP to copy it.</p>
-      </section>
-    </main>
+          <div id="running-card" class="card hidden">
+            <div class="kv">
+              <span class="label">Virtual IP</span>
+              <span id="virtual-ip" class="mono copy" title="Click to copy">—</span>
+            </div>
+            <div class="kv">
+              <span class="label">Node ID</span>
+              <span id="node-id" class="mono copy" title="Click to copy — share so a peer can reach you">—</span>
+            </div>
+            <div class="kv">
+              <span class="label">Public address</span>
+              <span id="public-addr" class="mono muted">—</span>
+            </div>
+            <div class="kv">
+              <span class="label">Fingerprint</span>
+              <span id="fingerprint" class="mono muted">—</span>
+            </div>
+            <div class="kv">
+              <span class="label">Mesh</span>
+              <label class="switch">
+                <input type="checkbox" id="mesh-toggle" />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <button id="stop" class="secondary">Stop node</button>
+          </div>
+        </section>
+
+        <!-- ===== PEERS ===== -->
+        <section data-panel="peers" class="panel hidden">
+          <h1 class="panel-title">Peers <span id="peer-count" class="muted">(0)</span></h1>
+          <ul id="peers" class="peers"></ul>
+          <div class="card">
+            <h2>Add a peer</h2>
+            <div class="add-row">
+              <input id="peer-spec" placeholder="direct: nodeID@ip:port" spellcheck="false" />
+              <button id="add-peer" class="secondary">Add</button>
+            </div>
+            <div class="add-row">
+              <input id="relay-peer-id" placeholder="via relay: nodeID" spellcheck="false" />
+              <button id="add-relay-peer" class="secondary">Add</button>
+            </div>
+            <p class="hint">Direct needs a public ip:port (port-forwarded). Via
+              relay needs a relay set in Network.</p>
+          </div>
+        </section>
+
+        <!-- ===== NETWORK ===== -->
+        <section data-panel="network" class="panel hidden">
+          <h1 class="panel-title">Network</h1>
+
+          <div class="card">
+            <h2>Exit node</h2>
+            <div class="kv">
+              <span class="label">Send my internet via</span>
+              <select id="exit-select" class="select"></select>
+            </div>
+            <div class="kv">
+              <span class="label">Act as exit for others</span>
+              <label class="switch">
+                <input type="checkbox" id="exit-toggle" />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <p class="hint">"Exit through" routes <b>all</b> your internet traffic
+              via that peer (you appear as its IP).</p>
+          </div>
+
+          <div class="card">
+            <h2>Relay</h2>
+            <div class="kv">
+              <span class="label">Status</span>
+              <span id="relay-status" class="mono muted">off</span>
+            </div>
+            <div class="add-row">
+              <input id="relay-addr" placeholder="relay ip:port (empty = off)" spellcheck="false" />
+              <button id="set-relay" class="secondary">Set</button>
+            </div>
+            <p class="hint">A relay forwards your encrypted traffic when a peer
+              can't be reached directly (CGNAT). Set it on both ends.</p>
+          </div>
+        </section>
+      </main>
+    </div>
+
     <div id="toast" class="toast hidden"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
