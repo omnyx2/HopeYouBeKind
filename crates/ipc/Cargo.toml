@@ -15,3 +15,16 @@ serde_json.workspace = true
 # Peer-credential lookup on the IPC socket (SO_PEERCRED / LOCAL_PEERPID) so the
 # daemon can authorize requests by the calling process's name.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Windows IPC uses a named pipe (\\.\pipe\lattice). windows-sys gives us the
+# client-PID lookup (GetNamedPipeClientProcessId) for the same caller-name
+# authorization the unix path does via peer credentials, plus the pipe security
+# descriptor so an unprivileged GUI/CLI can reach a daemon running as admin.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
