@@ -115,7 +115,23 @@ pub struct Engine {
     /// where the tie-break's designated initiator may be the unreachable side.
     /// Shared so the IPC handle can register pins at runtime.
     force_initiate: Arc<std::sync::Mutex<HashSet<NodeId>>>,
+    /// Initiator side: when we last sent a handshake INIT to each peer. Gates
+    /// re-initiation to at most once per [`REKEY_TIMEOUT`] so a re-init never
+    /// overwrites an in-flight `pending` before its response can complete it
+    /// (WireGuard's "one handshake in flight" rule — fixes the half-open deadlock).
+    last_init: HashMap<NodeId, Instant>,
+    /// Responder side: when we last accepted an INIT from each peer and replied.
+    /// Suppresses only a *burst* of duplicate inits (multi-candidate hole punch /
+    /// retransmits) within [`REKEY_TIMEOUT`]; a genuine re-handshake after that is
+    /// always honoured, so a peer whose session died can always reconnect.
+    last_responded: HashMap<NodeId, Instant>,
 }
+
+/// Minimum interval between handshake initiations to one peer, and the window in
+/// which a responder treats repeated inits as duplicates. From WireGuard's timer
+/// state machine (REKEY_TIMEOUT). Keeps at most one handshake in flight so the
+/// initiator's `pending` isn't churned out from under an arriving response.
+const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Engine {
     /// Create a node from an identity, using the default Noise-IK crypto suite.
@@ -154,6 +170,8 @@ impl Engine {
             peer_serial: HashMap::new(),
             resync: Arc::new(AtomicBool::new(false)),
             force_initiate: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            last_init: HashMap::new(),
+            last_responded: HashMap::new(),
         }
     }
 
@@ -302,6 +320,24 @@ impl Engine {
             return Ok(());
         }
 
+        // WireGuard REKEY_TIMEOUT: keep at most one handshake in flight per peer.
+        // If an INIT we sent is still pending and was sent within REKEY_TIMEOUT,
+        // don't send another — re-initiating overwrites `pending`, so the
+        // responder's reply to the first INIT could never complete it (the
+        // re-init race that left sessions stuck "Connecting" / half-open).
+        let has_pending = peer
+            .endpoints
+            .iter()
+            .any(|ep| self.pending.contains_key(ep));
+        if has_pending
+            && self
+                .last_init
+                .get(&peer.id)
+                .is_some_and(|t| t.elapsed() < REKEY_TIMEOUT)
+        {
+            return Ok(());
+        }
+
         // Identity == public key in v0, so discovery carries everything we need.
         let public_key = peer.id.0.to_vec();
         let info = PeerInfo {
@@ -331,6 +367,7 @@ impl Engine {
                 }
             }
         }
+        self.last_init.insert(peer.id, Instant::now());
         tracing::info!(
             peer = %peer.id.fingerprint(),
             candidates = peer.endpoints.len(),
@@ -430,17 +467,33 @@ impl Engine {
                     }
                 };
 
-                // Dedup: if we already have a live session with this peer (e.g. a
-                // duplicate INIT from multi-candidate hole punch), ignore this
-                // one — adopting it would clobber the working session and desync.
-                if let Some(&ep) = self.connected.get(&peer_id) {
-                    let fresh = self
-                        .last_seen
-                        .get(&ep)
-                        .map(|t| t.elapsed() < Duration::from_secs(15))
-                        .unwrap_or(false);
-                    if fresh && self.sessions.contains_key(&ep) {
-                        return Ok(());
+                // WireGuard responder rule: accept a valid INIT and (re)establish
+                // the session. Suppress only a *burst* — duplicate inits from
+                // multi-candidate hole punching or retransmits within REKEY_TIMEOUT
+                // — so we don't churn a session we just made. A genuine
+                // re-handshake after REKEY_TIMEOUT is always honoured: that is what
+                // breaks the half-open deadlock where the initiator's completion
+                // failed yet we kept a one-sided "Connected" session and (because
+                // the inits themselves refreshed last_seen) ignored its retries
+                // forever.
+                let burst = self
+                    .last_responded
+                    .get(&peer_id)
+                    .is_some_and(|t| t.elapsed() < REKEY_TIMEOUT);
+                let have_session = self
+                    .connected
+                    .get(&peer_id)
+                    .is_some_and(|ep| self.sessions.contains_key(ep));
+                if burst && have_session {
+                    return Ok(());
+                }
+                self.last_responded.insert(peer_id, Instant::now());
+                // Replacing at a new endpoint? Drop the stale session so we don't
+                // leave an orphan (its keys are dead now anyway).
+                if let Some(&old) = self.connected.get(&peer_id) {
+                    if old != from {
+                        self.sessions.remove(&old);
+                        self.last_seen.remove(&old);
                     }
                 }
 
@@ -579,6 +632,8 @@ impl Engine {
             self.pending.clear();
             self.connected.clear();
             self.peer_serial.clear();
+            self.last_init.clear();
+            self.last_responded.clear();
             let ids: Vec<NodeId> = self.overlay.lock().await.peers().map(|p| p.id).collect();
             let mut overlay = self.overlay.lock().await;
             for id in &ids {
@@ -629,6 +684,10 @@ impl Engine {
             self.connected.remove(&id);
             self.last_seen.remove(&ep);
             self.peer_serial.remove(&id);
+            // Clear the handshake timers so the re-init below can reconnect at once
+            // (a dropped peer should reconnect promptly, not wait out REKEY_TIMEOUT).
+            self.last_init.remove(&id);
+            self.last_responded.remove(&id);
             tracing::info!(peer = %id.fingerprint(), "peer timed out, removed");
         }
 
