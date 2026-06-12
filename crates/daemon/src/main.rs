@@ -316,6 +316,8 @@ async fn main() -> Result<()> {
             node_id,
             reflexive,
             disc_tx.clone(),
+            admin.clone(),
+            engine.handle(),
         )
         .await
         {
@@ -647,6 +649,7 @@ async fn main() -> Result<()> {
 /// Bring up a Kademlia DHT node: join via bootstrap addresses, publish our
 /// candidate addresses under our node id, and resolve each `--peer` id (feeding
 /// the discovered endpoints to the engine for handshaking).
+#[allow(clippy::too_many_arguments)]
 async fn start_dht(
     bind: String,
     bootstrap: Vec<String>,
@@ -654,6 +657,8 @@ async fn start_dht(
     node_id: NodeId,
     reflexive: Option<SocketAddr>,
     disc_tx: mpsc::Sender<DiscoveredPeer>,
+    admin: Option<std::sync::Arc<std::sync::Mutex<membership::Admin>>>,
+    handle: lattice_engine::EngineHandle,
 ) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind(&bind).await?);
     let local = socket.local_addr()?;
@@ -699,6 +704,67 @@ async fn start_dht(
                                 endpoints: addrs,
                             })
                             .await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    // SDN×DHT control plane (docs/SDN_DHT_ARCHITECTURE.md): the admin publishes the
+    // signed member directory to the DHT; every node fetches + verifies it and
+    // resolves each member's endpoint, so a full mesh forms automatically with no
+    // manual `--peer` list. Authority stays with the admin (only the CA can sign a
+    // directory readers accept).
+    if let Some(admin) = admin {
+        let kad = Arc::clone(&kad);
+        tokio::spawn(async move {
+            loop {
+                let (key, bytes) = {
+                    let a = admin.lock().unwrap();
+                    let dir = a.signed_directory();
+                    (a.network_id().directory_key(), dir.to_bytes())
+                };
+                kad.publish_record(key, bytes).await;
+                tracing::debug!("published member directory to DHT");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    // Directory consumer (admin + members alike): learn the whole membership and
+    // connect to everyone.
+    {
+        let kad = Arc::clone(&kad);
+        let tx = disc_tx.clone();
+        let me = node_id.0;
+        tokio::spawn(async move {
+            loop {
+                if let Some(net) = handle.network_id() {
+                    if let Some(bytes) = kad.get_record(net.directory_key()).await {
+                        match lattice_membership::MemberDirectory::from_bytes(&bytes) {
+                            Ok(dir) if dir.verify(&net).is_ok() => {
+                                for &id in dir.node_ids() {
+                                    if id == me {
+                                        continue;
+                                    }
+                                    if let Ok(addrs) = kad.lookup(id).await {
+                                        if !addrs.is_empty() {
+                                            let _ = tx
+                                                .send(DiscoveredPeer {
+                                                    id: NodeId(id),
+                                                    endpoints: addrs,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                tracing::warn!("member directory failed verification — ignoring")
+                            }
+                            Err(_) => tracing::warn!("malformed member directory in DHT"),
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;

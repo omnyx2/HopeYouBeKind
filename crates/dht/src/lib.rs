@@ -161,6 +161,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_publish_then_get_finds_bytes_across_the_dht() {
+        // The control-plane record store (e.g. the member directory) must route
+        // and resolve like the address store, across a network larger than K.
+        let kads = build_network(40).await;
+        let key = node_key(11);
+        let record = b"signed member directory bytes".to_vec();
+
+        kads[7].publish_record(key, record.clone()).await;
+        let found = kads[33].get_record(key).await;
+        assert_eq!(found.as_deref(), Some(record.as_slice()));
+
+        // an unknown record key resolves to nothing
+        assert!(kads[2].get_record(node_key(201)).await.is_none());
+    }
+
+    #[tokio::test]
     async fn find_node_converges_on_the_target_neighbourhood() {
         let kads = build_network(30).await;
         let target = node_key(17);
