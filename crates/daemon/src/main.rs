@@ -315,6 +315,7 @@ async fn main() -> Result<()> {
             args.peer.clone(),
             node_id,
             reflexive,
+            udp_addr.port(),
             disc_tx.clone(),
             admin.clone(),
             engine.handle(),
@@ -656,6 +657,7 @@ async fn start_dht(
     peers: Vec<String>,
     node_id: NodeId,
     reflexive: Option<SocketAddr>,
+    mesh_port: u16,
     disc_tx: mpsc::Sender<DiscoveredPeer>,
     admin: Option<std::sync::Arc<std::sync::Mutex<membership::Admin>>>,
     handle: lattice_engine::EngineHandle,
@@ -677,12 +679,31 @@ async fn start_dht(
         tracing::info!(count = boots.len(), "DHT bootstrapped");
     }
 
-    // Publish our candidate addresses so peers can find us by node id.
-    if let Some(public) = reflexive {
-        match kad.publish(kad_id, &[public]).await {
-            Ok(()) => tracing::info!(%public, "published candidate to DHT"),
-            Err(e) => tracing::warn!(error = %e, "DHT publish failed"),
-        }
+    // Publish our candidate addresses (LAN first, then reflexive/WAN) under our
+    // node id, refreshed periodically so peers can resolve us by id and reach us
+    // on whichever path works. The LAN candidate matters on a routed LAN where the
+    // reflexive (public) address isn't hairpin-reachable between peers.
+    {
+        let kad = Arc::clone(&kad);
+        let lan = primary_lan_addr(mesh_port);
+        tokio::spawn(async move {
+            loop {
+                let mut candidates: Vec<SocketAddr> = Vec::new();
+                if let Some(lan) = lan {
+                    candidates.push(lan);
+                }
+                if let Some(public) = reflexive {
+                    if !candidates.contains(&public) {
+                        candidates.push(public);
+                    }
+                }
+                if !candidates.is_empty() {
+                    kad.publish(kad_id, &candidates).await.ok();
+                    tracing::debug!(?candidates, "published endpoint candidates to DHT");
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
     }
 
     // Resolve each requested peer by id and feed its candidates to the engine.
@@ -773,6 +794,20 @@ async fn start_dht(
     }
 
     Ok(())
+}
+
+/// This node's primary LAN address (the source IP the OS would use to reach the
+/// internet) paired with the mesh port — a reachable on-LAN candidate to publish
+/// alongside the reflexive/WAN one. Uses the connected-UDP trick (no packet is
+/// sent) so it works the same on macOS, Linux, and Windows.
+fn primary_lan_addr(mesh_port: u16) -> Option<SocketAddr> {
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    probe.connect("8.8.8.8:80").ok()?;
+    let ip = probe.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        return None;
+    }
+    Some(SocketAddr::new(ip, mesh_port))
 }
 
 /// Parse a `<node-id-hex>@<ip:port>` peer pin.
