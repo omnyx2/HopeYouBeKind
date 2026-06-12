@@ -24,7 +24,7 @@ members = [
 # workspace members: the GUI pulls the heavy Tauri/webview toolchain and is built
 # via `cargo tauri`, and the fuzz crate depends on libfuzzer (nightly). Keeping
 # both out lets `cargo check` on the core stay fast and stable-only.
-exclude = ["gui", "fuzz"]
+exclude = ["gui", "gui-admin", "fuzz"]
 
 [workspace.package]
 version = "0.7.0"
