@@ -37,6 +37,11 @@ const DIRECTORY_DOMAIN: &[u8] = b"lattice-member-directory-v1";
 /// Tag mixed into the directory's DHT key so it can't collide with an endpoint
 /// rendezvous key (which is keyed by raw node id).
 const DIRECTORY_KEY_TAG: &[u8] = b"lattice-directory-key-v1";
+/// Domain for the admin-signed network manifest (the SDN "program": which nodes
+/// relay, etc. — Phase 2, see docs/SDN_DHT_ARCHITECTURE.md).
+const MANIFEST_DOMAIN: &[u8] = b"lattice-network-manifest-v1";
+/// Tag for the manifest's DHT key (distinct from the directory + endpoint keys).
+const MANIFEST_KEY_TAG: &[u8] = b"lattice-manifest-key-v1";
 
 const CERT_WIRE_LEN: usize = 32 + 32 + 8 + 8 + 8 + 64; // 152
 const REVOKE_WIRE_LEN: usize = 32 + 8 + 8 + 64; // 112
@@ -120,6 +125,18 @@ impl NetworkId {
         use blake2::Blake2bVar;
         let mut h = Blake2bVar::new(32).expect("32 is a valid blake2 output len");
         h.update(DIRECTORY_KEY_TAG);
+        h.update(&self.0);
+        let mut out = [0u8; 32];
+        h.finalize_variable(&mut out).expect("32-byte output");
+        out
+    }
+
+    /// The DHT key the admin-signed network manifest is stored under.
+    pub fn manifest_key(&self) -> [u8; 32] {
+        use blake2::digest::{Update, VariableOutput};
+        use blake2::Blake2bVar;
+        let mut h = Blake2bVar::new(32).expect("32 is a valid blake2 output len");
+        h.update(MANIFEST_KEY_TAG);
         h.update(&self.0);
         let mut out = [0u8; 32];
         h.finalize_variable(&mut out).expect("32-byte output");
@@ -225,6 +242,27 @@ impl NetworkKey {
         }
     }
 
+    /// Admin: sign the network manifest — the authoritative SDN "program"
+    /// (currently the list of node ids designated as relays). Only the CA holder
+    /// can produce one, so routing policy stays an admin-only act.
+    pub fn sign_manifest(
+        &self,
+        version: u64,
+        issued_at: u64,
+        relays: Vec<[u8; 32]>,
+    ) -> NetworkManifest {
+        let net = self.network_id().0;
+        let msg = manifest_signing_bytes(&net, version, issued_at, &relays);
+        let sig = self.signing.sign(&msg).to_bytes();
+        NetworkManifest {
+            network_id: NetworkId(net),
+            version,
+            issued_at,
+            relays,
+            sig,
+        }
+    }
+
     /// Load the network key from a 32-byte secret file, or `None` if missing/bad.
     pub fn load(path: &std::path::Path) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
@@ -285,6 +323,24 @@ fn directory_signing_bytes(
     m.extend_from_slice(&issued_at.to_be_bytes());
     m.extend_from_slice(&(node_ids.len() as u32).to_be_bytes());
     for id in node_ids {
+        m.extend_from_slice(id);
+    }
+    m
+}
+
+fn manifest_signing_bytes(
+    network_id: &[u8; 32],
+    version: u64,
+    issued_at: u64,
+    relays: &[[u8; 32]],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(MANIFEST_DOMAIN.len() + 48 + relays.len() * 32);
+    m.extend_from_slice(MANIFEST_DOMAIN);
+    m.extend_from_slice(network_id);
+    m.extend_from_slice(&version.to_be_bytes());
+    m.extend_from_slice(&issued_at.to_be_bytes());
+    m.extend_from_slice(&(relays.len() as u32).to_be_bytes());
+    for id in relays {
         m.extend_from_slice(id);
     }
     m
@@ -381,6 +437,90 @@ impl MemberDirectory {
             version,
             issued_at,
             node_ids,
+            sig,
+        })
+    }
+}
+
+/// The admin-signed network manifest — the SDN control-plane "program" the admin
+/// publishes over the DHT. v1 carries the **relays**: node ids the admin has
+/// designated to forward traffic for peers that can't connect directly (the
+/// Phase-2 auto-relay; see docs/SDN_DHT_ARCHITECTURE.md §7). Only the CA holder
+/// can sign one, so routing policy stays an admin-only act.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkManifest {
+    network_id: NetworkId,
+    version: u64,
+    issued_at: u64,
+    relays: Vec<[u8; 32]>,
+    sig: [u8; 64],
+}
+
+impl NetworkManifest {
+    pub fn network_id(&self) -> NetworkId {
+        self.network_id
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    /// Node ids the admin has designated as relays, in preference order.
+    pub fn relays(&self) -> &[[u8; 32]] {
+        &self.relays
+    }
+
+    /// Verify the manifest is authentic for `network` (signed by its CA). Returns
+    /// the version so a reader can keep only the newest it has seen.
+    pub fn verify(&self, network: &NetworkId) -> Result<u64, MembershipError> {
+        if self.network_id != *network {
+            return Err(MembershipError::WrongNetwork);
+        }
+        let msg = manifest_signing_bytes(&network.0, self.version, self.issued_at, &self.relays);
+        let sig = ed25519_dalek::Signature::from_bytes(&self.sig);
+        network
+            .verifying_key()?
+            .verify(&msg, &sig)
+            .map_err(|_| MembershipError::BadSignature)?;
+        Ok(self.version)
+    }
+
+    /// Wire form: network_id(32) ‖ version(8) ‖ issued_at(8) ‖ count(4) ‖
+    /// relays(32·n) ‖ sig(64). For DHT storage.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(52 + self.relays.len() * 32 + 64);
+        b.extend_from_slice(&self.network_id.0);
+        b.extend_from_slice(&self.version.to_be_bytes());
+        b.extend_from_slice(&self.issued_at.to_be_bytes());
+        b.extend_from_slice(&(self.relays.len() as u32).to_be_bytes());
+        for id in &self.relays {
+            b.extend_from_slice(id);
+        }
+        b.extend_from_slice(&self.sig);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, MembershipError> {
+        if b.len() < 52 {
+            return Err(MembershipError::Malformed);
+        }
+        let network_id = NetworkId(b[0..32].try_into().unwrap());
+        let version = u64::from_be_bytes(b[32..40].try_into().unwrap());
+        let issued_at = u64::from_be_bytes(b[40..48].try_into().unwrap());
+        let count = u32::from_be_bytes(b[48..52].try_into().unwrap()) as usize;
+        let want = 52 + count * 32 + 64;
+        if b.len() != want {
+            return Err(MembershipError::Malformed);
+        }
+        let mut relays = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 52 + i * 32;
+            relays.push(b[off..off + 32].try_into().unwrap());
+        }
+        let sig: [u8; 64] = b[want - 64..want].try_into().unwrap();
+        Ok(Self {
+            network_id,
+            version,
+            issued_at,
+            relays,
             sig,
         })
     }
@@ -748,5 +888,35 @@ mod tests {
         NetworkKey::from_secret(&net.secret_bytes())
             .network_id()
             .directory_key()
+    }
+
+    #[test]
+    fn network_manifest_signs_verifies_and_round_trips() {
+        let net = NetworkKey::generate();
+        let id = net.network_id();
+        let relays = vec![[9u8; 32], [8u8; 32]];
+        let m = net.sign_manifest(3, 500, relays.clone());
+
+        assert_eq!(m.verify(&id).unwrap(), 3);
+        assert_eq!(m.relays(), relays.as_slice());
+
+        let back = NetworkManifest::from_bytes(&m.to_bytes()).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.verify(&id).unwrap(), 3);
+
+        // wrong network + tamper both rejected
+        assert_eq!(
+            back.verify(&NetworkKey::generate().network_id()),
+            Err(MembershipError::WrongNetwork)
+        );
+        let mut t = m.to_bytes();
+        t[52] ^= 0xff;
+        assert!(NetworkManifest::from_bytes(&t)
+            .unwrap()
+            .verify(&id)
+            .is_err());
+
+        // manifest key is deterministic and distinct from the directory key
+        assert_ne!(id.manifest_key(), id.directory_key());
     }
 }
