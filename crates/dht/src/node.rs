@@ -18,6 +18,9 @@ pub struct KademliaNode {
     id: Key,
     table: RoutingTable,
     store: HashMap<Key, Vec<SocketAddr>>,
+    /// Signed control-plane records (e.g. the member directory), kept separate
+    /// from the address rendezvous `store`.
+    records: HashMap<Key, Vec<u8>>,
 }
 
 impl KademliaNode {
@@ -26,6 +29,7 @@ impl KademliaNode {
             id,
             table: RoutingTable::new(id),
             store: HashMap::new(),
+            records: HashMap::new(),
         }
     }
 
@@ -61,10 +65,24 @@ impl KademliaNode {
                 self.store.insert(key, addrs);
                 Message::Stored
             }
-            // Responses are not valid requests; answer with a harmless Pong.
-            Message::Pong | Message::Nodes { .. } | Message::Value { .. } | Message::Stored => {
-                Message::Pong
+            Message::FindRecord { key } => match self.records.get(&key) {
+                Some(value) => Message::Record {
+                    value: value.clone(),
+                },
+                None => Message::Nodes {
+                    contacts: self.table.closest(&key, K),
+                },
+            },
+            Message::StoreRecord { key, value } => {
+                self.records.insert(key, value);
+                Message::Stored
             }
+            // Responses are not valid requests; answer with a harmless Pong.
+            Message::Pong
+            | Message::Nodes { .. }
+            | Message::Value { .. }
+            | Message::Stored
+            | Message::Record { .. } => Message::Pong,
         }
     }
 }
@@ -198,6 +216,80 @@ impl Kademlia {
     /// Locate the contacts closest to `key` across the network.
     pub async fn find_node(&self, key: &Key) -> Vec<Contact> {
         self.iterative(key, false).await.1
+    }
+
+    /// Store a signed control-plane record (e.g. the member directory) on the k
+    /// nodes closest to `key`, and locally. Mirrors [`Rendezvous::publish`] but for
+    /// opaque record bytes rather than addresses.
+    pub async fn publish_record(&self, key: Key, value: Vec<u8>) {
+        let targets = self.find_node(&key).await;
+        {
+            let mut node = self.node.lock().unwrap();
+            let self_contact = Contact::new(node.id(), "0.0.0.0:0".parse().unwrap());
+            node.handle(
+                Message::StoreRecord {
+                    key,
+                    value: value.clone(),
+                },
+                self_contact,
+            );
+        }
+        for contact in targets {
+            let _ = self
+                .transport
+                .query(
+                    &contact,
+                    Message::StoreRecord {
+                        key,
+                        value: value.clone(),
+                    },
+                )
+                .await;
+        }
+    }
+
+    /// Fetch a control-plane record by `key` via an iterative lookup, or `None` if
+    /// no node holds it.
+    pub async fn get_record(&self, key: Key) -> Option<Vec<u8>> {
+        let mut shortlist: Vec<Contact> = self.node.lock().unwrap().closest(&key, K);
+        let mut queried: HashSet<Key> = HashSet::new();
+        loop {
+            let batch: Vec<Contact> = shortlist
+                .iter()
+                .filter(|c| !queried.contains(&c.id))
+                .take(ALPHA)
+                .cloned()
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
+            for contact in &batch {
+                queried.insert(contact.id);
+                let Some(response) = self
+                    .transport
+                    .query(contact, Message::FindRecord { key })
+                    .await
+                else {
+                    continue;
+                };
+                match response {
+                    Message::Record { value } => return Some(value),
+                    Message::Nodes { contacts } => {
+                        let mut node = self.node.lock().unwrap();
+                        for nc in contacts {
+                            node.learn(nc.clone());
+                            if !shortlist.iter().any(|c| c.id == nc.id) {
+                                shortlist.push(nc);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            shortlist.sort_by(|a, b| by_distance(&key, &a.id, &b.id));
+            shortlist.truncate(K);
+        }
+        None
     }
 }
 

@@ -27,4 +27,12 @@ pub enum Message {
     Store { key: Key, addrs: Vec<SocketAddr> },
     /// Reply to `Store`.
     Stored,
+    /// "Give me the record bytes stored under `key`, or the closest contacts."
+    /// For signed control-plane records (e.g. the member directory), distinct from
+    /// the address rendezvous store. See docs/SDN_DHT_ARCHITECTURE.md.
+    FindRecord { key: Key },
+    /// Response to `FindRecord` when the record is held.
+    Record { value: Vec<u8> },
+    /// "Store these record bytes under `key`."
+    StoreRecord { key: Key, value: Vec<u8> },
 }

@@ -31,6 +31,12 @@ use zeroize::Zeroize;
 /// revocation signature (or vice versa) even with identical field bytes.
 const CERT_DOMAIN: &[u8] = b"lattice-member-cert-v1";
 const REVOKE_DOMAIN: &[u8] = b"lattice-revocation-v1";
+/// Domain for the admin-signed member directory (the SDN control-plane record
+/// distributed over the DHT; see docs/SDN_DHT_ARCHITECTURE.md).
+const DIRECTORY_DOMAIN: &[u8] = b"lattice-member-directory-v1";
+/// Tag mixed into the directory's DHT key so it can't collide with an endpoint
+/// rendezvous key (which is keyed by raw node id).
+const DIRECTORY_KEY_TAG: &[u8] = b"lattice-directory-key-v1";
 
 const CERT_WIRE_LEN: usize = 32 + 32 + 8 + 8 + 8 + 64; // 152
 const REVOKE_WIRE_LEN: usize = 32 + 8 + 8 + 64; // 112
@@ -105,6 +111,19 @@ impl NetworkId {
             let _ = write!(s, "{b:02x}");
         }
         s
+    }
+
+    /// The DHT key the admin-signed member directory is stored under. Derived from
+    /// the network id so every member computes the same key without coordination.
+    pub fn directory_key(&self) -> [u8; 32] {
+        use blake2::digest::{Update, VariableOutput};
+        use blake2::Blake2bVar;
+        let mut h = Blake2bVar::new(32).expect("32 is a valid blake2 output len");
+        h.update(DIRECTORY_KEY_TAG);
+        h.update(&self.0);
+        let mut out = [0u8; 32];
+        h.finalize_variable(&mut out).expect("32-byte output");
+        out
     }
 
     fn verifying_key(&self) -> Result<VerifyingKey, MembershipError> {
@@ -185,6 +204,27 @@ impl NetworkKey {
         }
     }
 
+    /// Admin: sign a member directory (the authoritative list of admitted node
+    /// ids) for distribution over the DHT. Only the CA holder can produce this, so
+    /// it is the admin's sole authority over the network's membership view.
+    pub fn sign_directory(
+        &self,
+        version: u64,
+        issued_at: u64,
+        node_ids: Vec<[u8; 32]>,
+    ) -> MemberDirectory {
+        let net = self.network_id().0;
+        let msg = directory_signing_bytes(&net, version, issued_at, &node_ids);
+        let sig = self.signing.sign(&msg).to_bytes();
+        MemberDirectory {
+            network_id: NetworkId(net),
+            version,
+            issued_at,
+            node_ids,
+            sig,
+        }
+    }
+
     /// Load the network key from a 32-byte secret file, or `None` if missing/bad.
     pub fn load(path: &std::path::Path) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
@@ -232,6 +272,24 @@ fn cert_signing_bytes(
     m
 }
 
+fn directory_signing_bytes(
+    network_id: &[u8; 32],
+    version: u64,
+    issued_at: u64,
+    node_ids: &[[u8; 32]],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(DIRECTORY_DOMAIN.len() + 48 + node_ids.len() * 32);
+    m.extend_from_slice(DIRECTORY_DOMAIN);
+    m.extend_from_slice(network_id);
+    m.extend_from_slice(&version.to_be_bytes());
+    m.extend_from_slice(&issued_at.to_be_bytes());
+    m.extend_from_slice(&(node_ids.len() as u32).to_be_bytes());
+    for id in node_ids {
+        m.extend_from_slice(id);
+    }
+    m
+}
+
 fn revoke_signing_bytes(network_id: &[u8; 32], serial: u64, revoked_at: u64) -> Vec<u8> {
     let mut m = Vec::with_capacity(REVOKE_DOMAIN.len() + 48);
     m.extend_from_slice(REVOKE_DOMAIN);
@@ -239,6 +297,93 @@ fn revoke_signing_bytes(network_id: &[u8; 32], serial: u64, revoked_at: u64) -> 
     m.extend_from_slice(&serial.to_be_bytes());
     m.extend_from_slice(&revoked_at.to_be_bytes());
     m
+}
+
+/// The admin-signed list of admitted node ids — the authoritative membership view
+/// distributed over the DHT so every node learns the whole mesh and forms a full
+/// mesh automatically (no manual peer pins). Only the CA holder can sign one, so
+/// changing who is in the network stays an admin-only act even though the record
+/// itself rides untrusted DHT storage. See docs/SDN_DHT_ARCHITECTURE.md.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberDirectory {
+    network_id: NetworkId,
+    version: u64,
+    issued_at: u64,
+    node_ids: Vec<[u8; 32]>,
+    sig: [u8; 64],
+}
+
+impl MemberDirectory {
+    pub fn network_id(&self) -> NetworkId {
+        self.network_id
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    pub fn issued_at(&self) -> u64 {
+        self.issued_at
+    }
+    /// The admitted node ids (each is also the node's static public key in v0).
+    pub fn node_ids(&self) -> &[[u8; 32]] {
+        &self.node_ids
+    }
+
+    /// Verify the directory is authentic for `network` (signed by its CA). Returns
+    /// the version on success so a reader can keep only the newest it has seen.
+    pub fn verify(&self, network: &NetworkId) -> Result<u64, MembershipError> {
+        if self.network_id != *network {
+            return Err(MembershipError::WrongNetwork);
+        }
+        let msg = directory_signing_bytes(&network.0, self.version, self.issued_at, &self.node_ids);
+        let sig = ed25519_dalek::Signature::from_bytes(&self.sig);
+        network
+            .verifying_key()?
+            .verify(&msg, &sig)
+            .map_err(|_| MembershipError::BadSignature)?;
+        Ok(self.version)
+    }
+
+    /// Wire form: network_id(32) ‖ version(8) ‖ issued_at(8) ‖ count(4) ‖
+    /// node_ids(32·n) ‖ sig(64). For DHT storage.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(52 + self.node_ids.len() * 32 + 64);
+        b.extend_from_slice(&self.network_id.0);
+        b.extend_from_slice(&self.version.to_be_bytes());
+        b.extend_from_slice(&self.issued_at.to_be_bytes());
+        b.extend_from_slice(&(self.node_ids.len() as u32).to_be_bytes());
+        for id in &self.node_ids {
+            b.extend_from_slice(id);
+        }
+        b.extend_from_slice(&self.sig);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, MembershipError> {
+        if b.len() < 52 {
+            return Err(MembershipError::Malformed);
+        }
+        let network_id = NetworkId(b[0..32].try_into().unwrap());
+        let version = u64::from_be_bytes(b[32..40].try_into().unwrap());
+        let issued_at = u64::from_be_bytes(b[40..48].try_into().unwrap());
+        let count = u32::from_be_bytes(b[48..52].try_into().unwrap()) as usize;
+        let want = 52 + count * 32 + 64;
+        if b.len() != want {
+            return Err(MembershipError::Malformed);
+        }
+        let mut node_ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 52 + i * 32;
+            node_ids.push(b[off..off + 32].try_into().unwrap());
+        }
+        let sig: [u8; 64] = b[want - 64..want].try_into().unwrap();
+        Ok(Self {
+            network_id,
+            version,
+            issued_at,
+            node_ids,
+            sig,
+        })
+    }
 }
 
 /// A signed proof that a node belongs to a network. Presented during the
@@ -567,5 +712,41 @@ mod tests {
         // rendezvous tag is stable + short
         assert_eq!(id.rendezvous_tag().len(), 16);
         assert_eq!(id.rendezvous_tag(), reloaded.network_id().rendezvous_tag());
+    }
+
+    #[test]
+    fn member_directory_signs_verifies_and_round_trips() {
+        let net = NetworkKey::generate();
+        let id = net.network_id();
+        let ids = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        let dir = net.sign_directory(7, 1_000, ids.clone());
+
+        // authentic for its network
+        assert_eq!(dir.verify(&id).unwrap(), 7);
+        assert_eq!(dir.node_ids(), ids.as_slice());
+
+        // wire round-trip preserves everything + still verifies
+        let back = MemberDirectory::from_bytes(&dir.to_bytes()).unwrap();
+        assert_eq!(back, dir);
+        assert_eq!(back.verify(&id).unwrap(), 7);
+
+        // a different network rejects it; a tampered list fails the signature
+        let other = NetworkKey::generate().network_id();
+        assert_eq!(back.verify(&other), Err(MembershipError::WrongNetwork));
+        let mut tampered = dir.to_bytes();
+        tampered[52] ^= 0xff; // flip a byte of the first node id
+        assert!(MemberDirectory::from_bytes(&tampered)
+            .unwrap()
+            .verify(&id)
+            .is_err());
+
+        // the DHT key is deterministic per network
+        assert_eq!(id.directory_key(), reloaded_key(&net));
+    }
+
+    fn reloaded_key(net: &NetworkKey) -> [u8; 32] {
+        NetworkKey::from_secret(&net.secret_bytes())
+            .network_id()
+            .directory_key()
     }
 }

@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_membership::{MemberCert, NetworkId, NetworkKey, Revocation};
+use lattice_membership::{MemberCert, MemberDirectory, NetworkId, NetworkKey, Revocation};
 use lattice_proto::NodeId;
 use serde::{Deserialize, Serialize};
 
@@ -133,4 +133,32 @@ impl Admin {
     pub fn members(&self) -> &[Member] {
         &self.registry.members
     }
+
+    /// Build the admin-signed member directory — the non-revoked node ids — for
+    /// distribution over the DHT (docs/SDN_DHT_ARCHITECTURE.md). Only the admin
+    /// (CA holder) can produce a valid one, keeping membership an admin-only act.
+    pub fn signed_directory(&self) -> MemberDirectory {
+        let node_ids: Vec<[u8; 32]> = self
+            .registry
+            .members
+            .iter()
+            .filter(|m| !m.revoked)
+            .filter_map(|m| parse_hex32(&m.node_id))
+            .collect();
+        let now = now_unix();
+        // `now` doubles as a monotonic version: readers keep the highest they see.
+        self.key.sign_directory(now, now, node_ids)
+    }
+}
+
+/// Parse a 64-char hex node id into 32 bytes.
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
