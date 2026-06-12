@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lattice Admin</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-mark">⬡</span> Lattice</div>
+        <div class="brand-sub">ADMIN CONSOLE</div>
+        <nav class="nav">
+          <button class="nav-item active" data-tab="overview"><span class="nav-ico">◎</span> Overview</button>
+          <button class="nav-item" data-tab="members"><span class="nav-ico">⧉</span> Members</button>
+          <button class="nav-item" data-tab="traffic" disabled><span class="nav-ico">📊</span> Traffic <span class="nav-soon">soon</span></button>
+          <button class="nav-item" data-tab="crypto" disabled><span class="nav-ico">🧪</span> Crypto Lab <span class="nav-soon">soon</span></button>
+        </nav>
+        <div class="sidebar-foot">
+          <span id="conn-dot" class="conn-dot off"></span>
+          <span id="conn-text">connecting…</span>
+        </div>
+      </aside>
+
+      <main class="content">
+        <!-- ===== Overview ===== -->
+        <section class="panel" data-panel="overview">
+          <h1 class="panel-title">Overview</h1>
+          <p class="panel-sub">Network identity and live mesh state for this admin node.</p>
+
+          <div id="not-admin" class="banner hidden">
+            This daemon does <b>not</b> hold the network CA, so admin actions (issue /
+            revoke) will be refused. Start the daemon with <code>--network-key</code> to
+            administer a network.
+          </div>
+
+          <div class="card">
+            <h2>Network</h2>
+            <div class="kv"><span class="label">Role</span><span id="ov-role" class="badge readonly">—</span></div>
+            <div class="kv"><span class="label">Network ID</span><span id="ov-netid" class="mono copy" title="click to copy">—</span></div>
+            <div class="kv"><span class="label">Members</span><span id="ov-members" class="mono">—</span></div>
+            <div class="kv"><span class="label">Revocations</span><span id="ov-revocations" class="mono">—</span></div>
+          </div>
+
+          <div class="card">
+            <h2>This node</h2>
+            <div class="kv"><span class="label">Status</span><span id="ov-status" class="mono">—</span></div>
+            <div class="kv"><span class="label">Virtual IP</span><span id="ov-vip" class="mono copy" title="click to copy">—</span></div>
+            <div class="kv"><span class="label">Fingerprint</span><span id="ov-fp" class="mono">—</span></div>
+            <div class="kv"><span class="label">Node ID</span><span id="ov-nodeid" class="mono copy" title="click to copy">—</span></div>
+            <div class="kv"><span class="label">Public address</span><span id="ov-public" class="mono">—</span></div>
+          </div>
+
+          <div class="card">
+            <h2>Mesh peers (<span id="ov-peercount">0</span>)</h2>
+            <table class="grid">
+              <thead><tr><th>Status</th><th>Virtual IP</th><th>FP</th><th>OS</th><th>Endpoint</th></tr></thead>
+              <tbody id="ov-peers"><tr class="empty"><td colspan="5">No peers.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- ===== Members ===== -->
+        <section class="panel hidden" data-panel="members">
+          <h1 class="panel-title">Members</h1>
+          <p class="panel-sub">Enroll nodes into the network and evict them. Requires this node to hold the network CA.</p>
+
+          <div class="card">
+            <h2>Enroll a member</h2>
+            <div class="issue-row">
+              <div class="field">
+                <label for="issue-id">Node ID (64 hex)</label>
+                <input id="issue-id" class="text" placeholder="7dbce35e…f917" spellcheck="false" />
+              </div>
+              <div class="field">
+                <label for="issue-label">Label (optional)</label>
+                <input id="issue-label" class="text" placeholder="ubuntu-host" spellcheck="false" />
+              </div>
+              <button id="issue-btn" class="primary">Issue token</button>
+            </div>
+            <div id="token-box" class="token-box hidden">
+              <div class="kv" style="padding-top:0">
+                <span class="label">Join token — give to the node, then <code>lattice net join &lt;token&gt;</code></span>
+                <button id="copy-token" class="secondary">Copy</button>
+              </div>
+              <div id="token" class="token"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Roster (<span id="mem-count">0</span>)</h2>
+            <table class="grid">
+              <thead><tr><th>FP</th><th>Node ID</th><th class="right">Serial</th><th>Label</th><th>Status</th><th class="right">Action</th></tr></thead>
+              <tbody id="mem-rows"><tr class="empty"><td colspan="6">No members enrolled.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- ===== Traffic (Phase 2) ===== -->
+        <section class="panel hidden" data-panel="traffic">
+          <h1 class="panel-title">Traffic</h1>
+          <div class="soon"><div class="big">📊</div>Packet-level inspector lands in <b>Phase 2</b>.<br />See <code>docs/ADMIN_CONSOLE.md</code>.</div>
+        </section>
+
+        <!-- ===== Crypto Lab (Phase 3) ===== -->
+        <section class="panel hidden" data-panel="crypto">
+          <h1 class="panel-title">Crypto Lab</h1>
+          <div class="soon"><div class="big">🧪</div>Crypto-suite swap lab lands in <b>Phase 3</b>.<br />See <code>docs/ADMIN_CONSOLE.md</code>.</div>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

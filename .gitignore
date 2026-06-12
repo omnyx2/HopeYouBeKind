@@ -9,6 +9,12 @@ gui/dist
 gui/src-tauri/target
 gui/.vite
 
+# Admin console (gui-admin/) — same build artifacts as gui/
+gui-admin/node_modules
+gui-admin/dist
+gui-admin/src-tauri/target
+gui-admin/.vite
+
 # Local config, keys, state — NEVER commit secrets or node identity
 *.key
 *.pem

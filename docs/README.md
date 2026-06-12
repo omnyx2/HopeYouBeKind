@@ -20,6 +20,7 @@ Start here, then dive into the feature guide you need.
 | [EXIT_NODE.md](EXIT_NODE.md) | Route a node's general internet traffic out through a chosen peer. |
 | [RELAY.md](RELAY.md) | Forward encrypted traffic through a third node when two peers can't connect directly (CGNAT). |
 | [HEALTH_CHECK.md](HEALTH_CHECK.md) | ⚠️ **Security-sensitive.** Dump every node's virtual IP at once, gated by a (weak) process-name allow-list. Read the security impact before enabling. |
+| [ADMIN_CONSOLE.md](ADMIN_CONSOLE.md) | Design/plan for the standalone mesh **admin console** (`gui-admin/`): membership & eviction, full packet-level traffic inspector, runtime crypto-suite swap lab. |
 
 ## Design & reference
 
