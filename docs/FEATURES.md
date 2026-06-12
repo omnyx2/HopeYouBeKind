@@ -47,6 +47,7 @@ CA + certs + revocation), and a **traffic monitor**. Per-feature guides:
 | DHT over real UDP (request-id demux server) | ✅ | `crates/dht` (`server.rs`) |
 | Daemon DHT wiring (`--dht-bind/-bootstrap/--peer`) | ✅ | `crates/daemon` |
 | Manual peer pin (`--peer-addr <id>@<ip:port>`, GUI add) | ✅ | `crates/daemon`, `gui/` |
+| Pinned peers initiate regardless of id tie-break (one-sided reachable anchor) | ✅ | `crates/engine` (`force_initiate`) |
 | Public bootstrap node (stable internet entry point) | 🔜 | operational, not code |
 | Manual peer pin (`--peer-addr <id>@<ip:port>`) | ✅ | `crates/daemon` |
 | Relay (DERP-style) — forward via a third node for CGNAT | ⚠️ transport+relay tested; needs cross-network test | `crates/net` (`relay.rs`), `crates/daemon` |
@@ -59,7 +60,8 @@ CA + certs + revocation), and a **traffic monitor**. Per-feature guides:
 | --- | --- | --- |
 | Privileged daemon hosting the engine | ✅ | `crates/daemon` |
 | Local IPC (newline-JSON over Unix socket) | ✅ | `crates/ipc` |
-| CLI: `status` / `peers` / `up` / `down` | ✅ | `crates/cli` |
+| CLI: `status` / `peers` / `up` / `down` / `flows` / `health` | ✅ | `crates/cli` |
+| Mesh health check — all virtual IPs at once, process-name gated (⚠️ weakens security) | ✅ | `crates/daemon`, `crates/ipc`; [HEALTH_CHECK.md](HEALTH_CHECK.md) |
 | Desktop GUI (Tauri) | ✅ | `gui/` |
 | GUI: start/stop the daemon (admin prompt) | ✅ | `gui/` (bundles the daemon) |
 | GUI: live dashboard (status, mesh toggle, peers) | ✅ | `gui/` |

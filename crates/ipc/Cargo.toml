@@ -10,3 +10,8 @@ description = "Local IPC between the Lattice daemon and its GUI/CLI clients."
 lattice-proto.workspace = true
 tokio = { workspace = true }
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Peer-credential lookup on the IPC socket (SO_PEERCRED / LOCAL_PEERPID) so the
+# daemon can authorize requests by the calling process's name.
+libc = "0.2"

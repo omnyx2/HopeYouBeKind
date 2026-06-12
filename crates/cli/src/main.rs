@@ -30,6 +30,11 @@ enum Command {
     Peers,
     /// Show live traffic flows crossing the tunnel.
     Flows,
+    /// Health check: list every node's virtual IP on the mesh at once.
+    /// SECURITY-SENSITIVE and access-controlled — the daemon only answers a
+    /// caller whose process name is on its `--health-allow` list (default
+    /// `minisync`), so run as a binary by that name. See docs/HEALTH_CHECK.md.
+    Health,
     /// Manage mesh membership (network identity, enrollment, eviction).
     #[command(subcommand)]
     Net(NetCommand),
@@ -81,6 +86,7 @@ impl Command {
             Command::Status => Request::Status,
             Command::Peers => Request::Peers,
             Command::Flows => Request::Flows,
+            Command::Health => Request::HealthCheck,
             Command::Net(NetCommand::Info) => Request::NetworkInfo,
             Command::Net(NetCommand::Members) => Request::Members,
             Command::Net(NetCommand::Issue { node_id, label }) => Request::IssueCert {
@@ -183,6 +189,14 @@ fn print_response(response: Response) {
                     m.label.as_deref().unwrap_or("-"),
                     if m.revoked { "REVOKED" } else { "active" }
                 );
+            }
+        }
+        Response::Health(entries) => {
+            if entries.is_empty() {
+                println!("no nodes on the mesh");
+            }
+            for e in entries {
+                println!("{:<15}  {:<8}  {}", e.virtual_ip, e.fingerprint, e.status);
             }
         }
         Response::Token(token) => {
