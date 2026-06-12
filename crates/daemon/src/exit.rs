@@ -12,11 +12,14 @@
 //! path — verify on a spare host. See `docs/EXIT_NODE.md`.
 
 use std::net::IpAddr;
+#[cfg(unix)]
 use std::process::Command;
 
 /// Where we stash the original default route so we can put it back.
+#[cfg(unix)]
 const SAVED: &str = "/tmp/lattice-saved-default";
 
+#[cfg(unix)]
 fn run(cmd: &str, args: &[&str]) {
     match Command::new(cmd).args(args).status() {
         Ok(s) if s.success() => {}
