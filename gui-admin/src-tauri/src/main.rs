@@ -14,7 +14,7 @@
     windows_subsystem = "windows"
 )]
 
-use lattice_proto::ipc::{Request, Response};
+use lattice_proto::ipc::{CaptureFilter, Request, Response};
 use serde::Serialize;
 
 /// Where the admin daemon listens. The console attaches to an already-running
@@ -164,6 +164,115 @@ async fn revoke_member(node_id: String) -> Result<(), String> {
     }
 }
 
+// ---- Phase 2: packet inspector ----
+
+#[derive(Serialize)]
+struct CaptureStateView {
+    active: bool,
+    buffered: usize,
+    cap: usize,
+    snaplen: usize,
+    dropped: u64,
+    peer: Option<String>,
+    protocol: Option<String>,
+    port: Option<u16>,
+}
+
+fn cap_view(s: lattice_proto::ipc::CaptureState) -> CaptureStateView {
+    CaptureStateView {
+        active: s.active,
+        buffered: s.buffered,
+        cap: s.cap,
+        snaplen: s.snaplen,
+        dropped: s.dropped,
+        peer: s.filter.peer,
+        protocol: s.filter.protocol,
+        port: s.filter.port,
+    }
+}
+
+#[derive(Serialize)]
+struct PacketView {
+    seq: u64,
+    at_ms: u64,
+    dir: String,
+    peer: Option<String>,
+    protocol: String,
+    src: String,
+    dst: String,
+    length: u32,
+    tcp_flags: Option<String>,
+    tcp_seq: Option<u32>,
+    tcp_ack: Option<u32>,
+    bytes: Vec<u8>,
+}
+
+fn clean(s: Option<String>) -> Option<String> {
+    s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+async fn capture_cmd(req: Request) -> Result<CaptureStateView, String> {
+    match lattice_ipc::request(SOCKET, req).await {
+        Ok(Response::CaptureState(s)) => Ok(cap_view(s)),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Admin: arm the packet capture. Gated daemon-side by `--admin-allow` (the
+/// captured packets are decrypted plaintext).
+#[tauri::command]
+async fn capture_start(
+    peer: Option<String>,
+    protocol: Option<String>,
+    port: Option<u16>,
+) -> Result<CaptureStateView, String> {
+    let filter = CaptureFilter {
+        peer: clean(peer),
+        protocol: clean(protocol),
+        port: port.filter(|p| *p != 0),
+    };
+    capture_cmd(Request::CaptureStart { filter }).await
+}
+
+#[tauri::command]
+async fn capture_stop() -> Result<CaptureStateView, String> {
+    capture_cmd(Request::CaptureStop).await
+}
+
+#[tauri::command]
+async fn capture_status() -> Result<CaptureStateView, String> {
+    capture_cmd(Request::CaptureStatus).await
+}
+
+/// Admin: drain captured packets with `seq > after` (cursor poll), oldest first.
+#[tauri::command]
+async fn list_packets(after: u64) -> Result<Vec<PacketView>, String> {
+    match lattice_ipc::request(SOCKET, Request::Packets { after }).await {
+        Ok(Response::Packets(pkts)) => Ok(pkts
+            .into_iter()
+            .map(|p| PacketView {
+                seq: p.seq,
+                at_ms: p.at_ms,
+                dir: p.dir,
+                peer: p.peer,
+                protocol: p.protocol,
+                src: p.src,
+                dst: p.dst,
+                length: p.length,
+                tcp_flags: p.tcp_flags,
+                tcp_seq: p.tcp_seq,
+                tcp_ack: p.tcp_ack,
+                bytes: p.bytes,
+            })
+            .collect()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn parse_node_id(hex: &str) -> Option<lattice_proto::NodeId> {
     if hex.len() != 64 {
         return None;
@@ -183,7 +292,11 @@ fn main() {
             list_peers,
             list_members,
             issue_cert,
-            revoke_member
+            revoke_member,
+            capture_start,
+            capture_stop,
+            capture_status,
+            list_packets
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lattice Admin");

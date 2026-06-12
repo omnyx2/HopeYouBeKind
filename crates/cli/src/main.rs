@@ -203,6 +203,16 @@ fn print_response(response: Response) {
             println!("join token (give to the node, then `lattice net join <token>`):\n{token}");
         }
         Response::Done => println!("ok"),
+        // The packet capture is driven by the admin console, not this CLI; print a
+        // terse summary if one ever lands here.
+        Response::CaptureState(s) => println!(
+            "capture {} — {} buffered / {} cap, {} dropped",
+            if s.active { "active" } else { "stopped" },
+            s.buffered,
+            s.cap,
+            s.dropped
+        ),
+        Response::Packets(pkts) => println!("{} packet(s)", pkts.len()),
         Response::Error { message } => eprintln!("error: {message}"),
     }
 }

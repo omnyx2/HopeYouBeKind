@@ -106,6 +106,32 @@ struct Args {
     /// See docs/HEALTH_CHECK.md.
     #[arg(long, default_value = "minisync")]
     health_allow: Vec<String>,
+
+    /// Process name(s) allowed to drive the admin packet capture (the packet
+    /// inspector). SECURITY-SENSITIVE — captured packets are DECRYPTED plaintext.
+    /// Repeatable; defaults to EMPTY (capture disabled). Name the admin console's
+    /// binary here to enable it. See docs/ADMIN_CONSOLE.md.
+    #[arg(long)]
+    admin_allow: Vec<String>,
+}
+
+/// Is the calling process allowed to drive the admin packet capture? Same weak
+/// "name ≠ identity" gate as the health check; empty allow-list = denied.
+fn admin_permitted(caller: &Option<String>, allow: &[String]) -> bool {
+    caller
+        .as_deref()
+        .is_some_and(|name| allow.iter().any(|a| a == name))
+}
+
+/// The refusal response when a caller is not on the `--admin-allow` list.
+fn admin_denied(caller: &Option<String>, allow: &[String]) -> lattice_proto::ipc::Response {
+    lattice_proto::ipc::Response::Error {
+        message: format!(
+            "packet capture denied for process {:?} (allowed: {:?}); enable with --admin-allow",
+            caller.as_deref().unwrap_or("<unknown>"),
+            allow
+        ),
+    }
 }
 
 /// Hex-encode bytes (for join tokens on the wire).
@@ -363,6 +389,14 @@ async fn main() -> Result<()> {
         .filter(|s| !s.trim().is_empty())
         .cloned()
         .collect();
+    // Process names allowed to drive the packet capture (decrypted plaintext);
+    // empty = disabled.
+    let ipc_admin_allow: Vec<String> = args
+        .admin_allow
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .cloned()
+        .collect();
     let ipc = lattice_ipc::serve(&args.ipc_socket, move |req, caller| {
         let handle = ipc_handle.clone();
         let tun_name = ipc_tun.clone();
@@ -371,6 +405,7 @@ async fn main() -> Result<()> {
         let admin = ipc_admin.clone();
         let member_cert_path = ipc_member_cert.clone();
         let health_allow = ipc_health_allow.clone();
+        let admin_allow = ipc_admin_allow.clone();
         async move {
             use lattice_proto::ipc::{HealthEntry, MemberEntry, NetworkInfo, Request, Response};
             match req {
@@ -488,6 +523,36 @@ async fn main() -> Result<()> {
                             });
                         }
                         Response::Health(entries)
+                    }
+                }
+                // Admin packet inspector (decrypted plaintext) — gated by
+                // --admin-allow (empty = disabled). See docs/ADMIN_CONSOLE.md §B.
+                Request::CaptureStart { filter } => {
+                    if admin_permitted(&caller, &admin_allow) {
+                        Response::CaptureState(handle.capture_start(filter))
+                    } else {
+                        admin_denied(&caller, &admin_allow)
+                    }
+                }
+                Request::CaptureStop => {
+                    if admin_permitted(&caller, &admin_allow) {
+                        Response::CaptureState(handle.capture_stop())
+                    } else {
+                        admin_denied(&caller, &admin_allow)
+                    }
+                }
+                Request::CaptureStatus => {
+                    if admin_permitted(&caller, &admin_allow) {
+                        Response::CaptureState(handle.capture_status())
+                    } else {
+                        admin_denied(&caller, &admin_allow)
+                    }
+                }
+                Request::Packets { after } => {
+                    if admin_permitted(&caller, &admin_allow) {
+                        Response::Packets(handle.packets_since(after))
+                    } else {
+                        admin_denied(&caller, &admin_allow)
                     }
                 }
                 Request::Up => {
