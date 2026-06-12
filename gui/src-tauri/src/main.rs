@@ -276,16 +276,115 @@ async fn stop_daemon() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Start the bundled daemon elevated via UAC. Creating the Wintun adapter needs
+/// Administrator; `Start-Process -Verb RunAs` is the one moment the user consents.
+#[cfg(windows)]
 #[tauri::command]
-async fn start_daemon(_app: tauri::AppHandle) -> Result<(), String> {
-    Err("GUI daemon control is implemented for macOS; on Linux run `sudo lattice-daemon`".into())
+async fn start_daemon(app: tauri::AppHandle) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // Prefer the bundled daemon; fall back to one sitting next to the GUI exe
+    // (the unbundled `cargo tauri dev` / `cargo run` layout).
+    let daemon = app
+        .path_resolver()
+        .resolve_resource("resources/lattice-daemon.exe")
+        .filter(|p| p.exists())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("lattice-daemon.exe")))
+                .filter(|p| p.exists())
+        })
+        .ok_or("bundled daemon (lattice-daemon.exe) not found")?;
+
+    // Persist identity under the app data dir — the unix default /var/lib/lattice
+    // does not exist on Windows.
+    let data_dir = app
+        .path_resolver()
+        .app_data_dir()
+        .ok_or("could not resolve the app data directory")?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    let identity = data_dir.join("identity.key");
+
+    // Creating the Wintun adapter needs wintun.dll on the DLL search path
+    // (next to the daemon, or in System32). When it's absent the daemon would
+    // fail to open the TUN and exit immediately; fall back to a headless node
+    // (--no-tun: control plane + discovery, no packet forwarding) so "Start
+    // node" still brings the daemon up and status reflects it as running.
+    let has_wintun = daemon
+        .parent()
+        .map(|d| d.join("wintun.dll").exists())
+        .unwrap_or(false)
+        || std::env::var_os("SystemRoot")
+            .map(|root| std::path::Path::new(&root).join("System32\\wintun.dll").exists())
+            .unwrap_or(false);
+
+    // Single-quote for PowerShell: double any embedded quote.
+    let daemon = daemon.to_string_lossy().replace('\'', "''");
+    let identity = identity.to_string_lossy().replace('\'', "''");
+    // Only the Wintun adapter needs Administrator; a headless node doesn't, so
+    // skip the UAC prompt in that case.
+    let (no_tun, run_as) = if has_wintun {
+        ("", "-Verb RunAs ")
+    } else {
+        (",'--no-tun'", "")
+    };
+    let ps = format!(
+        "Start-Process -FilePath '{daemon}' \
+         -ArgumentList '--bind','0.0.0.0:41000','--identity','{identity}'{no_tun} \
+         {run_as}-WindowStyle Hidden"
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("could not start the node — elevation was declined".into())
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Stop the daemon. A headless node runs unprivileged, so a plain taskkill ends
+/// it; an elevated (Wintun) daemon can only be killed elevated, so fall back to
+/// a UAC-prompting kill when the plain one doesn't succeed.
+#[cfg(windows)]
 #[tauri::command]
 async fn stop_daemon() -> Result<(), String> {
-    Err("GUI daemon control is implemented for macOS".into())
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let plain = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "lattice-daemon.exe"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    if matches!(plain, Ok(s) if s.success()) {
+        return Ok(());
+    }
+
+    // Either access was denied (elevated daemon) — retry with elevation.
+    let ps = "Start-Process -FilePath 'taskkill' \
+              -ArgumentList '/F','/IM','lattice-daemon.exe' \
+              -Verb RunAs -WindowStyle Hidden";
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tauri::command]
+async fn start_daemon(_app: tauri::AppHandle) -> Result<(), String> {
+    Err("GUI daemon control is implemented for macOS and Windows; on Linux run `sudo lattice-daemon`".into())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tauri::command]
+async fn stop_daemon() -> Result<(), String> {
+    Err("GUI daemon control is implemented for macOS and Windows".into())
 }
 
 fn main() {
