@@ -779,6 +779,31 @@ impl EngineHandle {
         self.monitor.snapshot()
     }
 
+    /// Arm the per-packet capture (admin packet inspector) with `filter`,
+    /// clearing any previous buffer. Captured packets are decrypted plaintext —
+    /// the daemon gates this behind `--admin-allow`.
+    pub fn capture_start(
+        &self,
+        filter: lattice_proto::ipc::CaptureFilter,
+    ) -> lattice_proto::ipc::CaptureState {
+        self.monitor.capture_start(filter)
+    }
+
+    /// Stop the per-packet capture and clear its buffer.
+    pub fn capture_stop(&self) -> lattice_proto::ipc::CaptureState {
+        self.monitor.capture_stop()
+    }
+
+    /// Current capture state (without draining packets).
+    pub fn capture_status(&self) -> lattice_proto::ipc::CaptureState {
+        self.monitor.capture_status()
+    }
+
+    /// Drain captured packets with `seq > after`, oldest first (cursor poll).
+    pub fn packets_since(&self, after: u64) -> Vec<lattice_proto::ipc::PacketRecord> {
+        self.monitor.packets_since(after)
+    }
+
     /// The network this node belongs to, if any.
     pub fn network_id(&self) -> Option<NetworkId> {
         *self.network.lock().unwrap()

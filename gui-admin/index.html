@@ -14,7 +14,7 @@
         <nav class="nav">
           <button class="nav-item active" data-tab="overview"><span class="nav-ico">◎</span> Overview</button>
           <button class="nav-item" data-tab="members"><span class="nav-ico">⧉</span> Members</button>
-          <button class="nav-item" data-tab="traffic" disabled><span class="nav-ico">📊</span> Traffic <span class="nav-soon">soon</span></button>
+          <button class="nav-item" data-tab="traffic"><span class="nav-ico">📊</span> Traffic</button>
           <button class="nav-item" data-tab="crypto" disabled><span class="nav-ico">🧪</span> Crypto Lab <span class="nav-soon">soon</span></button>
         </nav>
         <div class="sidebar-foot">
@@ -97,10 +97,43 @@
           </div>
         </section>
 
-        <!-- ===== Traffic (Phase 2) ===== -->
+        <!-- ===== Traffic — packet-level inspector ===== -->
         <section class="panel hidden" data-panel="traffic">
           <h1 class="panel-title">Traffic</h1>
-          <div class="soon"><div class="big">📊</div>Packet-level inspector lands in <b>Phase 2</b>.<br />See <code>docs/ADMIN_CONSOLE.md</code>.</div>
+          <p class="panel-sub">Packet-level inspector — <b>decrypted plaintext</b> crossing the tunnel. Gated daemon-side by <code>--admin-allow</code>.</p>
+
+          <div id="cap-gate" class="banner hidden"></div>
+
+          <div class="card">
+            <h2>Capture</h2>
+            <div class="cap-controls">
+              <input id="cap-peer" class="text" placeholder="peer fp (optional)" spellcheck="false" />
+              <select id="cap-proto" class="text">
+                <option value="">any protocol</option>
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+                <option value="icmp">ICMP</option>
+              </select>
+              <input id="cap-port" class="text" placeholder="port (optional)" inputmode="numeric" />
+              <button id="cap-toggle" class="primary">Start capture</button>
+            </div>
+            <div class="cap-status">
+              <span id="cap-state" class="badge readonly">stopped</span>
+              <span id="cap-meta" class="muted small">—</span>
+              <label class="live-toggle"><input type="checkbox" id="cap-follow" checked /> follow newest</label>
+              <button id="cap-clear" class="secondary">Clear view</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Packets (<span id="pkt-count">0</span>)</h2>
+            <div class="pkt-scroll">
+              <table class="grid">
+                <thead><tr><th class="right">#</th><th>Time</th><th>Dir</th><th>Peer</th><th>Proto</th><th>Source</th><th>Destination</th><th class="right">Len</th><th>Flags</th></tr></thead>
+                <tbody id="pkt-rows"><tr class="empty"><td colspan="9">Capture stopped — start it above.</td></tr></tbody>
+              </table>
+            </div>
+          </div>
         </section>
 
         <!-- ===== Crypto Lab (Phase 3) ===== -->
@@ -109,6 +142,15 @@
           <div class="soon"><div class="big">🧪</div>Crypto-suite swap lab lands in <b>Phase 3</b>.<br />See <code>docs/ADMIN_CONSOLE.md</code>.</div>
         </section>
       </main>
+    </div>
+
+    <!-- packet detail drawer -->
+    <div id="drawer" class="drawer hidden">
+      <div class="drawer-head">
+        <span id="drawer-title">Packet</span>
+        <button id="drawer-close" class="secondary">Close</button>
+      </div>
+      <div id="drawer-body"></div>
     </div>
 
     <div id="toast" class="toast hidden"></div>

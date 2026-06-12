@@ -57,6 +57,18 @@ pub enum Request {
     /// so the daemon only answers a caller whose process name is on its
     /// `--health-allow` list (default `minisync`). See docs/HEALTH_CHECK.md.
     HealthCheck,
+    /// Admin: start capturing per-packet detail into the daemon's bounded ring
+    /// buffer. SECURITY-SENSITIVE — captured packets are DECRYPTED plaintext, so
+    /// this is gated by the `--admin-allow` process-name list (empty = disabled).
+    /// See docs/ADMIN_CONSOLE.md §B.
+    CaptureStart { filter: CaptureFilter },
+    /// Admin: stop capturing and clear the packet ring.
+    CaptureStop,
+    /// Admin: report the current capture state without draining packets.
+    CaptureStatus,
+    /// Admin: drain captured packets with `seq > after` (cursor poll), oldest
+    /// first. Pass `after: 0` for the first poll.
+    Packets { after: u64 },
 }
 
 /// The daemon's reply.
@@ -74,6 +86,10 @@ pub enum Response {
     Members(Vec<MemberEntry>),
     /// Every virtual IP on the mesh (this node + all peers), from `HealthCheck`.
     Health(Vec<HealthEntry>),
+    /// State of the packet capture (from CaptureStart/Stop/Status).
+    CaptureState(CaptureState),
+    /// Captured packets newer than the polled cursor (from `Packets`).
+    Packets(Vec<PacketRecord>),
     /// A join token (hex-encoded membership cert) handed back from `IssueCert`.
     Token(String),
     /// A command that returns no data succeeded.
@@ -127,6 +143,67 @@ pub struct HealthEntry {
     /// "self" for this node, else the peer status ("connected", "connecting",
     /// "known", "lost").
     pub status: String,
+}
+
+/// Optional narrowing for a packet capture. An empty filter (all `None`)
+/// captures every plaintext packet crossing the tunnel.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CaptureFilter {
+    /// Only packets attributed to this peer (matched against its short
+    /// fingerprint, case-insensitive prefix).
+    pub peer: Option<String>,
+    /// Only this protocol ("tcp", "udp", "icmp", or a raw number).
+    pub protocol: Option<String>,
+    /// Only flows touching this port (as source or destination).
+    pub port: Option<u16>,
+}
+
+/// The live state of the daemon's packet capture (from CaptureStart/Stop/Status).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CaptureState {
+    /// Whether capture is currently running.
+    pub active: bool,
+    /// Packets currently held in the ring.
+    pub buffered: usize,
+    /// Ring capacity (packets).
+    pub cap: usize,
+    /// Per-packet capture limit in bytes (longer packets are truncated).
+    pub snaplen: usize,
+    /// Packets evicted from the ring because it was full (history lost).
+    pub dropped: u64,
+    /// The filter in effect.
+    pub filter: CaptureFilter,
+}
+
+/// One captured plaintext packet — the unit the admin packet inspector renders.
+/// `bytes` holds the captured packet starting at the IPv4 header, truncated to
+/// the capture snaplen; `length` is the packet's true (pre-truncation) length.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PacketRecord {
+    /// Monotonic capture sequence number (the cursor for `Packets { after }`).
+    pub seq: u64,
+    /// Wall-clock capture time, milliseconds since the Unix epoch.
+    pub at_ms: u64,
+    /// Direction relative to this node: "tx" (outbound) or "rx" (inbound).
+    pub dir: String,
+    /// Short fingerprint of the peer carrying this packet.
+    pub peer: Option<String>,
+    /// Protocol name ("TCP", "UDP", "ICMP", "IP/<n>").
+    pub protocol: String,
+    /// Source endpoint ("ip" or "ip:port").
+    pub src: String,
+    /// Destination endpoint ("ip" or "ip:port").
+    pub dst: String,
+    /// True packet length in bytes (may exceed `bytes.len()` if truncated).
+    pub length: u32,
+    /// TCP flags, e.g. "SYN,ACK" (only for TCP).
+    pub tcp_flags: Option<String>,
+    /// TCP sequence number (only for TCP).
+    pub tcp_seq: Option<u32>,
+    /// TCP acknowledgement number (only for TCP).
+    pub tcp_ack: Option<u32>,
+    /// The captured packet bytes (IPv4 header onward), snaplen-truncated.
+    pub bytes: Vec<u8>,
 }
 
 /// One member in an admin node's registry.
