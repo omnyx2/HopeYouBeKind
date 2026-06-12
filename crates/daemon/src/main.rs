@@ -98,6 +98,14 @@ struct Args {
     /// via the GUI/CLI at runtime.
     #[arg(long)]
     member_cert: Option<String>,
+
+    /// Process name(s) allowed to call the mesh health check (every node's
+    /// virtual IP at once). SECURITY-SENSITIVE — it exposes the whole network's
+    /// address map; only a caller whose process name matches is answered.
+    /// Repeatable; defaults to `minisync`. Pass `--health-allow ""` to disable.
+    /// See docs/HEALTH_CHECK.md.
+    #[arg(long, default_value = "minisync")]
+    health_allow: Vec<String>,
 }
 
 /// Hex-encode bytes (for join tokens on the wire).
@@ -294,6 +302,9 @@ async fn main() -> Result<()> {
     for spec in &args.peer_addr {
         match parse_peer_spec(spec) {
             Some((id, addr)) => {
+                // A direct pin: we hold a reachable address, so initiate to it
+                // regardless of the id tie-break (one-sided reachability case).
+                engine.handle().pin_peer(id);
                 let tx = disc_tx.clone();
                 tokio::spawn(async move {
                     loop {
@@ -344,15 +355,24 @@ async fn main() -> Result<()> {
     let ipc_transport = std::sync::Arc::clone(&transport);
     let ipc_admin = admin.clone();
     let ipc_member_cert = args.member_cert.clone();
-    let ipc = lattice_ipc::serve(&args.ipc_socket, move |req| {
+    // Process names allowed to call the health check (empty strings filtered out
+    // so `--health-allow ""` disables it).
+    let ipc_health_allow: Vec<String> = args
+        .health_allow
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .cloned()
+        .collect();
+    let ipc = lattice_ipc::serve(&args.ipc_socket, move |req, caller| {
         let handle = ipc_handle.clone();
         let tun_name = ipc_tun.clone();
         let disc_tx = ipc_disc.clone();
         let transport = std::sync::Arc::clone(&ipc_transport);
         let admin = ipc_admin.clone();
         let member_cert_path = ipc_member_cert.clone();
+        let health_allow = ipc_health_allow.clone();
         async move {
-            use lattice_proto::ipc::{MemberEntry, NetworkInfo, Request, Response};
+            use lattice_proto::ipc::{HealthEntry, MemberEntry, NetworkInfo, Request, Response};
             match req {
                 Request::Status => {
                     let mut s = handle.status().await;
@@ -434,6 +454,42 @@ async fn main() -> Result<()> {
                         message: "not an admin node".into(),
                     },
                 },
+                Request::HealthCheck => {
+                    // SECURITY GATE: only an allow-listed process name may pull
+                    // the whole mesh's virtual-IP map at once. This is a weak
+                    // check by design (a process can be named anything); see
+                    // docs/HEALTH_CHECK.md for the threat model.
+                    let permitted = caller
+                        .as_deref()
+                        .is_some_and(|name| health_allow.iter().any(|a| a == name));
+                    if !permitted {
+                        Response::Error {
+                            message: format!(
+                                "health check denied for process {:?} (allowed: {:?})",
+                                caller.as_deref().unwrap_or("<unknown>"),
+                                health_allow
+                            ),
+                        }
+                    } else {
+                        let status = handle.status().await;
+                        let mut entries = Vec::new();
+                        if let Some(vip) = status.virtual_ip {
+                            entries.push(HealthEntry {
+                                virtual_ip: vip,
+                                fingerprint: status.id.fingerprint(),
+                                status: "self".into(),
+                            });
+                        }
+                        for p in handle.peers().await {
+                            entries.push(HealthEntry {
+                                virtual_ip: p.virtual_ip,
+                                fingerprint: p.id.fingerprint(),
+                                status: format!("{:?}", p.status).to_lowercase(),
+                            });
+                        }
+                        Response::Health(entries)
+                    }
+                }
                 Request::Up => {
                     handle.set_enabled(true);
                     Response::Done
@@ -471,6 +527,9 @@ async fn main() -> Result<()> {
                     Response::Done
                 }
                 Request::AddPeer { node_id, addr } => {
+                    // Direct pin: bypass the id tie-break so we drive the
+                    // handshake even if the peer is the smaller-id (anchor) side.
+                    handle.pin_peer(node_id);
                     let _ = disc_tx
                         .send(DiscoveredPeer {
                             id: node_id,

@@ -52,6 +52,11 @@ pub enum Request {
     RevokeMember { node_id: NodeId },
     /// Admin only: list the members this node's CA has issued certs to.
     Members,
+    /// Health check: every virtual IP on the mesh (this node + all peers) in one
+    /// shot. SECURITY-SENSITIVE — it hands out the whole network's address map,
+    /// so the daemon only answers a caller whose process name is on its
+    /// `--health-allow` list (default `minisync`). See docs/HEALTH_CHECK.md.
+    HealthCheck,
 }
 
 /// The daemon's reply.
@@ -67,6 +72,8 @@ pub enum Response {
     Flows(Vec<FlowRecord>),
     NetworkInfo(NetworkInfo),
     Members(Vec<MemberEntry>),
+    /// Every virtual IP on the mesh (this node + all peers), from `HealthCheck`.
+    Health(Vec<HealthEntry>),
     /// A join token (hex-encoded membership cert) handed back from `IssueCert`.
     Token(String),
     /// A command that returns no data succeeded.
@@ -107,6 +114,19 @@ pub struct NetworkInfo {
     pub member_count: usize,
     /// How many revocations this node currently knows about.
     pub revocation_count: usize,
+}
+
+/// One node's entry in a mesh health-check report: its virtual IP, a short id
+/// fingerprint, and its reachability from this node's point of view.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HealthEntry {
+    /// The node's overlay (virtual) IP.
+    pub virtual_ip: VirtualIp,
+    /// Short fingerprint of the node id, for display.
+    pub fingerprint: String,
+    /// "self" for this node, else the peer status ("connected", "connecting",
+    /// "known", "lost").
+    pub status: String,
 }
 
 /// One member in an admin node's registry.

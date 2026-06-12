@@ -579,6 +579,7 @@ name = "lattice-ipc"
 version = "0.7.0"
 dependencies = [
  "lattice-proto",
+ "libc",
  "serde_json",
  "tokio",
 ]

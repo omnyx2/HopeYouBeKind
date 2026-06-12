@@ -15,7 +15,7 @@
 //! handshake queueing, rekeying, and lossy-path replay handling are later
 //! milestones (see ROADMAP / PROTOCOL.md).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -108,6 +108,13 @@ pub struct Engine {
     /// Set when membership changes at runtime (a join): the loop drops all
     /// sessions on the next tick so they re-handshake under the new network.
     resync: Arc<AtomicBool>,
+    /// Node ids we were handed an explicit reachable address for (a direct
+    /// `--peer-addr` / runtime AddPeer pin). These bypass the id tie-break in
+    /// `on_peer_discovered`, so the *pinning* side always initiates — required
+    /// when reachability is one-sided (a port-forwarded anchor across NATs),
+    /// where the tie-break's designated initiator may be the unreachable side.
+    /// Shared so the IPC handle can register pins at runtime.
+    force_initiate: Arc<std::sync::Mutex<HashSet<NodeId>>>,
 }
 
 impl Engine {
@@ -146,6 +153,7 @@ impl Engine {
             revocations: Arc::new(std::sync::Mutex::new(RevocationList::new())),
             peer_serial: HashMap::new(),
             resync: Arc::new(AtomicBool::new(false)),
+            force_initiate: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -182,6 +190,7 @@ impl Engine {
             cert: Arc::clone(&self.cert),
             revocations: Arc::clone(&self.revocations),
             resync: Arc::clone(&self.resync),
+            force_initiate: Arc::clone(&self.force_initiate),
         }
     }
 
@@ -281,7 +290,15 @@ impl Engine {
         // Tie-break: only the node with the smaller id initiates; the other just
         // waits for the INIT. Without this, both sides handshake at once and the
         // sessions desync (each overwrites the other) → decrypt errors.
-        if self.identity.node_id().0 >= peer.id.0 {
+        //
+        // EXCEPTION — explicitly pinned peers: with a direct `--peer-addr`/
+        // AddPeer pin, reachability can be one-sided (e.g. a port-forwarded
+        // anchor behind NAT). The tie-break's designated initiator might be the
+        // side with no route to the other, so it would never connect. Only the
+        // pinning side has an address, so let it drive the handshake regardless
+        // of id ordering. Safe because the unreachable side's INIT goes nowhere.
+        let pinned = self.force_initiate.lock().unwrap().contains(&peer.id);
+        if !pinned && self.identity.node_id().0 >= peer.id.0 {
             return Ok(());
         }
 
@@ -708,6 +725,7 @@ pub struct EngineHandle {
     cert: Arc<std::sync::Mutex<Option<MemberCert>>>,
     revocations: Arc<std::sync::Mutex<RevocationList>>,
     resync: Arc<AtomicBool>,
+    force_initiate: Arc<std::sync::Mutex<HashSet<NodeId>>>,
 }
 
 impl EngineHandle {
@@ -733,6 +751,13 @@ impl EngineHandle {
     /// Record our public (reflexive) address, learned via STUN.
     pub fn set_public_addr(&self, addr: SocketAddr) {
         *self.public_addr.lock().unwrap() = Some(addr);
+    }
+
+    /// Mark a peer as explicitly pinned (we hold a reachable address for it).
+    /// The engine then initiates to it regardless of the id tie-break, so the
+    /// pinning side drives the handshake even when reachability is one-sided.
+    pub fn pin_peer(&self, id: NodeId) {
+        self.force_initiate.lock().unwrap().insert(id);
     }
 
     /// Route this node's internet traffic through `node_id` (or `None` for direct).
@@ -960,6 +985,63 @@ mod tests {
             flow.remote.starts_with(&vip_b.to_string()),
             "flow's remote end is B's virtual IP, got {}",
             flow.remote
+        );
+    }
+
+    /// A direct pin must initiate even when this node holds the LARGER id (which
+    /// the tie-break normally silences). Models a one-sided reachable anchor: the
+    /// pinning side is the only one that can reach the peer, so it must drive the
+    /// handshake regardless of id ordering. The smaller-id side here has NO
+    /// discovery, so without `pin_peer`'s tie-break bypass neither side would
+    /// ever send an INIT and the connection would never form.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pinned_peer_initiates_despite_id_tie_break() {
+        let id1 = Identity::generate().unwrap();
+        let id2 = Identity::generate().unwrap();
+        // big = larger node id (the side the tie-break would forbid from initiating).
+        let (big, small) = if id1.node_id().0 > id2.node_id().0 {
+            (id1, id2)
+        } else {
+            (id2, id1)
+        };
+        let small_nodeid = small.node_id();
+
+        let big_addr: SocketAddr = "10.0.0.1:700".parse().unwrap();
+        let small_addr: SocketAddr = "10.0.0.2:700".parse().unwrap();
+        let (t_big, t_small) = duplex(big_addr, small_addr);
+        let (tun_big, _hb) = MemoryTun::new();
+        let (tun_small, _hs) = MemoryTun::new();
+
+        // Only the larger-id side knows the peer (an explicit pin); the smaller-id
+        // side has no discovery and can only respond, never initiate.
+        let disc_big = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: small_nodeid,
+            endpoints: vec![small_addr],
+        }]);
+        let disc_small = StaticDiscovery::new(vec![]);
+
+        let mut engine_big = Engine::new(big, EngineConfig::default());
+        let mut engine_small = Engine::new(small, EngineConfig::default());
+        let big_handle = engine_big.handle();
+        big_handle.pin_peer(small_nodeid); // the fix under test
+
+        tokio::spawn(async move {
+            let _ = engine_big.run(tun_big, t_big, disc_big).await;
+        });
+        tokio::spawn(async move {
+            let _ = engine_small.run(tun_small, t_small, disc_small).await;
+        });
+
+        wait_connected(&big_handle, 1).await;
+        let connected = big_handle
+            .peers()
+            .await
+            .iter()
+            .filter(|p| p.status == PeerStatus::Connected)
+            .count();
+        assert_eq!(
+            connected, 1,
+            "pinned larger-id node must initiate and connect despite the tie-break"
         );
     }
 
