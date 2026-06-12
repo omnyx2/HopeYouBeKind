@@ -27,6 +27,7 @@ Start here, then dive into the feature guide you need.
 | Doc | What it covers |
 | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Crate layout and how the planes fit together. |
+| [SDN_DHT_ARCHITECTURE.md](SDN_DHT_ARCHITECTURE.md) | **Design** — the SDN×DHT control plane: a global admin-signed network map distributed serverlessly over the DHT (decentralized distribution, centralized admin authority). Auto full-mesh + programmable routing. |
 | [PROTOCOL.md](PROTOCOL.md) | The Lattice Tunnel Protocol — handshake, framing, sessions. |
 | [SECURITY.md](SECURITY.md) | Threat model and cryptographic choices. |
 | [FEATURES.md](FEATURES.md) | Status table — what works today, what's partial, what's planned. |
