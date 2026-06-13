@@ -322,7 +322,9 @@ impl Engine {
         tracing::info!(virtual_ip = %self.virtual_ip, "engine started");
 
         // Periodic keepalive: detects reachability and keeps NAT bindings open.
-        let mut keepalive = tokio::time::interval(Duration::from_secs(5));
+        // Also drives liveness re-classification (STALE/DEAD) each tick, so a
+        // shorter interval makes a peer's disconnect surface faster in the UI.
+        let mut keepalive = tokio::time::interval(Duration::from_secs(3));
 
         let mut discovery_done = false;
         loop {
@@ -790,8 +792,11 @@ impl Engine {
     /// how recently each was heard from. Peers unseen past a threshold are marked
     /// Lost; long-dead ones are dropped (clears stale "ghost" entries).
     async fn on_keepalive_tick<X: Transport>(&mut self, transport: &X) {
-        const STALE: Duration = Duration::from_secs(15);
-        const DEAD: Duration = Duration::from_secs(60);
+        // A peer is marked Lost after STALE of silence (≈2-3 missed 3s keepalives,
+        // so a single dropped packet doesn't flap it), and dropped after DEAD. Kept
+        // tight so a disconnect shows in the GUI within ~10s instead of ~15-20s.
+        const STALE: Duration = Duration::from_secs(8);
+        const DEAD: Duration = Duration::from_secs(24);
         let now = Instant::now();
 
         // Membership just changed (joined a network): drop every existing session
@@ -1872,8 +1877,15 @@ mod tests {
     /// the sessions re-handshake under the new suite — proving runtime selection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn crypto_suite_hot_swap_re_handshakes_under_new_suite() {
-        let id_a = Identity::generate().unwrap();
-        let id_b = Identity::generate().unwrap();
+        // Make A the smaller-id node so it's the tie-break initiator — handshake
+        // comparison stats are recorded on the initiator side, so we assert on A.
+        let id1 = Identity::generate().unwrap();
+        let id2 = Identity::generate().unwrap();
+        let (id_a, id_b) = if id1.node_id().0 < id2.node_id().0 {
+            (id1, id2)
+        } else {
+            (id2, id1)
+        };
         let a_nodeid = id_a.node_id();
         let b_nodeid = id_b.node_id();
         let addr_a: SocketAddr = "10.0.0.1:705".parse().unwrap();
