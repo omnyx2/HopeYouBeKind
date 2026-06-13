@@ -41,6 +41,35 @@ enum Command {
     /// Crypto swap-lab: list/compare suites, hot-swap, inspect sessions.
     #[command(subcommand)]
     Crypto(CryptoCommand),
+    /// Packet inspector (admin): capture decrypted tunnel packets. Gated by the
+    /// daemon's `--admin-allow` list (run this as a name on that list).
+    #[command(subcommand)]
+    Capture(CaptureCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum CaptureCommand {
+    /// Arm the capture (optionally filtered) and clear any previous buffer.
+    Start {
+        /// Only this protocol: tcp | udp | icmp.
+        #[arg(long)]
+        proto: Option<String>,
+        /// Only flows touching this port.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Only packets to/from this peer (short fingerprint prefix).
+        #[arg(long)]
+        peer: Option<String>,
+    },
+    /// Disarm the capture and clear its buffer.
+    Stop,
+    /// Show capture state (armed?, buffered, dropped).
+    Status,
+    /// Print captured packets with seq > `after` (cursor; default 0 = all).
+    Packets {
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -153,6 +182,16 @@ impl Command {
             Command::Crypto(CryptoCommand::Decrypt { hex }) => Request::CryptoDecrypt {
                 hex: hex.clone(),
             },
+            Command::Capture(CaptureCommand::Start { proto, port, peer }) => Request::CaptureStart {
+                filter: lattice_proto::ipc::CaptureFilter {
+                    peer: peer.clone(),
+                    protocol: proto.clone(),
+                    port: *port,
+                },
+            },
+            Command::Capture(CaptureCommand::Stop) => Request::CaptureStop,
+            Command::Capture(CaptureCommand::Status) => Request::CaptureStatus,
+            Command::Capture(CaptureCommand::Packets { after }) => Request::Packets { after: *after },
         })
     }
 }
@@ -267,7 +306,18 @@ fn print_response(response: Response) {
             s.cap,
             s.dropped
         ),
-        Response::Packets(pkts) => println!("{} packet(s)", pkts.len()),
+        Response::Packets(pkts) => {
+            if pkts.is_empty() {
+                println!("no packets captured yet (only decrypted overlay data is captured — send traffic between overlay IPs)");
+            }
+            for p in pkts {
+                let flags = p.tcp_flags.map(|f| format!(" [{f}]")).unwrap_or_default();
+                println!(
+                    "#{:<4} {:<3} {:<5} {} -> {}  {}B{}",
+                    p.seq, p.dir, p.protocol, p.src, p.dst, p.length, flags
+                );
+            }
+        }
         Response::CryptoSuites(suites) => {
             for s in suites {
                 println!(

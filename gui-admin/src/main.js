@@ -453,7 +453,10 @@ function renderPackets() {
   el("pkt-count").textContent = capPkts.length;
   const tb = el("pkt-rows");
   if (!capPkts.length) {
-    tb.innerHTML = `<tr class="empty"><td colspan="9">No packets ${capturing ? "yet — waiting for traffic" : "— capture stopped"}.</td></tr>`;
+    const hint = capturing
+      ? "Capturing… only <b>decrypted overlay data</b> is shown (not handshakes/keepalives). Send traffic between overlay IPs — e.g. <code>ping a peer's 100.x address</code> — to see packets here."
+      : "Capture stopped — start it above.";
+    tb.innerHTML = `<tr class="empty"><td colspan="9">${hint}</td></tr>`;
     return;
   }
   tb.innerHTML = "";
