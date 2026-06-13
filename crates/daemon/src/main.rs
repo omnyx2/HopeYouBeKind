@@ -672,11 +672,27 @@ async fn start_dht(
     let kad = Arc::new(Kademlia::with_shared(node, dht));
     tracing::info!(dht = %local, node = %node_id.fingerprint(), "DHT node listening");
 
-    // Join the DHT through any bootstrap nodes.
+    // Join the DHT through any bootstrap nodes — then keep re-joining on a timer.
+    // A one-shot bootstrap is fragile: if the bootstrap node restarts it comes back
+    // with an empty routing table, and if our contact to it is ever evicted we lose
+    // our only entry point — either way the ring silently breaks and lookups stop
+    // resolving (you then have to restart every node by hand). Re-pinging the
+    // configured bootstrap addresses periodically re-teaches a restarted bootstrap
+    // node about us and refreshes our own buckets (Kademlia's periodic refresh), so
+    // the mesh self-heals within one interval instead of needing a manual restart.
     let boots: Vec<SocketAddr> = bootstrap.iter().filter_map(|a| a.parse().ok()).collect();
     if !boots.is_empty() {
         kad.bootstrap_addrs(&boots).await;
         tracing::info!(count = boots.len(), "DHT bootstrapped");
+        let kad = Arc::clone(&kad);
+        tokio::spawn(async move {
+            const REBOOTSTRAP: Duration = Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(REBOOTSTRAP).await;
+                kad.bootstrap_addrs(&boots).await;
+                tracing::debug!(count = boots.len(), "DHT re-bootstrapped");
+            }
+        });
     }
 
     // Publish our candidate addresses (LAN first, then reflexive/WAN) under our
