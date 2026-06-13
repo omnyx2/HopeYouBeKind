@@ -15,7 +15,7 @@
           <button class="nav-item active" data-tab="overview"><span class="nav-ico">◎</span> Overview</button>
           <button class="nav-item" data-tab="members"><span class="nav-ico">⧉</span> Members</button>
           <button class="nav-item" data-tab="traffic"><span class="nav-ico">📊</span> Traffic</button>
-          <button class="nav-item" data-tab="crypto" disabled><span class="nav-ico">🧪</span> Crypto Lab <span class="nav-soon">soon</span></button>
+          <button class="nav-item" data-tab="crypto"><span class="nav-ico">🧪</span> Crypto Lab</button>
         </nav>
         <div class="sidebar-foot">
           <span id="conn-dot" class="conn-dot off"></span>
@@ -139,7 +139,25 @@
         <!-- ===== Crypto Lab (Phase 3) ===== -->
         <section class="panel hidden" data-panel="crypto">
           <h1 class="panel-title">Crypto Lab</h1>
-          <div class="soon"><div class="big">🧪</div>Crypto-suite swap lab lands in <b>Phase 3</b>.<br />See <code>docs/ADMIN_CONSOLE.md</code>.</div>
+          <p class="panel-sub">Swap the live tunnel cipher and compare handshakes. A swap drops every session and re-handshakes it under the new suite.</p>
+
+          <h2 class="sec">Suites</h2>
+          <table class="grid">
+            <thead><tr><th>Suite</th><th>Pattern</th><th>DH</th><th>AEAD</th><th>Hash</th><th></th></tr></thead>
+            <tbody id="crypto-suites"><tr class="empty"><td colspan="6">Loading…</td></tr></tbody>
+          </table>
+
+          <h2 class="sec">Handshake comparison</h2>
+          <table class="grid">
+            <thead><tr><th>Suite</th><th class="right">Handshakes</th><th class="right">Init bytes</th><th class="right">Resp bytes</th><th class="right">Median</th></tr></thead>
+            <tbody id="crypto-stats"><tr class="empty"><td colspan="5">No handshakes recorded yet.</td></tr></tbody>
+          </table>
+
+          <h2 class="sec">Live sessions</h2>
+          <table class="grid">
+            <thead><tr><th>Peer</th><th>Suite</th><th class="right">Age</th><th class="right">Rekey in</th><th class="right">Tx</th><th class="right">Rx</th><th class="right">Rejects</th></tr></thead>
+            <tbody id="crypto-sessions"><tr class="empty"><td colspan="7">No live sessions.</td></tr></tbody>
+          </table>
         </section>
       </main>
     </div>

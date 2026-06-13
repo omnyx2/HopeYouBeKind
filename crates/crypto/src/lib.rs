@@ -21,7 +21,10 @@ pub use cookie::CookieMaker;
 pub use rekey::RekeyPolicy;
 pub use replay::ReplayWindow;
 pub use session::{respond, Handshake, NoiseSession, PendingHandshake};
-pub use suite::{Accepted, CryptoSuite, HandshakeState, NoiseSuite};
+pub use suite::{
+    registry, suite_by_name, Accepted, CryptoSuite, HandshakeState, NoiseSuite, NOISE_AESGCM,
+    NOISE_CHACHAPOLY,
+};
 
 /// The Noise pattern + primitive suite LTP uses. Mirrors WireGuard's choices
 /// because they are well analyzed: mutual auth, forward secrecy, AEAD.
@@ -139,6 +142,23 @@ pub trait TunnelSession: Send + Sync {
     /// (it tracks each session's creation time). A suite with no rekey policy may
     /// always return `false`.
     fn rekey_due(&self, age: std::time::Duration) -> bool;
+
+    /// A read-only snapshot of this session's transport counters — for the admin
+    /// crypto-lab session inspector. Default: zeros (suites that don't track them).
+    fn stats(&self) -> SessionStats {
+        SessionStats::default()
+    }
+}
+
+/// Live transport counters for one session, surfaced to the crypto-lab inspector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionStats {
+    /// Outbound AEAD nonce/counter — how many packets we've sealed.
+    pub send_counter: u64,
+    /// Highest inbound packet counter accepted by the replay window.
+    pub replay_latest: u64,
+    /// Packets rejected as replays or too-old by the replay window.
+    pub replay_rejects: u64,
 }
 
 /// A no-op session that copies bytes through unchanged. **Tests only** — lets us

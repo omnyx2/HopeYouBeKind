@@ -27,6 +27,12 @@ impl ReplayWindow {
         Self::default()
     }
 
+    /// The highest packet counter accepted so far (0 before any packet). For the
+    /// crypto-lab session inspector.
+    pub fn latest(&self) -> u64 {
+        self.latest
+    }
+
     /// Check a counter and record it. Returns `true` if it is fresh (accept),
     /// `false` if it is a replay or too old to verify (reject). Counters are
     /// 1-based; `0` is never valid.

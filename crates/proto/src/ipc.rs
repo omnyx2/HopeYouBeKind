@@ -55,6 +55,18 @@ pub enum Request {
     DesignateRelay { node_id: NodeId, on: bool },
     /// Admin only: list the members this node's CA has issued certs to.
     Members,
+    /// Admin: the crypto suites this node can run (the swap-lab catalogue).
+    CryptoSuites,
+    /// Admin: the active crypto suite.
+    CryptoCurrent,
+    /// Admin: swap the active crypto suite by name → drops + re-handshakes all
+    /// sessions under it. SECURITY-SENSITIVE (changes the live tunnel crypto), so
+    /// gated by the `--admin-allow` capability list like the packet capture.
+    SetCryptoSuite { name: String },
+    /// Admin: per-suite handshake comparison metrics (init/resp bytes, median ms).
+    CryptoStats,
+    /// Admin: per-peer live session detail (suite, age, rekey countdown, counters).
+    SessionDetails,
     /// Health check: every virtual IP on the mesh (this node + all peers) in one
     /// shot. SECURITY-SENSITIVE — it hands out the whole network's address map,
     /// so the daemon only answers a caller whose process name is on its
@@ -93,6 +105,14 @@ pub enum Response {
     CaptureState(CaptureState),
     /// Captured packets newer than the polled cursor (from `Packets`).
     Packets(Vec<PacketRecord>),
+    /// The crypto suites this node can run (from `CryptoSuites`).
+    CryptoSuites(Vec<CryptoSuiteInfo>),
+    /// The active crypto suite (from `CryptoCurrent`).
+    CryptoSuite(CryptoSuiteInfo),
+    /// Per-suite handshake comparison metrics (from `CryptoStats`).
+    CryptoStats(Vec<SuiteStat>),
+    /// Per-peer live session detail (from `SessionDetails`).
+    SessionDetails(Vec<SessionDetail>),
     /// A join token (hex-encoded membership cert) handed back from `IssueCert`.
     Token(String),
     /// A command that returns no data succeeded.
@@ -220,6 +240,57 @@ pub struct MemberEntry {
     /// Whether the admin has designated this member as a relay.
     #[serde(default)]
     pub relay: bool,
+}
+
+/// One crypto suite in the swap-lab catalogue. The `spec` is split into its Noise
+/// components so the console can show a side-by-side comparison.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CryptoSuiteInfo {
+    /// Stable selector name, e.g. `noise-ik-aesgcm`.
+    pub name: String,
+    /// Noise handshake pattern, e.g. `IK`.
+    pub pattern: String,
+    /// Diffie-Hellman group, e.g. `25519`.
+    pub dh: String,
+    /// AEAD cipher, e.g. `ChaChaPoly` / `AESGCM`.
+    pub aead: String,
+    /// Hash function, e.g. `BLAKE2s` / `SHA256`.
+    pub hash: String,
+    /// Whether this is the node's active suite.
+    pub active: bool,
+}
+
+/// Aggregated handshake metrics for one suite — the swap-lab comparison row.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SuiteStat {
+    pub name: String,
+    /// Handshakes completed under this suite (sample size).
+    pub handshakes: u64,
+    /// Bytes on the wire for the most recent HANDSHAKE_INIT.
+    pub init_bytes: u32,
+    /// Bytes on the wire for the most recent HANDSHAKE_RESP.
+    pub resp_bytes: u32,
+    /// Median initiator handshake wall-clock (INIT sent → session established), ms.
+    pub median_ms: u32,
+}
+
+/// Live detail for one peer session — the swap-lab session inspector (read-only).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionDetail {
+    /// Peer fingerprint (short node id).
+    pub peer: String,
+    /// Crypto suite this session was established under.
+    pub suite: String,
+    /// How long the session has been alive.
+    pub age_secs: u64,
+    /// Seconds until a proactive rekey is due (negative once overdue).
+    pub rekey_in_secs: i64,
+    /// Outbound AEAD counter (packets sealed).
+    pub send_counter: u64,
+    /// Highest inbound packet counter accepted by the replay window.
+    pub replay_latest: u64,
+    /// Packets the replay window rejected (replays / too old).
+    pub replay_rejects: u64,
 }
 
 /// One aggregated traffic flow observed crossing the tunnel. The engine groups

@@ -56,6 +56,7 @@ body { background: var(--bg); color: var(--text); overflow: hidden; }
 .content { flex: 1; overflow-y: auto; padding: 22px 26px; }
 .panel-title { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
 .panel-sub { color: var(--muted); font-size: 13px; margin: 0 0 18px; }
+.sec { font-size: 14px; font-weight: 600; margin: 22px 0 8px; color: var(--text); }
 .panel.hidden { display: none; }
 
 .card {

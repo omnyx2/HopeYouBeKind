@@ -24,11 +24,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lattice_crypto::{CryptoSuite, HandshakeState, Identity, NoiseSuite, TunnelSession};
+use lattice_crypto::{
+    registry, suite_by_name, CryptoSuite, HandshakeState, Identity, NoiseSuite, TunnelSession,
+};
 use lattice_membership::{MemberCert, NetworkId, Revocation, RevocationList};
 use lattice_net::{DiscoveredPeer, Discovery, Transport};
 use lattice_overlay::{derive_virtual_ip, Overlay};
-use lattice_proto::ipc::{FlowRecord, NodeStatus};
+use lattice_proto::ipc::{CryptoSuiteInfo, FlowRecord, NodeStatus, SessionDetail, SuiteStat};
 use lattice_proto::wire::{self, MessageType};
 use lattice_proto::{NodeId, PeerInfo, PeerStatus, VirtualIp};
 use lattice_tun::TunDevice;
@@ -69,9 +71,11 @@ pub struct Engine {
     identity: Arc<Identity>,
     virtual_ip: VirtualIp,
     overlay: Arc<Mutex<Overlay>>,
-    /// The pluggable crypto suite driving every handshake + session. Swap this
-    /// to research a different scheme; Noise-IK is the default.
-    suite: Arc<dyn CryptoSuite>,
+    /// The pluggable crypto suite driving every handshake + session. Held behind
+    /// a mutex so the admin crypto-lab can hot-swap it at runtime (a swap sets
+    /// `resync`, dropping sessions so they re-handshake under the new suite).
+    /// Noise-IK/ChaChaPoly is the default.
+    suite: Arc<std::sync::Mutex<Arc<dyn CryptoSuite>>>,
     /// Live sessions, keyed by the peer's transport endpoint.
     sessions: HashMap<SocketAddr, Box<dyn TunnelSession>>,
     /// Initiator handshakes awaiting a response, keyed by the peer's endpoint.
@@ -132,6 +136,28 @@ pub struct Engine {
     /// `sessions`). Drives session lifetime: the suite's `rekey_due` against this
     /// age triggers a proactive rekey, and [`REJECT_AFTER_TIME`] forces expiry.
     established: HashMap<SocketAddr, Instant>,
+    /// Crypto suite each connected peer's session was established under (for the
+    /// crypto-lab session inspector). Keyed by peer id.
+    peer_suite: HashMap<NodeId, &'static str>,
+    /// Wire size of the last HANDSHAKE_INIT we sent per peer — paired with the
+    /// response size + RTT on completion to feed the crypto-lab comparison.
+    last_init_bytes: HashMap<NodeId, u32>,
+    /// Per-suite handshake comparison accumulators, shared so the IPC handle can
+    /// read them (the loop writes on each completed initiator handshake).
+    crypto_stats: Arc<std::sync::Mutex<HashMap<&'static str, SuiteAccum>>>,
+    /// Per-peer session-inspector snapshot, refreshed each keepalive tick so the
+    /// IPC handle can read live counters without touching the loop's session map.
+    session_snapshot: Arc<std::sync::Mutex<Vec<SessionDetail>>>,
+}
+
+/// Running handshake metrics for one suite (the crypto-lab comparison source).
+#[derive(Default)]
+struct SuiteAccum {
+    handshakes: u64,
+    init_bytes: u32,
+    resp_bytes: u32,
+    /// Recent initiator handshake durations (ms), bounded; the median is reported.
+    durations_ms: Vec<u32>,
 }
 
 /// Minimum interval between handshake initiations to one peer, and the window in
@@ -153,7 +179,7 @@ impl Engine {
     /// Create a node from an identity, using the default Noise-IK crypto suite.
     /// The virtual IP is derived from identity.
     pub fn new(identity: Identity, config: EngineConfig) -> Self {
-        Self::with_suite(identity, config, Arc::new(NoiseSuite))
+        Self::with_suite(identity, config, Arc::new(NoiseSuite::default()))
     }
 
     /// Create a node with an explicit crypto suite — the seam for researching
@@ -167,7 +193,7 @@ impl Engine {
         Self {
             identity: Arc::new(identity),
             virtual_ip,
-            suite,
+            suite: Arc::new(std::sync::Mutex::new(suite)),
             overlay: Arc::new(Mutex::new(Overlay::new())),
             sessions: HashMap::new(),
             pending: HashMap::new(),
@@ -189,6 +215,10 @@ impl Engine {
             last_init: HashMap::new(),
             last_responded: HashMap::new(),
             established: HashMap::new(),
+            peer_suite: HashMap::new(),
+            last_init_bytes: HashMap::new(),
+            crypto_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -226,6 +256,9 @@ impl Engine {
             revocations: Arc::clone(&self.revocations),
             resync: Arc::clone(&self.resync),
             force_initiate: Arc::clone(&self.force_initiate),
+            suite: Arc::clone(&self.suite),
+            crypto_stats: Arc::clone(&self.crypto_stats),
+            session_snapshot: Arc::clone(&self.session_snapshot),
         }
     }
 
@@ -390,9 +423,12 @@ impl Engine {
         let public_key = peer_id.0.to_vec();
         let private = self.identity.private_key().to_vec();
         let meta = self.local_payload();
+        let suite = self.current_suite();
+        let mut init_wire = 0u32;
         for &endpoint in endpoints {
-            let (handshake, init_msg) = self.suite.initiate(&private, &public_key, &meta)?;
+            let (handshake, init_msg) = suite.initiate(&private, &public_key, &meta)?;
             let frame = wire::encode(MessageType::HandshakeInit, &init_msg);
+            init_wire = frame.len() as u32;
             match transport.send_to(&frame, endpoint).await {
                 Ok(()) => {
                     self.pending.insert(endpoint, handshake);
@@ -403,7 +439,58 @@ impl Engine {
             }
         }
         self.last_init.insert(peer_id, Instant::now());
+        // Remember this INIT's wire size; paired with the response size + RTT when
+        // the handshake completes to feed the crypto-lab comparison.
+        self.last_init_bytes.insert(peer_id, init_wire);
         Ok(())
+    }
+
+    /// The crypto suite currently active (cloned `Arc` so the lock isn't held
+    /// across the handshake work).
+    fn current_suite(&self) -> Arc<dyn CryptoSuite> {
+        Arc::clone(&self.suite.lock().unwrap())
+    }
+
+    /// Fold one completed initiator handshake into the crypto-lab comparison.
+    fn record_handshake(&self, suite: &'static str, init_bytes: u32, resp_bytes: u32, dur_ms: u32) {
+        let mut stats = self.crypto_stats.lock().unwrap();
+        let acc = stats.entry(suite).or_default();
+        acc.handshakes += 1;
+        acc.init_bytes = init_bytes;
+        acc.resp_bytes = resp_bytes;
+        acc.durations_ms.push(dur_ms);
+        if acc.durations_ms.len() > 64 {
+            acc.durations_ms.remove(0); // bounded sample for the median
+        }
+    }
+
+    /// Rebuild the session-inspector snapshot from the live sessions, so the IPC
+    /// handle can read per-peer counters without touching the loop's state.
+    fn refresh_session_snapshot(&self) {
+        let now = Instant::now();
+        let max_age = lattice_crypto::rekey::DEFAULT_MAX_AGE.as_secs() as i64;
+        let details: Vec<SessionDetail> = self
+            .connected
+            .iter()
+            .filter_map(|(id, ep)| {
+                let session = self.sessions.get(ep)?;
+                let age = self
+                    .established
+                    .get(ep)
+                    .map_or(Duration::ZERO, |t| now.duration_since(*t));
+                let stats = session.stats();
+                Some(SessionDetail {
+                    peer: id.fingerprint(),
+                    suite: self.peer_suite.get(id).copied().unwrap_or("?").to_string(),
+                    age_secs: age.as_secs(),
+                    rekey_in_secs: max_age - age.as_secs() as i64,
+                    send_counter: stats.send_counter,
+                    replay_latest: stats.replay_latest,
+                    replay_rejects: stats.replay_rejects,
+                })
+            })
+            .collect();
+        *self.session_snapshot.lock().unwrap() = details;
     }
 
     /// A local packet that needs to reach a peer's virtual IP.
@@ -481,9 +568,8 @@ impl Engine {
         match msg_type {
             MessageType::HandshakeInit => {
                 let private = self.identity.private_key().to_vec();
-                let accepted = self
-                    .suite
-                    .respond(&private, payload, &self.local_payload())?;
+                let suite = self.current_suite();
+                let accepted = suite.respond(&private, payload, &self.local_payload())?;
                 let peer_id = node_id_from_pubkey(&accepted.peer_identity);
 
                 // Membership gate: in a network, the initiator must present a
@@ -540,6 +626,7 @@ impl Engine {
                 self.sessions.insert(from, accepted.session);
                 self.established.insert(from, Instant::now());
                 self.connected.insert(peer_id, from);
+                self.peer_suite.insert(peer_id, suite.name());
                 if let Some(serial) = serial {
                     self.peer_serial.insert(peer_id, serial);
                 }
@@ -549,7 +636,7 @@ impl Engine {
                         from,
                     )
                     .await?;
-                tracing::info!(peer = %peer_id.fingerprint(), %from, "session established (responder)");
+                tracing::info!(peer = %peer_id.fingerprint(), %from, suite = suite.name(), "session established (responder)");
             }
             MessageType::HandshakeResp => {
                 if let Some(handshake) = self.pending.remove(&from) {
@@ -570,18 +657,30 @@ impl Engine {
 
                     self.sessions.insert(from, session);
                     self.established.insert(from, Instant::now());
+                    let suite_name = self.current_suite().name();
                     if let Some(peer_id) = peer_id {
                         self.connected.insert(peer_id, from);
+                        self.peer_suite.insert(peer_id, suite_name);
                         if let Some(serial) = serial {
                             self.peer_serial.insert(peer_id, serial);
                         }
+                        // Crypto-lab: record this completed initiator handshake —
+                        // INIT/RESP wire sizes and the full INIT→established RTT —
+                        // under the active suite for the side-by-side comparison.
+                        let init_bytes = self.last_init_bytes.get(&peer_id).copied().unwrap_or(0);
+                        let dur_ms = self
+                            .last_init
+                            .get(&peer_id)
+                            .map(|t| t.elapsed().as_millis().min(u32::MAX as u128) as u32)
+                            .unwrap_or(0);
+                        self.record_handshake(suite_name, init_bytes, data.len() as u32, dur_ms);
                         let mut overlay = self.overlay.lock().await;
                         overlay.set_status(&peer_id, PeerStatus::Connected);
                         if let Some(os) = decode_os(&os_bytes) {
                             overlay.set_os(&peer_id, os);
                         }
                     }
-                    tracing::info!(%from, "session established (initiator)");
+                    tracing::info!(%from, suite = suite_name, "session established (initiator)");
                 }
             }
             MessageType::Transport => {
@@ -667,7 +766,9 @@ impl Engine {
             self.pending.clear();
             self.connected.clear();
             self.peer_serial.clear();
+            self.peer_suite.clear();
             self.last_init.clear();
+            self.last_init_bytes.clear();
             self.last_responded.clear();
             let ids: Vec<NodeId> = self.overlay.lock().await.peers().map(|p| p.id).collect();
             let mut overlay = self.overlay.lock().await;
@@ -796,6 +897,9 @@ impl Engine {
         for peer in stale_peers {
             let _ = self.on_peer_discovered(peer, transport).await;
         }
+
+        // Refresh the crypto-lab session inspector from the live sessions.
+        self.refresh_session_snapshot();
     }
 
     /// The network we belong to, if any (open mode otherwise).
@@ -875,6 +979,9 @@ pub struct EngineHandle {
     revocations: Arc<std::sync::Mutex<RevocationList>>,
     resync: Arc<AtomicBool>,
     force_initiate: Arc<std::sync::Mutex<HashSet<NodeId>>>,
+    suite: Arc<std::sync::Mutex<Arc<dyn CryptoSuite>>>,
+    crypto_stats: Arc<std::sync::Mutex<HashMap<&'static str, SuiteAccum>>>,
+    session_snapshot: Arc<std::sync::Mutex<Vec<SessionDetail>>>,
 }
 
 impl EngineHandle {
@@ -989,6 +1096,84 @@ impl EngineHandle {
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
     }
+
+    /// The crypto suites this node can run (the swap-lab catalogue), with the
+    /// active one flagged.
+    pub fn crypto_suites(&self) -> Vec<CryptoSuiteInfo> {
+        let active = self.suite.lock().unwrap().name();
+        registry()
+            .iter()
+            .map(|s| suite_info(s.as_ref(), s.name() == active))
+            .collect()
+    }
+
+    /// The active crypto suite.
+    pub fn crypto_current(&self) -> CryptoSuiteInfo {
+        let s = self.suite.lock().unwrap();
+        suite_info(s.as_ref(), true)
+    }
+
+    /// Hot-swap the active crypto suite by name, then drop + re-handshake every
+    /// session under it (reuses the membership-join resync path). Returns false
+    /// if `name` isn't a known suite.
+    pub fn set_crypto_suite(&self, name: &str) -> bool {
+        match suite_by_name(name) {
+            Some(s) => {
+                *self.suite.lock().unwrap() = s;
+                self.resync.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Per-suite handshake comparison metrics (catalogue order; only suites that
+    /// have actually run a handshake appear).
+    pub fn crypto_stats(&self) -> Vec<SuiteStat> {
+        let stats = self.crypto_stats.lock().unwrap();
+        registry()
+            .iter()
+            .filter_map(|s| {
+                stats.get(s.name()).map(|acc| SuiteStat {
+                    name: s.name().to_string(),
+                    handshakes: acc.handshakes,
+                    init_bytes: acc.init_bytes,
+                    resp_bytes: acc.resp_bytes,
+                    median_ms: median(&acc.durations_ms),
+                })
+            })
+            .collect()
+    }
+
+    /// Per-peer live session detail (last refreshed on the keepalive tick).
+    pub fn session_details(&self) -> Vec<SessionDetail> {
+        self.session_snapshot.lock().unwrap().clone()
+    }
+}
+
+/// Build a [`CryptoSuiteInfo`] from a suite by splitting its Noise spec
+/// (`Noise_<pattern>_<dh>_<aead>_<hash>`) into the catalogue columns.
+fn suite_info(s: &dyn CryptoSuite, active: bool) -> CryptoSuiteInfo {
+    let p: Vec<&str> = s.spec().split('_').collect();
+    let col = |i: usize| p.get(i).copied().unwrap_or("?").to_string();
+    CryptoSuiteInfo {
+        name: s.name().to_string(),
+        pattern: col(1),
+        dh: col(2),
+        aead: col(3),
+        hash: col(4),
+        active,
+    }
+}
+
+/// Median of a small unsorted sample (0 when empty).
+fn median(v: &[u32]) -> u32 {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    s[s.len() / 2]
 }
 
 /// Current wall-clock time in unix seconds, for cert expiry checks.
@@ -1477,6 +1662,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "fast-rekey"
         }
+        fn spec(&self) -> &'static str {
+            self.inner.spec()
+        }
         fn initiate(
             &self,
             local_private: &[u8],
@@ -1563,11 +1751,11 @@ mod tests {
 
         let inits = Arc::new(AtomicUsize::new(0));
         let suite_a = Arc::new(FastRekeySuite {
-            inner: NoiseSuite,
+            inner: NoiseSuite::default(),
             inits: Arc::clone(&inits),
         });
         let suite_b = Arc::new(FastRekeySuite {
-            inner: NoiseSuite,
+            inner: NoiseSuite::default(),
             inits: Arc::new(AtomicUsize::new(0)),
         });
         let mut engine_a = Engine::with_suite(id_a, EngineConfig::default(), suite_a);
@@ -1605,6 +1793,92 @@ mod tests {
                 .iter()
                 .any(|p| p.status == PeerStatus::Connected),
             "rekey must be seamless — the peer stays Connected"
+        );
+    }
+
+    /// The crypto-lab swap: two nodes connect under the default ChaChaPoly suite,
+    /// the inspector/catalogue/stats report it, then both hot-swap to AES-GCM and
+    /// the sessions re-handshake under the new suite — proving runtime selection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crypto_suite_hot_swap_re_handshakes_under_new_suite() {
+        let id_a = Identity::generate().unwrap();
+        let id_b = Identity::generate().unwrap();
+        let a_nodeid = id_a.node_id();
+        let b_nodeid = id_b.node_id();
+        let addr_a: SocketAddr = "10.0.0.1:705".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:705".parse().unwrap();
+        let (ta, tb) = duplex(addr_a, addr_b);
+        let (tun_a, _ha) = MemoryTun::new();
+        let (tun_b, _hb) = MemoryTun::new();
+        let disc_a = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: b_nodeid,
+            endpoints: vec![addr_b],
+        }]);
+        let disc_b = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: a_nodeid,
+            endpoints: vec![addr_a],
+        }]);
+
+        let mut engine_a = Engine::new(id_a, EngineConfig::default());
+        let mut engine_b = Engine::new(id_b, EngineConfig::default());
+        let a_ctl = engine_a.handle();
+        let b_ctl = engine_b.handle();
+
+        tokio::spawn(async move {
+            let _ = engine_a.run(tun_a, ta, disc_a).await;
+        });
+        tokio::spawn(async move {
+            let _ = engine_b.run(tun_b, tb, disc_b).await;
+        });
+
+        wait_connected(&a_ctl, 1).await;
+
+        // Catalogue + current suite + comparison stats all report ChaChaPoly.
+        assert_eq!(a_ctl.crypto_current().name, "noise-ik-chachapoly");
+        let cat = a_ctl.crypto_suites();
+        assert_eq!(cat.len(), 2, "two suites in the catalogue");
+        assert!(cat.iter().any(|s| s.name == "noise-ik-aesgcm" && !s.active));
+        // Session inspector eventually reflects the live session (refreshed on tick).
+        let mut saw_chacha = false;
+        for _ in 0..30 {
+            let det = a_ctl.session_details();
+            if det.iter().any(|d| d.suite == "noise-ik-chachapoly") {
+                saw_chacha = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(saw_chacha, "inspector shows the ChaChaPoly session");
+        assert!(
+            a_ctl
+                .crypto_stats()
+                .iter()
+                .any(|s| s.name == "noise-ik-chachapoly" && s.handshakes >= 1),
+            "comparison stats recorded a ChaChaPoly handshake"
+        );
+
+        // Hot-swap BOTH nodes to AES-GCM → resync drops + re-handshakes sessions.
+        assert!(a_ctl.set_crypto_suite("noise-ik-aesgcm"));
+        assert!(b_ctl.set_crypto_suite("noise-ik-aesgcm"));
+        assert_eq!(a_ctl.crypto_current().name, "noise-ik-aesgcm");
+        assert!(!a_ctl.set_crypto_suite("nope"), "unknown suite rejected");
+
+        // The session must re-form under AES-GCM (the inspector reports the suite).
+        let mut swapped = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if a_ctl
+                .session_details()
+                .iter()
+                .any(|d| d.suite == "noise-ik-aesgcm")
+            {
+                swapped = true;
+                break;
+            }
+        }
+        assert!(
+            swapped,
+            "sessions must re-handshake under the swapped-in AES-GCM suite"
         );
     }
 }

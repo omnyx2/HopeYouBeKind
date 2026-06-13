@@ -179,6 +179,49 @@ async fn designate_relay(node_id: String, on: bool) -> Result<(), String> {
     }
 }
 
+// ---- Phase 3: crypto swap lab ----
+
+#[tauri::command]
+async fn crypto_suites() -> Result<Vec<lattice_proto::ipc::CryptoSuiteInfo>, String> {
+    match lattice_ipc::request(SOCKET, Request::CryptoSuites).await {
+        Ok(Response::CryptoSuites(v)) => Ok(v),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Admin: hot-swap the live tunnel crypto suite (gated by `--admin-allow`).
+#[tauri::command]
+async fn crypto_swap(name: String) -> Result<(), String> {
+    match lattice_ipc::request(SOCKET, Request::SetCryptoSuite { name }).await {
+        Ok(Response::Done) => Ok(()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn crypto_stats() -> Result<Vec<lattice_proto::ipc::SuiteStat>, String> {
+    match lattice_ipc::request(SOCKET, Request::CryptoStats).await {
+        Ok(Response::CryptoStats(v)) => Ok(v),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn session_details() -> Result<Vec<lattice_proto::ipc::SessionDetail>, String> {
+    match lattice_ipc::request(SOCKET, Request::SessionDetails).await {
+        Ok(Response::SessionDetails(v)) => Ok(v),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 // ---- Phase 2: packet inspector ----
 
 #[derive(Serialize)]
@@ -309,6 +352,10 @@ fn main() {
             issue_cert,
             revoke_member,
             designate_relay,
+            crypto_suites,
+            crypto_swap,
+            crypto_stats,
+            session_details,
             capture_start,
             capture_stop,
             capture_status,

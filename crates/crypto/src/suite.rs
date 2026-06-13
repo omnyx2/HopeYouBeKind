@@ -21,8 +21,13 @@ use crate::{CryptoError, Handshake, NoiseSession, TunnelSession};
 /// an `Arc<dyn CryptoSuite>`; one instance is shared across all of a node's
 /// peers (it holds no per-peer state — that lives in the returned objects).
 pub trait CryptoSuite: Send + Sync {
-    /// Short stable name, e.g. `"noise-ik"`. For selection and logging.
+    /// Short stable name, e.g. `"noise-ik-chachapoly"`. For selection + logging.
     fn name(&self) -> &'static str;
+
+    /// The Noise protocol spec this suite negotiates, e.g.
+    /// `"Noise_IK_25519_ChaChaPoly_BLAKE2s"`. The crypto-lab catalogue splits it
+    /// into pattern / DH / AEAD / hash for a side-by-side comparison.
+    fn spec(&self) -> &'static str;
 
     /// Begin a handshake toward a peer whose identity (static public) key we
     /// already know. `payload` is small authenticated data carried in the first
@@ -68,15 +73,58 @@ pub struct Accepted {
     pub peer_payload: Vec<u8>,
 }
 
-/// The default production suite: `Noise_IK_25519_ChaChaPoly_BLAKE2s` with an
-/// explicit-nonce stateless transport + replay window. Wraps the [`Handshake`]
-/// / [`respond`](crate::respond) / [`NoiseSession`] primitives in this crate.
-#[derive(Default, Clone, Copy)]
-pub struct NoiseSuite;
+/// A Noise-IK suite parameterised by its protocol spec — an explicit-nonce
+/// stateless transport + replay window over the chosen DH/AEAD/hash. Wraps the
+/// [`Handshake`] / [`respond`](crate::respond) / [`NoiseSession`] primitives.
+/// The crypto-lab seam: drop in another spec to compare schemes.
+#[derive(Clone, Copy)]
+pub struct NoiseSuite {
+    name: &'static str,
+    spec: &'static str,
+}
+
+/// Default production suite: `Noise_IK_25519_ChaChaPoly_BLAKE2s` (mirrors
+/// WireGuard's AEAD choice).
+pub const NOISE_CHACHAPOLY: NoiseSuite =
+    NoiseSuite::new("noise-ik-chachapoly", "Noise_IK_25519_ChaChaPoly_BLAKE2s");
+
+/// Alternative suite for comparison: AES-256-GCM + SHA-256 (the IPsec/TLS AEAD,
+/// hardware-accelerated on most CPUs).
+pub const NOISE_AESGCM: NoiseSuite =
+    NoiseSuite::new("noise-ik-aesgcm", "Noise_IK_25519_AESGCM_SHA256");
+
+impl NoiseSuite {
+    pub const fn new(name: &'static str, spec: &'static str) -> Self {
+        Self { name, spec }
+    }
+}
+
+impl Default for NoiseSuite {
+    fn default() -> Self {
+        NOISE_CHACHAPOLY
+    }
+}
+
+/// Every suite the node can run, in catalogue order (the first is the default).
+pub fn registry() -> Vec<std::sync::Arc<dyn CryptoSuite>> {
+    vec![
+        std::sync::Arc::new(NOISE_CHACHAPOLY),
+        std::sync::Arc::new(NOISE_AESGCM),
+    ]
+}
+
+/// Look up a suite by its [`CryptoSuite::name`].
+pub fn suite_by_name(name: &str) -> Option<std::sync::Arc<dyn CryptoSuite>> {
+    registry().into_iter().find(|s| s.name() == name)
+}
 
 impl CryptoSuite for NoiseSuite {
     fn name(&self) -> &'static str {
-        "noise-ik"
+        self.name
+    }
+
+    fn spec(&self) -> &'static str {
+        self.spec
     }
 
     fn initiate(
@@ -85,7 +133,7 @@ impl CryptoSuite for NoiseSuite {
         remote_public: &[u8],
         payload: &[u8],
     ) -> Result<(Box<dyn HandshakeState>, Vec<u8>), CryptoError> {
-        let (hs, init) = Handshake::initiate(local_private, remote_public, payload)?;
+        let (hs, init) = Handshake::initiate(local_private, remote_public, payload, self.spec)?;
         Ok((Box::new(NoiseHandshake(hs)), init))
     }
 
@@ -95,7 +143,7 @@ impl CryptoSuite for NoiseSuite {
         init: &[u8],
         payload: &[u8],
     ) -> Result<Accepted, CryptoError> {
-        let pending = crate::respond(local_private, init, payload)?;
+        let pending = crate::respond(local_private, init, payload, self.spec)?;
         Ok(Accepted {
             session: Box::new(pending.session) as Box<dyn TunnelSession>,
             response: pending.response,
@@ -135,7 +183,7 @@ mod tests {
     /// abstraction is sufficient for the engine without naming Noise.
     #[test]
     fn noise_suite_round_trips_via_the_trait() {
-        let suite = NoiseSuite;
+        let suite = NoiseSuite::default();
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
 
@@ -159,5 +207,40 @@ mod tests {
         assert_eq!(b_sess.decrypt(&sealed).unwrap(), b"hello over the suite");
         let sealed = b_sess.encrypt(b"reply").unwrap();
         assert_eq!(a_sess.decrypt(&sealed).unwrap(), b"reply");
+    }
+
+    /// The alternative AES-GCM suite must complete a handshake and carry traffic
+    /// through the same trait — proving the seam supports a second, differently-
+    /// parameterised Noise scheme for the crypto-lab comparison.
+    #[test]
+    fn aesgcm_suite_round_trips_and_reports_stats() {
+        let suite = NOISE_AESGCM;
+        assert_eq!(suite.spec(), "Noise_IK_25519_AESGCM_SHA256");
+        let a = Identity::generate().unwrap();
+        let b = Identity::generate().unwrap();
+
+        let (hs, init) = suite.initiate(a.private_key(), b.public_key(), b"x").unwrap();
+        let accepted = suite.respond(b.private_key(), &init, b"y").unwrap();
+        let (mut a_sess, _) = hs.complete(&accepted.response).unwrap();
+        let mut b_sess = accepted.session;
+
+        let sealed = a_sess.encrypt(b"aes-gcm payload").unwrap();
+        assert_eq!(b_sess.decrypt(&sealed).unwrap(), b"aes-gcm payload");
+        // Session stats reflect the one packet sent + received.
+        assert_eq!(a_sess.stats().send_counter, 1);
+        assert_eq!(b_sess.stats().replay_latest, 1);
+    }
+
+    /// The registry catalogues both suites and `suite_by_name` resolves them; an
+    /// unknown name resolves to nothing.
+    #[test]
+    fn registry_catalogues_and_resolves_suites() {
+        let names: Vec<&str> = registry().iter().map(|s| s.name()).collect();
+        assert_eq!(names, vec!["noise-ik-chachapoly", "noise-ik-aesgcm"]);
+        assert_eq!(
+            suite_by_name("noise-ik-aesgcm").unwrap().spec(),
+            "Noise_IK_25519_AESGCM_SHA256"
+        );
+        assert!(suite_by_name("nope").is_none());
     }
 }
