@@ -188,4 +188,45 @@ mod tests {
             "retrieved over real UDP via request-id demux"
         );
     }
+
+    /// A one-shot bootstrap is fragile: if the bootstrap node restarts it returns
+    /// with an empty routing table and the ring silently breaks. The daemon's
+    /// periodic re-bootstrap must heal it. Here the seed "restarts" (same address,
+    /// emptied buckets); a member re-bootstrapping against it re-teaches it the
+    /// ring, and a fresh joiner resolves a published value through it once more.
+    #[tokio::test]
+    async fn rebootstrap_heals_ring_after_bootstrap_restart() {
+        let (k1, a1) = spawn_node(1).await; // seed / bootstrap node
+        let (k2, _a2) = spawn_node(2).await; // member
+        k2.bootstrap_addrs(&[a1]).await; // join; the seed learns k2
+
+        let mut key = [0u8; 32];
+        key[0] = 2;
+        let cands: Vec<SocketAddr> = vec!["203.0.113.2:51820".parse().unwrap()];
+        k2.publish(key, &cands).await.unwrap();
+
+        // A late joiner resolves the value through the healthy seed.
+        let (k3, _a3) = spawn_node(3).await;
+        k3.bootstrap_addrs(&[a1]).await;
+        assert_eq!(
+            k3.lookup(key).await.unwrap(),
+            cands,
+            "resolves while the ring is healthy"
+        );
+
+        // The seed restarts: same address, empty routing table — it now knows nobody.
+        k1.node().lock().unwrap().reset_routing();
+
+        // Periodic re-bootstrap heals it: the member re-pings the seed (re-teaching
+        // it the member) and republishes; a brand-new joiner then resolves again.
+        k2.bootstrap_addrs(&[a1]).await;
+        k2.publish(key, &cands).await.unwrap();
+        let (k4, _a4) = spawn_node(4).await;
+        k4.bootstrap_addrs(&[a1]).await;
+        assert_eq!(
+            k4.lookup(key).await.unwrap(),
+            cands,
+            "ring healed after re-bootstrap"
+        );
+    }
 }

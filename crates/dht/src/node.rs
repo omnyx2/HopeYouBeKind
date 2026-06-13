@@ -41,6 +41,14 @@ impl KademliaNode {
         self.table.insert(contact);
     }
 
+    /// Drop every learned contact — the routing-table state of a freshly
+    /// (re)started node. Test-only, to simulate a bootstrap node restart and
+    /// verify the ring heals via periodic re-bootstrap.
+    #[cfg(test)]
+    pub(crate) fn reset_routing(&mut self) {
+        self.table = RoutingTable::new(self.id);
+    }
+
     pub fn closest(&self, target: &Key, count: usize) -> Vec<Contact> {
         self.table.closest(target, count)
     }
