@@ -131,6 +131,14 @@ impl Drop for Identity {
 pub trait TunnelSession: Send + Sync {
     fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError>;
     fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// Whether this session should be renegotiated, given how long it has been
+    /// alive (`age`). Surfaces the suite's rekey policy to the engine, which uses
+    /// it to drive a proactive re-handshake (WireGuard's REKEY_AFTER_TIME) for
+    /// forward secrecy and nonce-exhaustion avoidance. The caller owns the clock
+    /// (it tracks each session's creation time). A suite with no rekey policy may
+    /// always return `false`.
+    fn rekey_due(&self, age: std::time::Duration) -> bool;
 }
 
 /// A no-op session that copies bytes through unchanged. **Tests only** — lets us
@@ -144,6 +152,9 @@ impl TunnelSession for PassthroughSession {
     }
     fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         Ok(ciphertext.to_vec())
+    }
+    fn rekey_due(&self, _age: std::time::Duration) -> bool {
+        false // the passthrough test session never rekeys
     }
 }
 

@@ -11,9 +11,12 @@
 //! in-memory fakes in tests — same logic either way.
 //!
 //! v0.2 scope: a peer surfaced by discovery triggers an eager Noise-IK
-//! handshake; once the session is up, overlay packets tunnel through it. Lazy
-//! handshake queueing, rekeying, and lossy-path replay handling are later
-//! milestones (see ROADMAP / PROTOCOL.md).
+//! handshake; once the session is up, overlay packets tunnel through it. Sessions
+//! are renegotiated on WireGuard's timer schedule — proactively rekeyed before
+//! their keys go stale ([`REKEY_TIMEOUT`]-spaced retries off the suite's
+//! [`rekey_due`](lattice_crypto::TunnelSession::rekey_due)) and hard-expired past
+//! [`REJECT_AFTER_TIME`]. Lazy handshake queueing and lossy-path replay handling
+//! are later milestones (see ROADMAP / PROTOCOL.md).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -125,6 +128,10 @@ pub struct Engine {
     /// retransmits) within [`REKEY_TIMEOUT`]; a genuine re-handshake after that is
     /// always honoured, so a peer whose session died can always reconnect.
     last_responded: HashMap<NodeId, Instant>,
+    /// When each live session was established, keyed by its endpoint (parallel to
+    /// `sessions`). Drives session lifetime: the suite's `rekey_due` against this
+    /// age triggers a proactive rekey, and [`REJECT_AFTER_TIME`] forces expiry.
+    established: HashMap<SocketAddr, Instant>,
 }
 
 /// Minimum interval between handshake initiations to one peer, and the window in
@@ -132,6 +139,15 @@ pub struct Engine {
 /// state machine (REKEY_TIMEOUT). Keeps at most one handshake in flight so the
 /// initiator's `pending` isn't churned out from under an arriving response.
 const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A session must not be used past this age — the engine tears it down and forces
+/// a fresh handshake. WireGuard's REJECT_AFTER_TIME. The proactive rekey (driven
+/// by the suite's shorter REKEY_AFTER_TIME, surfaced via
+/// [`TunnelSession::rekey_due`](lattice_crypto::TunnelSession::rekey_due)) renews
+/// the session well before this in the normal case; this is the safety net for
+/// when a rekey can't complete yet keepalives keep the peer off the dead list, so
+/// it never runs indefinitely on stale keys.
+const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 
 impl Engine {
     /// Create a node from an identity, using the default Noise-IK crypto suite.
@@ -172,6 +188,7 @@ impl Engine {
             force_initiate: Arc::new(std::sync::Mutex::new(HashSet::new())),
             last_init: HashMap::new(),
             last_responded: HashMap::new(),
+            established: HashMap::new(),
         }
     }
 
@@ -306,56 +323,74 @@ impl Engine {
         }
 
         // Tie-break: only the node with the smaller id initiates; the other just
-        // waits for the INIT. Without this, both sides handshake at once and the
-        // sessions desync (each overwrites the other) → decrypt errors.
-        //
-        // EXCEPTION — explicitly pinned peers: with a direct `--peer-addr`/
-        // AddPeer pin, reachability can be one-sided (e.g. a port-forwarded
-        // anchor behind NAT). The tie-break's designated initiator might be the
-        // side with no route to the other, so it would never connect. Only the
-        // pinning side has an address, so let it drive the handshake regardless
-        // of id ordering. Safe because the unreachable side's INIT goes nowhere.
-        let pinned = self.force_initiate.lock().unwrap().contains(&peer.id);
-        if !pinned && self.identity.node_id().0 >= peer.id.0 {
-            return Ok(());
-        }
-
-        // WireGuard REKEY_TIMEOUT: keep at most one handshake in flight per peer.
-        // If an INIT we sent is still pending and was sent within REKEY_TIMEOUT,
-        // don't send another — re-initiating overwrites `pending`, so the
-        // responder's reply to the first INIT could never complete it (the
-        // re-init race that left sessions stuck "Connecting" / half-open).
-        let has_pending = peer
-            .endpoints
-            .iter()
-            .any(|ep| self.pending.contains_key(ep));
-        if has_pending
-            && self
-                .last_init
-                .get(&peer.id)
-                .is_some_and(|t| t.elapsed() < REKEY_TIMEOUT)
-        {
+        // waits for the INIT (the pin exception aside). See `should_initiate_to`.
+        if !self.should_initiate_to(&peer.id) {
             return Ok(());
         }
 
         // Identity == public key in v0, so discovery carries everything we need.
-        let public_key = peer.id.0.to_vec();
         let info = PeerInfo {
             id: peer.id,
             virtual_ip: derive_virtual_ip(&peer.id),
-            public_key: public_key.clone(),
+            public_key: peer.id.0.to_vec(),
             endpoints: peer.endpoints.clone(),
             status: PeerStatus::Connecting,
             os: None, // learned from the handshake response
         };
         self.overlay.lock().await.upsert_peer(info)?;
 
+        self.initiate_handshake(peer.id, &peer.endpoints, transport)
+            .await?;
+        tracing::info!(
+            peer = %peer.id.fingerprint(),
+            candidates = peer.endpoints.len(),
+            "handshake initiated"
+        );
+        Ok(())
+    }
+
+    /// Whether this node should be the one to send the handshake INIT to `peer`:
+    /// the id tie-break (the smaller id initiates, so the two sides don't both
+    /// handshake at once and desync their sessions). Exception — an explicitly
+    /// pinned peer: with a direct `--peer-addr`/AddPeer pin, reachability can be
+    /// one-sided (a port-forwarded anchor behind NAT), so the tie-break's chosen
+    /// initiator might have no route. The pinning side holds the address, so it
+    /// drives the handshake regardless of id ordering (the unreachable side's
+    /// INIT goes nowhere anyway).
+    fn should_initiate_to(&self, peer: &NodeId) -> bool {
+        self.force_initiate.lock().unwrap().contains(peer)
+            || self.identity.node_id().0 < peer.0
+    }
+
+    /// Send a handshake INIT toward every candidate `endpoints` at once (hole
+    /// punch — the first to answer wins, its NAT binding is the working path; a
+    /// single unreachable candidate must not abort the others).
+    ///
+    /// Honours WireGuard's "one handshake in flight" rule: if an INIT we sent is
+    /// still pending and was sent within [`REKEY_TIMEOUT`], we don't send another
+    /// — re-initiating overwrites `pending`, so the responder's reply to the
+    /// first INIT could never complete it (the re-init race that left sessions
+    /// stuck "Connecting"). Shared by fresh handshakes and proactive rekeys.
+    async fn initiate_handshake<X: Transport>(
+        &mut self,
+        peer_id: NodeId,
+        endpoints: &[SocketAddr],
+        transport: &X,
+    ) -> Result<(), EngineError> {
+        let has_pending = endpoints.iter().any(|ep| self.pending.contains_key(ep));
+        if has_pending
+            && self
+                .last_init
+                .get(&peer_id)
+                .is_some_and(|t| t.elapsed() < REKEY_TIMEOUT)
+        {
+            return Ok(());
+        }
+
+        let public_key = peer_id.0.to_vec();
         let private = self.identity.private_key().to_vec();
         let meta = self.local_payload();
-        // Hole punch: initiate a handshake toward every candidate endpoint at
-        // once. The first to answer wins — its NAT binding is the working path.
-        // A single unreachable candidate must not abort the others.
-        for &endpoint in &peer.endpoints {
+        for &endpoint in endpoints {
             let (handshake, init_msg) = self.suite.initiate(&private, &public_key, &meta)?;
             let frame = wire::encode(MessageType::HandshakeInit, &init_msg);
             match transport.send_to(&frame, endpoint).await {
@@ -367,12 +402,7 @@ impl Engine {
                 }
             }
         }
-        self.last_init.insert(peer.id, Instant::now());
-        tracing::info!(
-            peer = %peer.id.fingerprint(),
-            candidates = peer.endpoints.len(),
-            "handshake initiated"
-        );
+        self.last_init.insert(peer_id, Instant::now());
         Ok(())
     }
 
@@ -493,6 +523,7 @@ impl Engine {
                 if let Some(&old) = self.connected.get(&peer_id) {
                     if old != from {
                         self.sessions.remove(&old);
+                        self.established.remove(&old);
                         self.last_seen.remove(&old);
                     }
                 }
@@ -507,6 +538,7 @@ impl Engine {
                 };
                 self.overlay.lock().await.upsert_peer(info)?;
                 self.sessions.insert(from, accepted.session);
+                self.established.insert(from, Instant::now());
                 self.connected.insert(peer_id, from);
                 if let Some(serial) = serial {
                     self.peer_serial.insert(peer_id, serial);
@@ -537,6 +569,7 @@ impl Engine {
                     };
 
                     self.sessions.insert(from, session);
+                    self.established.insert(from, Instant::now());
                     if let Some(peer_id) = peer_id {
                         self.connected.insert(peer_id, from);
                         if let Some(serial) = serial {
@@ -606,6 +639,7 @@ impl Engine {
         let mut overlay = self.overlay.lock().await;
         for (id, ep) in revoked {
             self.sessions.remove(&ep);
+            self.established.remove(&ep);
             self.connected.remove(&id);
             self.last_seen.remove(&ep);
             self.peer_serial.remove(&id);
@@ -629,6 +663,7 @@ impl Engine {
         // keep the overlay peers (their endpoints) so the re-init below reconnects.
         if self.resync.swap(false, Ordering::Relaxed) {
             self.sessions.clear();
+            self.established.clear();
             self.pending.clear();
             self.connected.clear();
             self.peer_serial.clear();
@@ -681,6 +716,7 @@ impl Engine {
         }
         for (id, ep) in dead {
             self.sessions.remove(&ep);
+            self.established.remove(&ep);
             self.connected.remove(&id);
             self.last_seen.remove(&ep);
             self.peer_serial.remove(&id);
@@ -689,6 +725,55 @@ impl Engine {
             self.last_init.remove(&id);
             self.last_responded.remove(&id);
             tracing::info!(peer = %id.fingerprint(), "peer timed out, removed");
+        }
+
+        // WireGuard session lifetime. The suite decides when a session's keys are
+        // stale enough to renew (`rekey_due`, its REKEY_AFTER_TIME); the engine
+        // enforces a hard ceiling past which a session must not be used at all
+        // (REJECT_AFTER_TIME). The initiator (id tie-break / pin) drives a
+        // proactive re-handshake while the live session keeps carrying traffic —
+        // the response replaces it in place, so there's no gap. A session that
+        // sails past REJECT_AFTER_TIME (its rekey never completed, yet keepalives
+        // kept it off the dead list above) is torn down to force a fresh one.
+        let mut rekey: Vec<(NodeId, SocketAddr)> = Vec::new();
+        let mut expired: Vec<(NodeId, SocketAddr)> = Vec::new();
+        for (id, ep) in &self.connected {
+            let Some(session) = self.sessions.get(ep) else {
+                continue;
+            };
+            let age = self
+                .established
+                .get(ep)
+                .map_or(Duration::ZERO, |t| now.duration_since(*t));
+            if age >= REJECT_AFTER_TIME {
+                expired.push((*id, *ep));
+            } else if session.rekey_due(age) && self.should_initiate_to(id) {
+                rekey.push((*id, *ep));
+            }
+        }
+        if !expired.is_empty() {
+            let mut overlay = self.overlay.lock().await;
+            for (id, ep) in &expired {
+                self.sessions.remove(ep);
+                self.established.remove(ep);
+                self.connected.remove(id);
+                self.last_seen.remove(ep);
+                self.peer_serial.remove(id);
+                self.last_init.remove(id);
+                self.last_responded.remove(id);
+                // Keep the overlay peer (its endpoints) so the re-init below
+                // reconnects; just mark it Connecting again.
+                overlay.set_status(id, PeerStatus::Connecting);
+                tracing::info!(peer = %id.fingerprint(), "session expired (REJECT_AFTER_TIME) — re-handshaking");
+            }
+        }
+        // Proactively rekey toward the proven connected endpoint (not the full
+        // candidate list — that path already works). The live session stays in
+        // place until the response swaps it, so traffic never stops.
+        for (id, ep) in rekey {
+            if self.initiate_handshake(id, &[ep], transport).await.is_ok() {
+                tracing::debug!(peer = %id.fingerprint(), "proactive rekey initiated");
+            }
         }
 
         // Re-initiate handshakes to known peers we have no live session with, so
@@ -1369,5 +1454,152 @@ mod tests {
             }
         }
         assert!(evicted, "revoking the re-bound member must evict it");
+    }
+
+    use std::sync::atomic::AtomicUsize;
+    use lattice_crypto::{Accepted, CryptoError};
+
+    /// A crypto suite that wraps the real Noise suite but whose sessions report
+    /// `rekey_due` almost immediately, and which counts every handshake it starts.
+    /// Lets us prove the engine *proactively re-handshakes* a live session
+    /// (WireGuard's REKEY_AFTER_TIME) in ~1s instead of the production 120s.
+    struct FastRekeySuite {
+        inner: NoiseSuite,
+        inits: Arc<AtomicUsize>,
+    }
+
+    impl CryptoSuite for FastRekeySuite {
+        fn name(&self) -> &'static str {
+            "fast-rekey"
+        }
+        fn initiate(
+            &self,
+            local_private: &[u8],
+            remote_public: &[u8],
+            payload: &[u8],
+        ) -> Result<(Box<dyn HandshakeState>, Vec<u8>), CryptoError> {
+            self.inits.fetch_add(1, Ordering::Relaxed);
+            let (hs, init) = self.inner.initiate(local_private, remote_public, payload)?;
+            Ok((Box::new(FastRekeyHandshake(hs)), init))
+        }
+        fn respond(
+            &self,
+            local_private: &[u8],
+            init: &[u8],
+            payload: &[u8],
+        ) -> Result<Accepted, CryptoError> {
+            let acc = self.inner.respond(local_private, init, payload)?;
+            Ok(Accepted {
+                session: Box::new(FastRekeySession(acc.session)),
+                response: acc.response,
+                peer_identity: acc.peer_identity,
+                peer_payload: acc.peer_payload,
+            })
+        }
+    }
+
+    struct FastRekeyHandshake(Box<dyn HandshakeState>);
+    impl HandshakeState for FastRekeyHandshake {
+        fn complete(
+            self: Box<Self>,
+            response: &[u8],
+        ) -> Result<(Box<dyn TunnelSession>, Vec<u8>), CryptoError> {
+            let (session, payload) = self.0.complete(response)?;
+            Ok((Box::new(FastRekeySession(session)), payload))
+        }
+    }
+
+    /// Delegates the real crypto but claims to be rekey-due after half a second.
+    struct FastRekeySession(Box<dyn TunnelSession>);
+    impl TunnelSession for FastRekeySession {
+        fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+            self.0.encrypt(plaintext)
+        }
+        fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+            self.0.decrypt(ciphertext)
+        }
+        fn rekey_due(&self, age: Duration) -> bool {
+            age >= Duration::from_millis(500)
+        }
+    }
+
+    /// A live session whose suite reports it rekey-due must be proactively
+    /// re-handshaked by the initiator (WireGuard's REKEY_AFTER_TIME) without the
+    /// peer ever leaving Connected. We prove it by counting handshake initiations:
+    /// after the first connect the count keeps climbing as the engine renews the
+    /// session, and the peer stays Connected throughout (seamless rekey).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_session_is_proactively_rekeyed() {
+        // Make A the smaller-id node so it's the tie-break initiator (and thus the
+        // side that drives the rekey, where we count initiations).
+        let id1 = Identity::generate().unwrap();
+        let id2 = Identity::generate().unwrap();
+        let (id_a, id_b) = if id1.node_id().0 < id2.node_id().0 {
+            (id1, id2)
+        } else {
+            (id2, id1)
+        };
+        let a_nodeid = id_a.node_id();
+        let b_nodeid = id_b.node_id();
+
+        let addr_a: SocketAddr = "10.0.0.1:704".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:704".parse().unwrap();
+        let (ta, tb) = duplex(addr_a, addr_b);
+        let (tun_a, _ha) = MemoryTun::new();
+        let (tun_b, _hb) = MemoryTun::new();
+        let disc_a = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: b_nodeid,
+            endpoints: vec![addr_b],
+        }]);
+        let disc_b = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: a_nodeid,
+            endpoints: vec![addr_a],
+        }]);
+
+        let inits = Arc::new(AtomicUsize::new(0));
+        let suite_a = Arc::new(FastRekeySuite {
+            inner: NoiseSuite,
+            inits: Arc::clone(&inits),
+        });
+        let suite_b = Arc::new(FastRekeySuite {
+            inner: NoiseSuite,
+            inits: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut engine_a = Engine::with_suite(id_a, EngineConfig::default(), suite_a);
+        let mut engine_b = Engine::with_suite(id_b, EngineConfig::default(), suite_b);
+        let a_ctl = engine_a.handle();
+
+        tokio::spawn(async move {
+            let _ = engine_a.run(tun_a, ta, disc_a).await;
+        });
+        tokio::spawn(async move {
+            let _ = engine_b.run(tun_b, tb, disc_b).await;
+        });
+
+        wait_connected(&a_ctl, 1).await;
+        let after_connect = inits.load(Ordering::Relaxed);
+
+        // The rekey fires off the 5s keepalive tick. Within a couple of ticks the
+        // initiator must start at least one more handshake than the initial connect.
+        let mut rekeyed = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if inits.load(Ordering::Relaxed) > after_connect {
+                rekeyed = true;
+                break;
+            }
+        }
+        assert!(
+            rekeyed,
+            "initiator must proactively re-handshake a rekey-due session"
+        );
+        assert!(
+            a_ctl
+                .peers()
+                .await
+                .iter()
+                .any(|p| p.status == PeerStatus::Connected),
+            "rekey must be seamless — the peer stays Connected"
+        );
     }
 }
