@@ -135,15 +135,15 @@ impl NoiseSession {
             rekey: RekeyPolicy::default(),
         }
     }
-
-    /// Whether this session should be renegotiated, given how long it has lived.
-    /// The caller owns the clock (tracks the session's creation time).
-    pub fn rekey_due(&self, age: Duration) -> bool {
-        self.rekey.due(age)
-    }
 }
 
 impl TunnelSession for NoiseSession {
+    /// Whether this session should be renegotiated, given how long it has lived.
+    /// The caller owns the clock (tracks the session's creation time).
+    fn rekey_due(&self, age: Duration) -> bool {
+        self.rekey.due(age)
+    }
+
     fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let nonce = self.send_counter;
         self.send_counter = self.send_counter.wrapping_add(1);
@@ -220,6 +220,28 @@ mod tests {
         let reply = b"pong";
         let sealed = resp_session.encrypt(reply).unwrap();
         assert_eq!(init_session.decrypt(&sealed).unwrap(), reply);
+    }
+
+    /// `rekey_due` must be reachable through the `TunnelSession` trait object the
+    /// engine actually holds (`Box<dyn TunnelSession>`), and reflect the session's
+    /// default age policy — the seam that lets the engine drive proactive rekeys
+    /// without naming a concrete suite.
+    #[test]
+    fn boxed_session_exposes_rekey_due_through_the_trait() {
+        use crate::rekey::DEFAULT_MAX_AGE;
+
+        let a = Identity::generate().unwrap();
+        let b = Identity::generate().unwrap();
+        let (hs, init) = Handshake::initiate(a.private_key(), b.public_key(), b"").unwrap();
+        let pending = respond(b.private_key(), &init, b"").unwrap();
+        let (session, _) = hs.complete(&pending.response).unwrap();
+
+        let boxed: Box<dyn TunnelSession> = Box::new(session);
+        assert!(!boxed.rekey_due(Duration::ZERO), "a fresh session is not due");
+        assert!(
+            boxed.rekey_due(DEFAULT_MAX_AGE),
+            "a session past the max age is due for rekey"
+        );
     }
 
     #[test]
