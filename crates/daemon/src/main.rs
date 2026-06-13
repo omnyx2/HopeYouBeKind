@@ -810,21 +810,31 @@ async fn start_dht(
         tokio::spawn(async move {
             loop {
                 if let Some(net) = handle.network_id() {
-                    if let Some(bytes) = kad.get_record(net.manifest_key()).await {
-                        match NetworkManifest::from_bytes(&bytes) {
+                    match kad.get_record(net.manifest_key()).await {
+                        Some(bytes) => match NetworkManifest::from_bytes(&bytes) {
                             Ok(m) if m.verify(&net).is_ok() => {
+                                tracing::debug!(relays = m.relays().len(), "manifest fetched");
                                 if m.relays().contains(&me) {
                                     // We're designated a relay: forward on our mesh socket.
+                                    if !relay.is_relay_server() {
+                                        tracing::info!("designated as relay — forwarding on mesh socket");
+                                    }
                                     relay.set_relay_server(true);
                                     *relay_id.lock().unwrap() = None;
                                 } else if let Some(&rid) = m.relays().iter().find(|&&r| r != me) {
                                     // Point at the first relay that isn't us and resolves.
-                                    if let Ok(addrs) = kad.lookup(rid).await {
-                                        if let Some(addr) = addrs.first().copied() {
-                                            relay.set_relay(Some(addr));
-                                            *relay_id.lock().unwrap() = Some(rid);
-                                            tracing::debug!(relay = %NodeId(rid).fingerprint(), %addr, "relay selected from manifest");
-                                        }
+                                    match kad.lookup(rid).await {
+                                        Ok(addrs) => match addrs.first().copied() {
+                                            Some(addr) => {
+                                                if relay.current_relay() != Some(addr) {
+                                                    tracing::info!(relay = %NodeId(rid).fingerprint(), %addr, "relay selected from manifest");
+                                                }
+                                                relay.set_relay(Some(addr));
+                                                *relay_id.lock().unwrap() = Some(rid);
+                                            }
+                                            None => tracing::debug!(relay = %NodeId(rid).fingerprint(), "relay designated but its endpoint did not resolve"),
+                                        },
+                                        Err(_) => tracing::debug!("relay endpoint lookup failed"),
                                     }
                                 } else {
                                     relay.set_relay(None);
@@ -833,7 +843,8 @@ async fn start_dht(
                             }
                             Ok(_) => tracing::warn!("network manifest failed verification — ignoring"),
                             Err(_) => tracing::warn!("malformed network manifest in DHT"),
-                        }
+                        },
+                        None => tracing::debug!("no network manifest in DHT yet"),
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;
