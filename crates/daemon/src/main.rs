@@ -113,6 +113,12 @@ struct Args {
     /// binary here to enable it. See docs/ADMIN_CONSOLE.md.
     #[arg(long)]
     admin_allow: Vec<String>,
+
+    /// Crypto suite to start under, by name (e.g. `noise-ik-chachapoly` or
+    /// `noise-ik-aesgcm`). The admin crypto-lab can hot-swap it at runtime; this
+    /// just sets the initial one. Unknown names fall back to the default.
+    #[arg(long)]
+    crypto: Option<String>,
 }
 
 /// Is the calling process allowed to drive the admin packet capture? Same weak
@@ -191,7 +197,17 @@ async fn main() -> Result<()> {
     let config = EngineConfig {
         bind_addr: args.bind.parse()?,
     };
-    let mut engine = Engine::new(identity, config);
+    // Start under the requested crypto suite (the lab can hot-swap later); an
+    // unknown name falls back to the default Noise-IK/ChaChaPoly suite.
+    let suite = args
+        .crypto
+        .as_deref()
+        .and_then(lattice_crypto::suite_by_name)
+        .unwrap_or_else(|| std::sync::Arc::new(lattice_crypto::NoiseSuite::default()));
+    if let Some(name) = &args.crypto {
+        tracing::info!(suite = %suite.name(), requested = %name, "crypto suite selected");
+    }
+    let mut engine = Engine::with_suite(identity, config, suite);
     let virtual_ip = engine.virtual_ip();
 
     tracing::info!(
@@ -570,6 +586,28 @@ async fn main() -> Result<()> {
                 Request::Packets { after } => {
                     if admin_permitted(&caller, &admin_allow) {
                         Response::Packets(handle.packets_since(after))
+                    } else {
+                        admin_denied(&caller, &admin_allow)
+                    }
+                }
+                // Crypto-lab reads are informational (suite names, handshake sizes,
+                // session counters — no plaintext), so they're ungated like status.
+                Request::CryptoSuites => Response::CryptoSuites(handle.crypto_suites()),
+                Request::CryptoCurrent => Response::CryptoSuite(handle.crypto_current()),
+                Request::CryptoStats => Response::CryptoStats(handle.crypto_stats()),
+                Request::SessionDetails => Response::SessionDetails(handle.session_details()),
+                // Swapping the live tunnel crypto is disruptive (drops every
+                // session), so it's gated by the same admin capability as capture.
+                Request::SetCryptoSuite { name } => {
+                    if admin_permitted(&caller, &admin_allow) {
+                        if handle.set_crypto_suite(&name) {
+                            tracing::info!(suite = %name, "crypto suite swapped — re-handshaking all sessions");
+                            Response::Done
+                        } else {
+                            Response::Error {
+                                message: format!("unknown crypto suite: {name}"),
+                            }
+                        }
                     } else {
                         admin_denied(&caller, &admin_allow)
                     }

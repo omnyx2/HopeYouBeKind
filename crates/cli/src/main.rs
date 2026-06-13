@@ -38,6 +38,24 @@ enum Command {
     /// Manage mesh membership (network identity, enrollment, eviction).
     #[command(subcommand)]
     Net(NetCommand),
+    /// Crypto swap-lab: list/compare suites, hot-swap, inspect sessions.
+    #[command(subcommand)]
+    Crypto(CryptoCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum CryptoCommand {
+    /// List the crypto suites this node can run (* = active).
+    List,
+    /// Swap the active crypto suite by name → re-handshakes all sessions.
+    Swap {
+        /// Suite name, e.g. `noise-ik-aesgcm`.
+        name: String,
+    },
+    /// Per-suite handshake comparison (init/resp bytes, median ms).
+    Stats,
+    /// Per-peer live session detail (suite, age, rekey countdown, counters).
+    Sessions,
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,6 +130,12 @@ impl Command {
                 node_id: parse_id(node_id)?,
                 on: !off,
             },
+            Command::Crypto(CryptoCommand::List) => Request::CryptoSuites,
+            Command::Crypto(CryptoCommand::Swap { name }) => Request::SetCryptoSuite {
+                name: name.clone(),
+            },
+            Command::Crypto(CryptoCommand::Stats) => Request::CryptoStats,
+            Command::Crypto(CryptoCommand::Sessions) => Request::SessionDetails,
         })
     }
 }
@@ -227,6 +251,49 @@ fn print_response(response: Response) {
             s.dropped
         ),
         Response::Packets(pkts) => println!("{} packet(s)", pkts.len()),
+        Response::CryptoSuites(suites) => {
+            for s in suites {
+                println!(
+                    "{} {:<22} {}_{}_{}_{}",
+                    if s.active { "*" } else { " " },
+                    s.name,
+                    s.pattern,
+                    s.dh,
+                    s.aead,
+                    s.hash
+                );
+            }
+        }
+        Response::CryptoSuite(s) => println!("{} ({})", s.name, s.aead),
+        Response::CryptoStats(stats) => {
+            if stats.is_empty() {
+                println!("no handshakes recorded yet");
+            }
+            println!("{:<22} {:>6} {:>5} {:>5} {:>8}", "suite", "count", "init", "resp", "median");
+            for s in stats {
+                println!(
+                    "{:<22} {:>6} {:>5} {:>5} {:>6}ms",
+                    s.name, s.handshakes, s.init_bytes, s.resp_bytes, s.median_ms
+                );
+            }
+        }
+        Response::SessionDetails(sessions) => {
+            if sessions.is_empty() {
+                println!("no live sessions");
+            }
+            for s in sessions {
+                println!(
+                    "{}  {:<22} age {}s  rekey in {}s  tx {}  rx {}  rejects {}",
+                    s.peer,
+                    s.suite,
+                    s.age_secs,
+                    s.rekey_in_secs,
+                    s.send_counter,
+                    s.replay_latest,
+                    s.replay_rejects
+                );
+            }
+        }
         Response::Error { message } => eprintln!("error: {message}"),
     }
 }

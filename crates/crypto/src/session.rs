@@ -24,10 +24,12 @@ use std::time::Duration;
 
 use crate::rekey::RekeyPolicy;
 use crate::replay::ReplayWindow;
-use crate::{CryptoError, TunnelSession, NOISE_PARAMS};
+use crate::{CryptoError, SessionStats, TunnelSession};
 
-fn params() -> snow::params::NoiseParams {
-    NOISE_PARAMS.parse().expect("NOISE_PARAMS is a valid spec")
+/// Parse a Noise spec string (e.g. `Noise_IK_25519_ChaChaPoly_BLAKE2s`). The
+/// suite supplies a vetted constant, so a parse failure is a programmer error.
+fn params(spec: &str) -> snow::params::NoiseParams {
+    spec.parse().expect("a valid Noise spec")
 }
 
 /// The initiator side of an in-progress handshake. Hold this between sending the
@@ -55,8 +57,9 @@ impl Handshake {
         local_private: &[u8],
         remote_public: &[u8],
         payload: &[u8],
+        spec: &str,
     ) -> Result<(Self, Vec<u8>), CryptoError> {
-        let mut state = snow::Builder::new(params())
+        let mut state = snow::Builder::new(params(spec))
             .local_private_key(local_private)
             .remote_public_key(remote_public)
             .build_initiator()?;
@@ -84,8 +87,9 @@ pub fn respond(
     local_private: &[u8],
     init: &[u8],
     payload: &[u8],
+    spec: &str,
 ) -> Result<PendingHandshake, CryptoError> {
-    let mut state = snow::Builder::new(params())
+    let mut state = snow::Builder::new(params(spec))
         .local_private_key(local_private)
         .build_responder()?;
 
@@ -124,6 +128,7 @@ pub struct NoiseSession {
     send_counter: u64,
     replay: ReplayWindow,
     rekey: RekeyPolicy,
+    replay_rejects: u64,
 }
 
 impl NoiseSession {
@@ -133,6 +138,7 @@ impl NoiseSession {
             send_counter: 0,
             replay: ReplayWindow::new(),
             rekey: RekeyPolicy::default(),
+            replay_rejects: 0,
         }
     }
 }
@@ -170,10 +176,19 @@ impl TunnelSession for NoiseSession {
             .map_err(|_| CryptoError::AuthFailed)?;
         // Authentic — now drop replays / too-old packets (window is 1-based).
         if !self.replay.check_and_update(nonce.wrapping_add(1)) {
+            self.replay_rejects = self.replay_rejects.wrapping_add(1);
             return Err(CryptoError::AuthFailed);
         }
         out.truncate(n);
         Ok(out)
+    }
+
+    fn stats(&self) -> SessionStats {
+        SessionStats {
+            send_counter: self.send_counter,
+            replay_latest: self.replay.latest(),
+            replay_rejects: self.replay_rejects,
+        }
     }
 }
 
@@ -191,10 +206,10 @@ mod tests {
 
         // 1. initiator → INIT (carrying metadata "macos")
         let (hs, init_msg) =
-            Handshake::initiate(initiator.private_key(), responder.public_key(), b"macos").unwrap();
+            Handshake::initiate(initiator.private_key(), responder.public_key(), b"macos", crate::NOISE_PARAMS).unwrap();
 
         // 2. responder accepts, learns initiator identity + metadata, → RESP
-        let pending = respond(responder.private_key(), &init_msg, b"linux").unwrap();
+        let pending = respond(responder.private_key(), &init_msg, b"linux", crate::NOISE_PARAMS).unwrap();
         assert_eq!(
             pending.remote_static,
             initiator.public_key(),
@@ -232,8 +247,9 @@ mod tests {
 
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
-        let (hs, init) = Handshake::initiate(a.private_key(), b.public_key(), b"").unwrap();
-        let pending = respond(b.private_key(), &init, b"").unwrap();
+        let (hs, init) =
+            Handshake::initiate(a.private_key(), b.public_key(), b"", crate::NOISE_PARAMS).unwrap();
+        let pending = respond(b.private_key(), &init, b"", crate::NOISE_PARAMS).unwrap();
         let (session, _) = hs.complete(&pending.response).unwrap();
 
         let boxed: Box<dyn TunnelSession> = Box::new(session);
@@ -248,8 +264,9 @@ mod tests {
     fn tampered_ciphertext_is_rejected() {
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
-        let (hs, init) = Handshake::initiate(a.private_key(), b.public_key(), b"").unwrap();
-        let pending = respond(b.private_key(), &init, b"").unwrap();
+        let (hs, init) =
+            Handshake::initiate(a.private_key(), b.public_key(), b"", crate::NOISE_PARAMS).unwrap();
+        let pending = respond(b.private_key(), &init, b"", crate::NOISE_PARAMS).unwrap();
         let (mut sa, _) = hs.complete(&pending.response).unwrap();
         let mut sb = pending.session;
 
@@ -265,8 +282,9 @@ mod tests {
     fn tolerates_reordering_and_rejects_replays() {
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
-        let (hs, init) = Handshake::initiate(a.private_key(), b.public_key(), b"").unwrap();
-        let pending = respond(b.private_key(), &init, b"").unwrap();
+        let (hs, init) =
+            Handshake::initiate(a.private_key(), b.public_key(), b"", crate::NOISE_PARAMS).unwrap();
+        let pending = respond(b.private_key(), &init, b"", crate::NOISE_PARAMS).unwrap();
         let (mut sa, _) = hs.complete(&pending.response).unwrap();
         let mut sb = pending.session;
 

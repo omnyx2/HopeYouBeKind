@@ -85,6 +85,88 @@ async function refresh() {
     el("mem-count").textContent = "0";
     renderMembers([]);
   }
+
+  // crypto lab (suites / comparison / live sessions)
+  try {
+    renderSuites(await invoke("crypto_suites"));
+    renderCryptoStats(await invoke("crypto_stats"));
+    renderSessions(await invoke("session_details"));
+  } catch {}
+}
+
+function renderSuites(suites) {
+  const tb = el("crypto-suites");
+  tb.innerHTML = "";
+  for (const s of suites) {
+    const tr = document.createElement("tr");
+    const action = s.active
+      ? `<span class="badge live">active</span>`
+      : `<button class="toggle" data-swap="${s.name}">Use</button>`;
+    tr.innerHTML =
+      `<td class="mono small">${s.active ? "● " : ""}${s.name}</td>` +
+      `<td class="small">${s.pattern}</td>` +
+      `<td class="small">${s.dh}</td>` +
+      `<td class="small">${s.aead}</td>` +
+      `<td class="small">${s.hash}</td>` +
+      `<td class="right">${action}</td>`;
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll("[data-swap]").forEach((btn) => {
+    btn.addEventListener("click", () => swapSuite(btn.dataset.swap));
+  });
+}
+
+function renderCryptoStats(stats) {
+  const tb = el("crypto-stats");
+  if (!stats.length) {
+    tb.innerHTML = `<tr class="empty"><td colspan="5">No handshakes recorded yet.</td></tr>`;
+    return;
+  }
+  tb.innerHTML = "";
+  for (const s of stats) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td class="mono small">${s.name}</td>` +
+      `<td class="right mono">${s.handshakes}</td>` +
+      `<td class="right mono">${s.init_bytes}</td>` +
+      `<td class="right mono">${s.resp_bytes}</td>` +
+      `<td class="right mono">${s.median_ms} ms</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+function renderSessions(sessions) {
+  const tb = el("crypto-sessions");
+  if (!sessions.length) {
+    tb.innerHTML = `<tr class="empty"><td colspan="7">No live sessions.</td></tr>`;
+    return;
+  }
+  tb.innerHTML = "";
+  for (const s of sessions) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td class="mono small">${s.peer}</td>` +
+      `<td class="mono small">${s.suite}</td>` +
+      `<td class="right mono">${s.age_secs}s</td>` +
+      `<td class="right mono">${s.rekey_in_secs}s</td>` +
+      `<td class="right mono">${s.send_counter}</td>` +
+      `<td class="right mono">${s.replay_latest}</td>` +
+      `<td class="right mono">${s.replay_rejects}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function swapSuite(name) {
+  if (!confirm(`Swap the live tunnel crypto to ${name}?\n\nEvery session drops and re-handshakes under the new suite. All nodes must run the same suite to stay connected.`)) {
+    return;
+  }
+  try {
+    await invoke("crypto_swap", { name });
+    toast(`Swapped to ${name}.`);
+    refresh();
+  } catch (e) {
+    toast(String(e));
+  }
 }
 
 function renderPeers(peers) {
