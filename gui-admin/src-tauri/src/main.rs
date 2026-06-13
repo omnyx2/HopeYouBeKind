@@ -222,6 +222,29 @@ async fn session_details() -> Result<Vec<lattice_proto::ipc::SessionDetail>, Str
     }
 }
 
+/// Bench: seal plaintext with the active suite → ciphertext hex.
+#[tauri::command]
+async fn crypto_encrypt(text: String) -> Result<String, String> {
+    match lattice_ipc::request(SOCKET, Request::CryptoEncrypt { text }).await {
+        Ok(Response::CryptoBytes { hex }) => Ok(hex),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Bench: open a ciphertext hex with the active suite → plaintext (or an error if
+/// rejected — tampered/replayed/past a time-window cipher's window).
+#[tauri::command]
+async fn crypto_decrypt(hex: String) -> Result<String, String> {
+    match lattice_ipc::request(SOCKET, Request::CryptoDecrypt { hex }).await {
+        Ok(Response::CryptoText { text }) => Ok(text),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 // ---- Phase 2: packet inspector ----
 
 #[derive(Serialize)]
@@ -356,6 +379,8 @@ fn main() {
             crypto_swap,
             crypto_stats,
             session_details,
+            crypto_encrypt,
+            crypto_decrypt,
             capture_start,
             capture_stop,
             capture_status,

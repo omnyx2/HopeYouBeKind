@@ -147,6 +147,26 @@
             <tbody id="crypto-suites"><tr class="empty"><td colspan="6">Loading…</td></tr></tbody>
           </table>
 
+          <h2 class="sec">Encrypt / decrypt bench</h2>
+          <p class="panel-sub" style="margin-bottom:10px">Seal a plaintext with the active suite and read the ciphertext; decrypt a ciphertext back. Self-contained (not the live tunnel). Encrypt now and decrypt later — a time-window cipher will refuse it once its window passes.</p>
+          <div class="bench">
+            <div class="bench-col">
+              <label class="bench-lbl">Plaintext</label>
+              <textarea id="bench-pt" class="text bench-area" placeholder="type a message…" spellcheck="false"></textarea>
+              <button id="bench-enc" class="primary">Encrypt →</button>
+              <label class="bench-lbl">Ciphertext (hex)</label>
+              <textarea id="bench-ct-out" class="text bench-area mono small" placeholder="ciphertext appears here" spellcheck="false" readonly></textarea>
+              <div class="bench-meta"><span id="bench-enc-meta" class="muted small">—</span> <button id="bench-copy" class="secondary">Copy</button> <button id="bench-to-dec" class="secondary">↓ send to decrypt</button></div>
+            </div>
+            <div class="bench-col">
+              <label class="bench-lbl">Ciphertext (hex)</label>
+              <textarea id="bench-ct-in" class="text bench-area mono small" placeholder="paste ciphertext hex…" spellcheck="false"></textarea>
+              <button id="bench-dec" class="primary">Decrypt →</button>
+              <label class="bench-lbl">Result</label>
+              <div id="bench-dec-out" class="bench-result muted">—</div>
+            </div>
+          </div>
+
           <h2 class="sec">Handshake comparison</h2>
           <table class="grid">
             <thead><tr><th>Suite</th><th class="right">Handshakes</th><th class="right">Init bytes</th><th class="right">Resp bytes</th><th class="right">Median</th></tr></thead>

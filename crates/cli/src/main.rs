@@ -56,6 +56,17 @@ enum CryptoCommand {
     Stats,
     /// Per-peer live session detail (suite, age, rekey countdown, counters).
     Sessions,
+    /// Bench: encrypt text with the active suite → prints the ciphertext hex.
+    Encrypt {
+        /// Plaintext to seal.
+        text: String,
+    },
+    /// Bench: decrypt a ciphertext hex with the active suite → prints the plaintext
+    /// (or "rejected" if tampered/replayed/past a time-window cipher's window).
+    Decrypt {
+        /// Ciphertext as hex (from `crypto encrypt`).
+        hex: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -136,6 +147,12 @@ impl Command {
             },
             Command::Crypto(CryptoCommand::Stats) => Request::CryptoStats,
             Command::Crypto(CryptoCommand::Sessions) => Request::SessionDetails,
+            Command::Crypto(CryptoCommand::Encrypt { text }) => Request::CryptoEncrypt {
+                text: text.clone(),
+            },
+            Command::Crypto(CryptoCommand::Decrypt { hex }) => Request::CryptoDecrypt {
+                hex: hex.clone(),
+            },
         })
     }
 }
@@ -277,6 +294,8 @@ fn print_response(response: Response) {
                 );
             }
         }
+        Response::CryptoBytes { hex } => println!("{hex}"),
+        Response::CryptoText { text } => println!("{text}"),
         Response::SessionDetails(sessions) => {
             if sessions.is_empty() {
                 println!("no live sessions");

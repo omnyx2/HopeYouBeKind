@@ -67,6 +67,12 @@ pub enum Request {
     CryptoStats,
     /// Admin: per-peer live session detail (suite, age, rekey countdown, counters).
     SessionDetails,
+    /// Crypto bench: seal `text` with the active suite → returns the ciphertext
+    /// hex. Self-contained test harness, not the live tunnel.
+    CryptoEncrypt { text: String },
+    /// Crypto bench: open ciphertext `hex` with the active suite → plaintext, or an
+    /// error if it's rejected (tampered/replayed/past a time-window cipher's window).
+    CryptoDecrypt { hex: String },
     /// Health check: every virtual IP on the mesh (this node + all peers) in one
     /// shot. SECURITY-SENSITIVE — it hands out the whole network's address map,
     /// so the daemon only answers a caller whose process name is on its
@@ -113,6 +119,10 @@ pub enum Response {
     CryptoStats(Vec<SuiteStat>),
     /// Per-peer live session detail (from `SessionDetails`).
     SessionDetails(Vec<SessionDetail>),
+    /// Ciphertext (hex) from a `CryptoEncrypt` bench probe.
+    CryptoBytes { hex: String },
+    /// Plaintext from a `CryptoDecrypt` bench probe.
+    CryptoText { text: String },
     /// A join token (hex-encoded membership cert) handed back from `IssueCert`.
     Token(String),
     /// A command that returns no data succeeded.

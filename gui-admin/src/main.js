@@ -169,6 +169,34 @@ async function swapSuite(name) {
   }
 }
 
+// ---- crypto bench (encrypt / decrypt) ----
+el("bench-enc").addEventListener("click", async () => {
+  const pt = el("bench-pt").value;
+  if (!pt) { toast("Type a plaintext first."); return; }
+  try {
+    const hex = await invoke("crypto_encrypt", { text: pt });
+    el("bench-ct-out").value = hex;
+    let suite = "";
+    try { suite = (await invoke("crypto_suites")).find((s) => s.active)?.name ?? ""; } catch {}
+    el("bench-enc-meta").textContent = `${hex.length / 2} bytes · ${suite} · ${new Date().toLocaleTimeString()}`;
+  } catch (e) { toast(String(e)); }
+});
+el("bench-copy").addEventListener("click", () => copy(el("bench-ct-out").value));
+el("bench-to-dec").addEventListener("click", () => { el("bench-ct-in").value = el("bench-ct-out").value; });
+el("bench-dec").addEventListener("click", async () => {
+  const hex = el("bench-ct-in").value.trim();
+  const out = el("bench-dec-out");
+  if (!hex) { toast("Paste a ciphertext first."); return; }
+  try {
+    const text = await invoke("crypto_decrypt", { hex });
+    out.className = "bench-result ok";
+    out.textContent = text || "(empty plaintext)";
+  } catch (e) {
+    out.className = "bench-result bad";
+    out.textContent = "✗ " + String(e);
+  }
+});
+
 function renderPeers(peers) {
   const tb = el("ov-peers");
   if (!peers.length) {
