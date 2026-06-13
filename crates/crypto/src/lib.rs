@@ -12,6 +12,7 @@ use lattice_proto::NodeId;
 use zeroize::Zeroize;
 
 pub mod cookie;
+pub mod custom;
 pub mod rekey;
 pub mod replay;
 pub mod session;

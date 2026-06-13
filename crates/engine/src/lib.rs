@@ -1907,7 +1907,7 @@ mod tests {
         // Catalogue + current suite + comparison stats all report ChaChaPoly.
         assert_eq!(a_ctl.crypto_current().name, "noise-ik-chachapoly");
         let cat = a_ctl.crypto_suites();
-        assert_eq!(cat.len(), 2, "two suites in the catalogue");
+        assert!(cat.len() >= 2, "at least the two Noise suites in the catalogue");
         assert!(cat.iter().any(|s| s.name == "noise-ik-aesgcm" && !s.active));
         // Session inspector eventually reflects the live session (refreshed on tick).
         let mut saw_chacha = false;

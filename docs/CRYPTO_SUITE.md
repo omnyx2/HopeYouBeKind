@@ -64,18 +64,58 @@ must:
    integrity-protected with no in-order assumption (the default uses an explicit
    per-packet nonce + a sliding replay window).
 
-## Implementing a research suite
+## Drop in your own cipher — START HERE
 
-1. Add a type that implements `CryptoSuite` (and a `HandshakeState` for the
-   initiator side, and a `TunnelSession` for the live session). Build on vetted
-   primitives — don't hand-roll ciphers.
-2. Inject it: `Engine::with_suite(identity, config, Arc::new(MySuite))` instead of
-   `Engine::new(...)` (which defaults to `NoiseSuite`). Both ends of a tunnel must
-   run the same suite — it changes the wire handshake.
+There is a ready-to-edit template: **`crates/crypto/src/custom.rs`** (`CustomSuite`
+/ `CustomSession`). It already compiles, is registered, and works in the admin
+crypto bench. You write your algorithm in **two places**, both clearly marked with
+`▼▼▼ YOUR … ALGORITHM GOES HERE ▼▼▼` banners:
 
-The default `NoiseSuite` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) is a thin wrapper
-over `crates/crypto`'s existing handshake/session primitives — a good reference
-for what a suite has to provide.
+| Edit | Location | What goes there |
+| --- | --- | --- |
+| **1** | `CustomSession::encrypt` (`custom.rs`) | your encryption — return ciphertext bytes, embedding whatever `decrypt` needs (a nonce/counter, and a timestamp if your scheme has a time window) |
+| **2** | `CustomSession::decrypt` (`custom.rs`) | your decryption — and **return `Err(CryptoError::AuthFailed)` once your time window has passed**; that `Err` is what makes the data unrecoverable (the bench shows "✗ rejected") |
+
+Optional knobs in the same file: `WINDOW` (the demo time window), `from_handshake`
+(how the session key is derived — see its note on confidentiality), and
+`CustomSuite::{name, spec}` (rename your suite; `name()` is the `crypto swap`
+selector). You normally **keep the Noise-IK handshake** for key agreement + peer
+authentication and only write the session cipher.
+
+To register a *second* suite (or rename), add `Arc::new(YourSuite)` to `registry()`
+in `crates/crypto/src/suite.rs`.
+
+### Build → swap → test loop
+
+```text
+cargo build -p lattice-daemon -p lattice-cli     # compile your cipher in
+# restart the daemon (Stop the Windows daemon BEFORE building — it locks the .exe)
+lattice crypto swap custom-template              # make it the active suite (rename as you like)
+lattice crypto encrypt "hello"                   # → ciphertext hex
+lattice crypto decrypt <hex>                     # → hello       (within the window)
+#   …wait past your WINDOW…
+lattice crypto decrypt <hex>                     # → rejected    (data unrecoverable)
+```
+
+Or use the admin console → **Crypto Lab → "Encrypt / decrypt bench"** (plaintext →
+ciphertext, ciphertext → plaintext or ✗ rejected). The bench is self-contained (a
+local session pair under the active suite), so you don't need two real nodes to
+test the cipher. Keep the bench session alive between an encrypt and a later
+decrypt — don't swap suites or restart in between, or the pair is rebuilt.
+
+The default `NoiseSuite` (`Noise_IK_25519_ChaChaPoly_BLAKE2s`,
+`crates/crypto/src/suite.rs`) is the reference implementation built on the crate's
+vetted primitives. Build on vetted primitives — don't hand-roll ciphers unless
+that *is* the research.
+
+## Implementing a research suite (manual injection)
+
+Outside the registry/bench flow you can also inject a suite directly:
+`Engine::with_suite(identity, config, Arc::new(MySuite))` instead of
+`Engine::new(...)`. The daemon's `--crypto <name>` flag resolves a registered
+suite at startup; the admin `SetCryptoSuite` IPC / `lattice crypto swap` hot-swaps
+it at runtime (dropping + re-handshaking every session). Both ends of a tunnel
+must run the same suite — it changes the wire handshake.
 
 ## Why it's a clean seam
 
@@ -88,7 +128,13 @@ for what a suite has to provide.
 
 ## Status
 
-`CryptoSuite` / `NoiseSuite` are implemented and the engine is fully on the trait
-(`crates/crypto/src/suite.rs`, `crates/engine`). Suite **selection by config/flag**
-(`--crypto <name>`) and a registry of research suites are not wired yet — today
-you choose the suite in code via `Engine::with_suite`.
+Fully wired. `CryptoSuite` / `TunnelSession` (`crates/crypto/src/suite.rs`,
+`lib.rs`) drive the engine; a **registry** (`registry()` / `suite_by_name()`) lists
+the available suites — `noise-ik-chachapoly` (default), `noise-ik-aesgcm`, and the
+`custom-template` scaffold. **Selection** is wired three ways: the `--crypto <name>`
+daemon flag (startup), `lattice crypto swap <name>` / the admin `SetCryptoSuite`
+IPC (runtime hot-swap → drops + re-handshakes every session), and
+`Engine::with_suite` (in code). The admin **Crypto Lab** adds a side-by-side
+handshake comparison, a live session inspector, and an **encrypt/decrypt bench**
+(`lattice crypto encrypt|decrypt`) for testing a cipher in isolation — including
+"encrypt now, decrypt later" for time-window schemes.

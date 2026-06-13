@@ -106,10 +106,14 @@ impl Default for NoiseSuite {
 }
 
 /// Every suite the node can run, in catalogue order (the first is the default).
+/// ★ Register your own cipher here — add `std::sync::Arc::new(YourSuite)`. The
+/// `crate::custom::CustomSuite` template is included so `crypto swap custom-template`
+/// works out of the box (see crates/crypto/src/custom.rs + docs/CRYPTO_SUITE.md).
 pub fn registry() -> Vec<std::sync::Arc<dyn CryptoSuite>> {
     vec![
         std::sync::Arc::new(NOISE_CHACHAPOLY),
         std::sync::Arc::new(NOISE_AESGCM),
+        std::sync::Arc::new(crate::custom::CustomSuite),
     ]
 }
 
@@ -236,7 +240,10 @@ mod tests {
     #[test]
     fn registry_catalogues_and_resolves_suites() {
         let names: Vec<&str> = registry().iter().map(|s| s.name()).collect();
-        assert_eq!(names, vec!["noise-ik-chachapoly", "noise-ik-aesgcm"]);
+        assert_eq!(
+            names,
+            vec!["noise-ik-chachapoly", "noise-ik-aesgcm", "custom-template"]
+        );
         assert_eq!(
             suite_by_name("noise-ik-aesgcm").unwrap().spec(),
             "Noise_IK_25519_AESGCM_SHA256"
