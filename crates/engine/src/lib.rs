@@ -840,13 +840,18 @@ impl Engine {
             .map(|(id, _)| *id)
     }
 
-    /// Find which known peer currently lives at `endpoint`.
+    /// Find which known peer currently lives at `endpoint`. Matches *any* of a
+    /// peer's candidate endpoints, not just the first: a handshake response can
+    /// arrive on whichever candidate won the multi-endpoint race — a non-first
+    /// direct candidate, or the relay's synthetic endpoint (appended last). If we
+    /// only matched the first, we'd fail to identify the peer and reject its
+    /// (valid) membership cert as "bound to a different node".
     async fn peer_id_at(&self, endpoint: SocketAddr) -> Option<NodeId> {
         self.overlay
             .lock()
             .await
             .peers()
-            .find(|p| p.endpoints.first() == Some(&endpoint))
+            .find(|p| p.endpoints.contains(&endpoint))
             .map(|p| p.id)
     }
 }
