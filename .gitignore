@@ -34,3 +34,4 @@ Thumbs.db
 !.vscode/extensions.json
 *.swp
 /dist-linux
+ssh-key-2026-06-13.key*

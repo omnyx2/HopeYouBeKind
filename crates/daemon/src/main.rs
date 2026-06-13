@@ -119,6 +119,14 @@ struct Args {
     /// just sets the initial one. Unknown names fall back to the default.
     #[arg(long)]
     crypto: Option<String>,
+
+    /// Explicit public endpoint `<ip:port>` to advertise to the DHT, instead of
+    /// the STUN-discovered reflexive address. Set this on a publicly-reachable
+    /// anchor (public-IP VPS or a port-forwarded host) — especially on clouds
+    /// whose outbound source-port PAT makes the STUN port differ from the fixed
+    /// inbound port (e.g. Oracle: `--public-addr <vps-ip>:41000`).
+    #[arg(long)]
+    public_addr: Option<String>,
 }
 
 /// Lowercase hex of bytes — for the crypto bench ciphertext over IPC.
@@ -128,6 +136,31 @@ fn to_hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Choose which of a relay's published candidates to dial. A relay must be
+/// reachable across networks, so a globally-routable (public) address is
+/// preferred over a LAN/private one — the latter only works on the relay's own
+/// subnet and is useless to an off-net peer (e.g. a public anchor publishes both
+/// `10.0.0.x:port` and its public `1:1`-NAT address; we must pick the public one).
+/// Falls back to the first candidate if none look public.
+fn pick_relay_addr(addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
+        ip.is_private()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            // CGNAT / carrier-grade NAT shared space 100.64.0.0/10.
+            || matches!(ip.octets(), [100, b, ..] if (64..=127).contains(&b))
+    }
+    addrs
+        .iter()
+        .find(|a| match a.ip() {
+            std::net::IpAddr::V4(v4) => !is_private_v4(v4),
+            std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+        })
+        .copied()
+        .or_else(|| addrs.first().copied())
 }
 
 /// Parse lowercase/uppercase hex into bytes (tolerates internal whitespace so a
@@ -311,10 +344,21 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Best-effort: learn our public (reflexive) address via STUN — a WAN
-    // candidate we publish to the DHT for NAT hole punching.
-    let reflexive: Option<SocketAddr> =
-        match lattice_net::nat::reflexive_address("stun.l.google.com:19302").await {
+    // Our WAN candidate published to the DHT for peers to reach us. A node with a
+    // known reachable endpoint (a public-IP anchor / a port-forward) sets
+    // `--public-addr <ip:port>` explicitly — important on clouds (e.g. Oracle)
+    // whose outbound source-port PAT makes the STUN reflexive differ from the
+    // fixed inbound port. Otherwise we discover it best-effort via STUN.
+    let public_override: Option<SocketAddr> = args
+        .public_addr
+        .as_deref()
+        .and_then(|s| s.parse().ok());
+    let reflexive: Option<SocketAddr> = match public_override {
+        Some(addr) => {
+            tracing::info!(%addr, "public address (explicit --public-addr)");
+            Some(addr)
+        }
+        None => match lattice_net::nat::reflexive_address("stun.l.google.com:19302").await {
             Ok(public) => {
                 tracing::info!(%public, "public address (STUN)");
                 Some(public)
@@ -323,7 +367,8 @@ async fn main() -> Result<()> {
                 tracing::debug!(error = %e, "STUN lookup failed (LAN-only or offline)");
                 None
             }
-        };
+        },
+    };
     if let Some(public) = reflexive {
         engine.handle().set_public_addr(public);
     }
@@ -899,7 +944,7 @@ async fn start_dht(
                                 } else if let Some(&rid) = m.relays().iter().find(|&&r| r != me) {
                                     // Point at the first relay that isn't us and resolves.
                                     match kad.lookup(rid).await {
-                                        Ok(addrs) => match addrs.first().copied() {
+                                        Ok(addrs) => match pick_relay_addr(&addrs) {
                                             Some(addr) => {
                                                 if relay.current_relay() != Some(addr) {
                                                     tracing::info!(relay = %NodeId(rid).fingerprint(), %addr, "relay selected from manifest");

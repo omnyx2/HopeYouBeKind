@@ -49,6 +49,20 @@ impl KademliaNode {
         self.table = RoutingTable::new(self.id);
     }
 
+    /// A signed control-plane record we hold locally, if any. A node that was
+    /// pushed a record (via `StoreRecord`) can serve it without a network query —
+    /// essential when the publisher is reachable to us but our query back to it is
+    /// not (asymmetric NAT: a public anchor receives pushes but can't always dial
+    /// the NATed publisher back).
+    pub fn local_record(&self, key: &Key) -> Option<Vec<u8>> {
+        self.records.get(key).cloned()
+    }
+
+    /// Addresses we hold locally for `key` (same rationale as `local_record`).
+    pub fn local_value(&self, key: &Key) -> Option<Vec<SocketAddr>> {
+        self.store.get(key).cloned()
+    }
+
     pub fn closest(&self, target: &Key, count: usize) -> Vec<Contact> {
         self.table.closest(target, count)
     }
@@ -257,8 +271,12 @@ impl Kademlia {
     }
 
     /// Fetch a control-plane record by `key` via an iterative lookup, or `None` if
-    /// no node holds it.
+    /// no node holds it. Checks our own store first — a record pushed to us is
+    /// served without a network round-trip (and survives an unreachable publisher).
     pub async fn get_record(&self, key: Key) -> Option<Vec<u8>> {
+        if let Some(v) = self.node.lock().unwrap().local_record(&key) {
+            return Some(v);
+        }
         let mut shortlist: Vec<Contact> = self.node.lock().unwrap().closest(&key, K);
         let mut queried: HashSet<Key> = HashSet::new();
         loop {
@@ -337,6 +355,11 @@ impl lattice_net::nat::Rendezvous for Kademlia {
     }
 
     async fn lookup(&self, node_id: [u8; 32]) -> Result<Vec<SocketAddr>, lattice_net::NetError> {
+        // Serve from our own store first (a peer that pushed its candidates to us
+        // resolves without a network round-trip / despite an unreachable publisher).
+        if let Some(addrs) = self.node.lock().unwrap().local_value(&node_id) {
+            return Ok(addrs);
+        }
         Ok(self.iterative(&node_id, true).await.0.unwrap_or_default())
     }
 }
