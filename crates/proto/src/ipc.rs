@@ -50,6 +50,9 @@ pub enum Request {
     },
     /// Admin only: evict a member (revoke its certificate) by node id.
     RevokeMember { node_id: NodeId },
+    /// Admin only: designate (or undesignate) a member as a relay. Published in
+    /// the signed `NetworkManifest`; nodes route unreachable pairs through it.
+    DesignateRelay { node_id: NodeId, on: bool },
     /// Admin only: list the members this node's CA has issued certs to.
     Members,
     /// Health check: every virtual IP on the mesh (this node + all peers) in one
@@ -214,6 +217,9 @@ pub struct MemberEntry {
     pub serial: u64,
     pub label: Option<String>,
     pub revoked: bool,
+    /// Whether the admin has designated this member as a relay.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 /// One aggregated traffic flow observed crossing the tunnel. The engine groups

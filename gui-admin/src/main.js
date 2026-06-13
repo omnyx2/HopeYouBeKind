@@ -118,9 +118,12 @@ function renderMembers(members) {
     const status = m.revoked
       ? `<span class="badge revoked">revoked</span>`
       : `<span class="badge live">live</span>`;
+    const relayBtn = m.revoked
+      ? ""
+      : `<button class="${m.relay ? "toggle on" : "toggle"}" data-relay="${m.node_id}" data-on="${m.relay ? "0" : "1"}" data-fp="${m.fingerprint}">${m.relay ? "Relay ✓" : "Make relay"}</button> `;
     const action = m.revoked
       ? `<button class="danger" disabled>evicted</button>`
-      : `<button class="danger" data-revoke="${m.node_id}" data-fp="${m.fingerprint}">Evict</button>`;
+      : `${relayBtn}<button class="danger" data-revoke="${m.node_id}" data-fp="${m.fingerprint}">Evict</button>`;
     tr.innerHTML =
       `<td class="mono small">${m.fingerprint}</td>` +
       `<td class="mono small copy" title="click to copy" data-copy="${m.node_id}">${m.node_id.slice(0, 18)}…</td>` +
@@ -130,9 +133,14 @@ function renderMembers(members) {
       `<td class="right">${action}</td>`;
     tb.appendChild(tr);
   }
-  // wire up revoke + copy
+  // wire up revoke + relay + copy
   tb.querySelectorAll("[data-revoke]").forEach((btn) => {
     btn.addEventListener("click", () => revoke(btn.dataset.revoke, btn.dataset.fp));
+  });
+  tb.querySelectorAll("[data-relay]").forEach((btn) => {
+    btn.addEventListener("click", () =>
+      designateRelay(btn.dataset.relay, btn.dataset.on === "1", btn.dataset.fp)
+    );
   });
   tb.querySelectorAll("[data-copy]").forEach((c) => {
     c.addEventListener("click", () => copy(c.dataset.copy));
@@ -172,6 +180,16 @@ async function revoke(nodeId, fp) {
   try {
     await invoke("revoke_member", { nodeId });
     toast(`Evicted ${fp}.`);
+    refresh();
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+async function designateRelay(nodeId, on, fp) {
+  try {
+    await invoke("designate_relay", { nodeId, on });
+    toast(on ? `${fp} is now a relay.` : `${fp} is no longer a relay.`);
     refresh();
   } catch (e) {
     toast(String(e));

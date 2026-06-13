@@ -62,6 +62,15 @@ enum NetCommand {
         /// The member's 64-hex node id.
         node_id: String,
     },
+    /// Admin: designate (or with --off, undesignate) a member as a relay for
+    /// peers that can't connect directly. Published in the signed manifest.
+    Relay {
+        /// The member's 64-hex node id.
+        node_id: String,
+        /// Remove the relay designation instead of adding it.
+        #[arg(long)]
+        off: bool,
+    },
     /// Admin: list members this node's CA has enrolled.
     Members,
 }
@@ -98,6 +107,10 @@ impl Command {
             },
             Command::Net(NetCommand::Revoke { node_id }) => Request::RevokeMember {
                 node_id: parse_id(node_id)?,
+            },
+            Command::Net(NetCommand::Relay { node_id, off }) => Request::DesignateRelay {
+                node_id: parse_id(node_id)?,
+                on: !off,
             },
         })
     }
@@ -183,11 +196,12 @@ fn print_response(response: Response) {
             }
             for m in members {
                 println!(
-                    "{}  serial {:<4} {:<16} {}",
+                    "{}  serial {:<4} {:<16} {}{}",
                     m.fingerprint,
                     m.serial,
                     m.label.as_deref().unwrap_or("-"),
-                    if m.revoked { "REVOKED" } else { "active" }
+                    if m.revoked { "REVOKED" } else { "active" },
+                    if m.relay { "  [relay]" } else { "" }
                 );
             }
         }
