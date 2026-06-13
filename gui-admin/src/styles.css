@@ -108,6 +108,14 @@ button.danger {
 }
 button.danger:hover { background: rgba(224,82,96,0.14); border-color: var(--bad); }
 button.danger:disabled { opacity: 0.4; cursor: default; }
+button.toggle {
+  padding: 5px 12px; border: 1px solid var(--line); border-radius: 8px;
+  background: transparent; color: var(--muted); font-size: 12px; cursor: pointer;
+}
+button.toggle:hover { border-color: var(--off); background: #1f2430; }
+button.toggle.on {
+  border-color: rgba(52,211,153,0.5); color: #5fe0b0; background: rgba(52,211,153,0.12);
+}
 
 /* inputs */
 .field { display: flex; flex-direction: column; gap: 5px; }

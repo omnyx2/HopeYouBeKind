@@ -56,6 +56,7 @@ struct MemberView {
     serial: u64,
     label: Option<String>,
     revoked: bool,
+    relay: bool,
 }
 
 #[tauri::command]
@@ -122,6 +123,7 @@ async fn list_members() -> Result<Vec<MemberView>, String> {
                 serial: m.serial,
                 label: m.label,
                 revoked: m.revoked,
+                relay: m.relay,
             })
             .collect()),
         Ok(Response::Error { message }) => Err(message),
@@ -157,6 +159,19 @@ async fn issue_cert(node_id: String, label: Option<String>) -> Result<String, St
 async fn revoke_member(node_id: String) -> Result<(), String> {
     let id = parse_node_id(node_id.trim()).ok_or("invalid node id (need 64 hex chars)")?;
     match lattice_ipc::request(SOCKET, Request::RevokeMember { node_id: id }).await {
+        Ok(Response::Done) => Ok(()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Admin: designate (or undesignate) a member as a relay. Published in the signed
+/// network manifest; nodes that can't connect directly route through it.
+#[tauri::command]
+async fn designate_relay(node_id: String, on: bool) -> Result<(), String> {
+    let id = parse_node_id(node_id.trim()).ok_or("invalid node id (need 64 hex chars)")?;
+    match lattice_ipc::request(SOCKET, Request::DesignateRelay { node_id: id, on }).await {
         Ok(Response::Done) => Ok(()),
         Ok(Response::Error { message }) => Err(message),
         Ok(_) => Err("unexpected response".into()),
@@ -293,6 +308,7 @@ fn main() {
             list_members,
             issue_cert,
             revoke_member,
+            designate_relay,
             capture_start,
             capture_stop,
             capture_status,

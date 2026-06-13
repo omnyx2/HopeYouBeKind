@@ -18,12 +18,12 @@ use lattice_net::discovery::{ChannelDiscovery, MdnsDiscovery};
 use lattice_net::nat::Rendezvous;
 use lattice_net::udp::UdpTransport;
 use lattice_net::{DiscoveredPeer, Discovery, Transport};
-use lattice_proto::{NodeId, OVERLAY_SUBNET};
+use lattice_proto::{NodeId, PeerStatus, OVERLAY_SUBNET};
 use lattice_tun::TunConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use lattice_membership::MemberCert;
+use lattice_membership::{MemberCert, NetworkManifest};
 
 mod exit;
 mod membership;
@@ -319,6 +319,7 @@ async fn main() -> Result<()> {
             disc_tx.clone(),
             admin.clone(),
             engine.handle(),
+            std::sync::Arc::clone(&transport),
         )
         .await
         {
@@ -471,6 +472,20 @@ async fn main() -> Result<()> {
                         message: "not an admin node".into(),
                     },
                 },
+                Request::DesignateRelay { node_id, on } => match &admin {
+                    Some(a) => {
+                        if a.lock().unwrap().set_relay(&node_id, on) {
+                            Response::Done
+                        } else {
+                            Response::Error {
+                                message: "no such member to designate".into(),
+                            }
+                        }
+                    }
+                    None => Response::Error {
+                        message: "not an admin node".into(),
+                    },
+                },
                 Request::Members => match &admin {
                     Some(a) => {
                         let members = a
@@ -484,6 +499,7 @@ async fn main() -> Result<()> {
                                 serial: m.serial,
                                 label: m.label.clone(),
                                 revoked: m.revoked,
+                                relay: m.relay,
                             })
                             .collect();
                         Response::Members(members)
@@ -661,6 +677,7 @@ async fn start_dht(
     disc_tx: mpsc::Sender<DiscoveredPeer>,
     admin: Option<std::sync::Arc<std::sync::Mutex<membership::Admin>>>,
     handle: lattice_engine::EngineHandle,
+    relay: Arc<lattice_net::relay::RelayTransport<UdpTransport>>,
 ) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind(&bind).await?);
     let local = socket.local_addr()?;
@@ -757,13 +774,68 @@ async fn start_dht(
         let kad = Arc::clone(&kad);
         tokio::spawn(async move {
             loop {
-                let (key, bytes) = {
+                let (dir_key, dir_bytes, man_key, man_bytes) = {
                     let a = admin.lock().unwrap();
-                    let dir = a.signed_directory();
-                    (a.network_id().directory_key(), dir.to_bytes())
+                    let net = a.network_id();
+                    (
+                        net.directory_key(),
+                        a.signed_directory().to_bytes(),
+                        net.manifest_key(),
+                        a.signed_manifest().to_bytes(),
+                    )
                 };
-                kad.publish_record(key, bytes).await;
-                tracing::debug!("published member directory to DHT");
+                kad.publish_record(dir_key, dir_bytes).await;
+                // The SDN "program": which members relay for unreachable pairs.
+                kad.publish_record(man_key, man_bytes).await;
+                tracing::debug!("published member directory + manifest to DHT");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    // Shared: the relay node id currently selected from the signed manifest (None
+    // if no relay is configured, or if we are the relay). Written by the manifest
+    // consumer, read by the directory consumer to add a relay-fallback endpoint.
+    let relay_id: Arc<std::sync::Mutex<Option<[u8; 32]>>> = Arc::new(std::sync::Mutex::new(None));
+
+    // Manifest consumer (all nodes): fetch the admin-signed NetworkManifest, learn
+    // the designated relay(s), and program the data plane — become a relay server
+    // if we're listed, else point our RelayTransport at the first reachable relay.
+    {
+        let kad = Arc::clone(&kad);
+        let relay = Arc::clone(&relay);
+        let relay_id = Arc::clone(&relay_id);
+        let handle = handle.clone();
+        let me = node_id.0;
+        tokio::spawn(async move {
+            loop {
+                if let Some(net) = handle.network_id() {
+                    if let Some(bytes) = kad.get_record(net.manifest_key()).await {
+                        match NetworkManifest::from_bytes(&bytes) {
+                            Ok(m) if m.verify(&net).is_ok() => {
+                                if m.relays().contains(&me) {
+                                    // We're designated a relay: forward on our mesh socket.
+                                    relay.set_relay_server(true);
+                                    *relay_id.lock().unwrap() = None;
+                                } else if let Some(&rid) = m.relays().iter().find(|&&r| r != me) {
+                                    // Point at the first relay that isn't us and resolves.
+                                    if let Ok(addrs) = kad.lookup(rid).await {
+                                        if let Some(addr) = addrs.first().copied() {
+                                            relay.set_relay(Some(addr));
+                                            *relay_id.lock().unwrap() = Some(rid);
+                                            tracing::debug!(relay = %NodeId(rid).fingerprint(), %addr, "relay selected from manifest");
+                                        }
+                                    }
+                                } else {
+                                    relay.set_relay(None);
+                                    *relay_id.lock().unwrap() = None;
+                                }
+                            }
+                            Ok(_) => tracing::warn!("network manifest failed verification — ignoring"),
+                            Err(_) => tracing::warn!("malformed network manifest in DHT"),
+                        }
+                    }
+                }
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });
@@ -774,6 +846,8 @@ async fn start_dht(
     {
         let kad = Arc::clone(&kad);
         let tx = disc_tx.clone();
+        let relay = Arc::clone(&relay);
+        let relay_id = Arc::clone(&relay_id);
         let me = node_id.0;
         tokio::spawn(async move {
             loop {
@@ -781,19 +855,40 @@ async fn start_dht(
                     if let Some(bytes) = kad.get_record(net.directory_key()).await {
                         match lattice_membership::MemberDirectory::from_bytes(&bytes) {
                             Ok(dir) if dir.verify(&net).is_ok() => {
+                                // Who are we already directly connected to? The relay
+                                // is only a fallback for peers we can't reach directly.
+                                let connected: std::collections::HashSet<[u8; 32]> = handle
+                                    .peers()
+                                    .await
+                                    .iter()
+                                    .filter(|p| p.status == PeerStatus::Connected)
+                                    .map(|p| p.id.0)
+                                    .collect();
+                                let configured_relay = relay.current_relay().is_some();
+                                let relay_node = *relay_id.lock().unwrap();
                                 for &id in dir.node_ids() {
                                     if id == me {
                                         continue;
                                     }
-                                    if let Ok(addrs) = kad.lookup(id).await {
-                                        if !addrs.is_empty() {
-                                            let _ = tx
-                                                .send(DiscoveredPeer {
-                                                    id: NodeId(id),
-                                                    endpoints: addrs,
-                                                })
-                                                .await;
-                                        }
+                                    let mut endpoints = kad.lookup(id).await.unwrap_or_default();
+                                    // Relay fallback: not yet connected directly, a
+                                    // relay is configured, and this peer isn't the
+                                    // relay itself → add its synthetic relay endpoint
+                                    // so the engine's multi-candidate handshake can
+                                    // connect through the relay when direct fails.
+                                    if configured_relay
+                                        && !connected.contains(&id)
+                                        && relay_node != Some(id)
+                                    {
+                                        endpoints.push(relay.endpoint_for(id));
+                                    }
+                                    if !endpoints.is_empty() {
+                                        let _ = tx
+                                            .send(DiscoveredPeer {
+                                                id: NodeId(id),
+                                                endpoints,
+                                            })
+                                            .await;
                                     }
                                 }
                             }

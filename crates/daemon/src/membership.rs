@@ -8,7 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_membership::{MemberCert, MemberDirectory, NetworkId, NetworkKey, Revocation};
+use lattice_membership::{
+    MemberCert, MemberDirectory, NetworkId, NetworkKey, NetworkManifest, Revocation,
+};
 use lattice_proto::NodeId;
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +28,11 @@ pub struct Member {
     pub serial: u64,
     pub label: Option<String>,
     pub revoked: bool,
+    /// Designated by the admin to relay for peers that can't connect directly
+    /// (published in the signed `NetworkManifest`). `#[serde(default)]` so
+    /// registries written before auto-relay load cleanly.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 /// The admin's persistent record of who has been enrolled.
@@ -71,8 +78,21 @@ impl Registry {
             serial,
             label,
             revoked: false,
+            relay: false,
         });
         serial
+    }
+
+    /// Set (or clear) the relay designation for `node_hex`. Returns false if we
+    /// never enrolled that node (you can only designate an admitted member).
+    fn set_relay(&mut self, node_hex: &str, on: bool) -> bool {
+        match self.members.iter_mut().find(|m| m.node_id == node_hex) {
+            Some(m) => {
+                m.relay = on;
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -134,6 +154,34 @@ impl Admin {
         &self.registry.members
     }
 
+    /// Designate (or undesignate) a member as a relay, persisting the change.
+    /// Returns false if the node was never enrolled. The new designation takes
+    /// effect on the next `signed_manifest()` publish.
+    pub fn set_relay(&mut self, node: &NodeId, on: bool) -> bool {
+        let changed = self.registry.set_relay(&node.to_hex(), on);
+        if changed {
+            self.registry.save(&self.registry_path);
+        }
+        changed
+    }
+
+    /// Build the admin-signed network manifest — the SDN "program" published over
+    /// the DHT (docs/SDN_DHT_ARCHITECTURE.md §7). v1 carries the designated relay
+    /// node ids (non-revoked members with `relay == true`), in registry order.
+    /// Only the admin (CA holder) can sign one, keeping routing policy admin-only.
+    pub fn signed_manifest(&self) -> NetworkManifest {
+        let relays: Vec<[u8; 32]> = self
+            .registry
+            .members
+            .iter()
+            .filter(|m| m.relay && !m.revoked)
+            .filter_map(|m| parse_hex32(&m.node_id))
+            .collect();
+        let now = now_unix();
+        // `now` doubles as a monotonic version: readers keep the highest they see.
+        self.key.sign_manifest(now, now, relays)
+    }
+
     /// Build the admin-signed member directory — the non-revoked node ids — for
     /// distribution over the DHT (docs/SDN_DHT_ARCHITECTURE.md). Only the admin
     /// (CA holder) can produce a valid one, keeping membership an admin-only act.
@@ -161,4 +209,43 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
         *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `signed_manifest()` carries exactly the members the admin designated as
+    /// relays (non-revoked), and it verifies against the admin's network.
+    #[test]
+    fn signed_manifest_lists_designated_relays() {
+        // Unique temp key path (no tempfile dep); clean up the sidecars after.
+        let base = std::env::temp_dir().join(format!("lat-relay-test-{}.key", std::process::id()));
+        let key = base.to_string_lossy().to_string();
+        let mut admin = Admin::load_or_create(&key);
+
+        let a = NodeId([0xA1; 32]);
+        let b = NodeId([0xB2; 32]);
+        admin.issue(&a, Some("relay-node".into()));
+        admin.issue(&b, None);
+
+        // Nothing designated yet → empty relay list.
+        assert!(admin.signed_manifest().relays().is_empty());
+
+        // Designate A as a relay; the manifest must list A only and verify.
+        assert!(admin.set_relay(&a, true));
+        let manifest = admin.signed_manifest();
+        let net = admin.network_id();
+        assert!(manifest.verify(&net).is_ok(), "manifest signed by the CA");
+        assert_eq!(manifest.relays(), &[[0xA1; 32]], "exactly the designated relay");
+
+        // Undesignate → back to empty.
+        assert!(admin.set_relay(&a, false));
+        assert!(admin.signed_manifest().relays().is_empty());
+        // Designating a non-member is a no-op.
+        assert!(!admin.set_relay(&NodeId([0xCC; 32]), true));
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(base.with_extension("members.json"));
+    }
 }
