@@ -121,6 +121,28 @@ struct Args {
     crypto: Option<String>,
 }
 
+/// Lowercase hex of bytes — for the crypto bench ciphertext over IPC.
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Parse lowercase/uppercase hex into bytes (tolerates internal whitespace so a
+/// pasted ciphertext with spaces/newlines still decodes). `None` if malformed.
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if clean.len() % 2 != 0 {
+        return None;
+    }
+    (0..clean.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// Is the calling process allowed to drive the admin packet capture? Same weak
 /// "name ≠ identity" gate as the health check; empty allow-list = denied.
 fn admin_permitted(caller: &Option<String>, allow: &[String]) -> bool {
@@ -596,6 +618,21 @@ async fn main() -> Result<()> {
                 Request::CryptoCurrent => Response::CryptoSuite(handle.crypto_current()),
                 Request::CryptoStats => Response::CryptoStats(handle.crypto_stats()),
                 Request::SessionDetails => Response::SessionDetails(handle.session_details()),
+                Request::CryptoEncrypt { text } => match handle.bench_encrypt(text.as_bytes()) {
+                    Ok(ct) => Response::CryptoBytes { hex: to_hex(&ct) },
+                    Err(message) => Response::Error { message },
+                },
+                Request::CryptoDecrypt { hex } => match from_hex(&hex) {
+                    Some(ct) => match handle.bench_decrypt(&ct) {
+                        Ok(pt) => Response::CryptoText {
+                            text: String::from_utf8_lossy(&pt).to_string(),
+                        },
+                        Err(message) => Response::Error { message },
+                    },
+                    None => Response::Error {
+                        message: "invalid hex ciphertext".into(),
+                    },
+                },
                 // Swapping the live tunnel crypto is disruptive (drops every
                 // session), so it's gated by the same admin capability as capture.
                 Request::SetCryptoSuite { name } => {

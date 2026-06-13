@@ -57,6 +57,15 @@ body { background: var(--bg); color: var(--text); overflow: hidden; }
 .panel-title { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
 .panel-sub { color: var(--muted); font-size: 13px; margin: 0 0 18px; }
 .sec { font-size: 14px; font-weight: 600; margin: 22px 0 8px; color: var(--text); }
+.bench { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.bench-col { display: flex; flex-direction: column; gap: 8px; }
+.bench-lbl { font-size: 12px; color: var(--muted); }
+.bench-area { min-height: 70px; resize: vertical; width: 100%; box-sizing: border-box; }
+.bench-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.bench-result { min-height: 40px; padding: 10px; border-radius: 8px; background: #1b2030;
+  border: 1px solid var(--line); font-family: ui-monospace, monospace; font-size: 13px; word-break: break-all; }
+.bench-result.ok { color: #5fe0b0; border-color: rgba(52,211,153,0.4); }
+.bench-result.bad { color: #f1929b; border-color: rgba(224,82,96,0.4); }
 .panel.hidden { display: none; }
 
 .card {

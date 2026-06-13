@@ -148,6 +148,12 @@ pub struct Engine {
     /// Per-peer session-inspector snapshot, refreshed each keepalive tick so the
     /// IPC handle can read live counters without touching the loop's session map.
     session_snapshot: Arc<std::sync::Mutex<Vec<SessionDetail>>>,
+    /// Self-contained encrypt/decrypt test bench (the crypto research harness):
+    /// a persistent session PAIR built with the active suite over a local
+    /// handshake, decoupled from the live tunnel. Lets the admin inject a
+    /// plaintext and read the ciphertext, and decrypt a ciphertext on demand —
+    /// e.g. encrypt now, decrypt later, and watch a time-window cipher refuse it.
+    bench: Arc<std::sync::Mutex<Option<CryptoBench>>>,
 }
 
 /// Running handshake metrics for one suite (the crypto-lab comparison source).
@@ -158,6 +164,37 @@ struct SuiteAccum {
     resp_bytes: u32,
     /// Recent initiator handshake durations (ms), bounded; the median is reported.
     durations_ms: Vec<u32>,
+}
+
+/// A self-contained encrypt/decrypt bench: a session pair from one local
+/// handshake under a given suite. `encryptor` (initiator) seals, `decryptor`
+/// (responder) opens — Noise keys are directional, so one session can't decrypt
+/// its own output. Persists until the active suite changes.
+struct CryptoBench {
+    encryptor: Box<dyn TunnelSession>,
+    decryptor: Box<dyn TunnelSession>,
+    suite: &'static str,
+}
+
+/// Build a fresh bench session pair for `suite` via a local in-process handshake
+/// over two ephemeral identities (reuses the real handshake path).
+fn build_bench(suite: &Arc<dyn CryptoSuite>) -> Result<CryptoBench, String> {
+    let a = Identity::generate().map_err(|e| e.to_string())?;
+    let b = Identity::generate().map_err(|e| e.to_string())?;
+    let (handshake, init) = suite
+        .initiate(a.private_key(), b.public_key(), &[])
+        .map_err(|e| e.to_string())?;
+    let accepted = suite
+        .respond(b.private_key(), &init, &[])
+        .map_err(|e| e.to_string())?;
+    let (encryptor, _) = handshake
+        .complete(&accepted.response)
+        .map_err(|e| e.to_string())?;
+    Ok(CryptoBench {
+        encryptor,
+        decryptor: accepted.session,
+        suite: suite.name(),
+    })
 }
 
 /// Minimum interval between handshake initiations to one peer, and the window in
@@ -219,6 +256,7 @@ impl Engine {
             last_init_bytes: HashMap::new(),
             crypto_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
+            bench: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -259,6 +297,7 @@ impl Engine {
             suite: Arc::clone(&self.suite),
             crypto_stats: Arc::clone(&self.crypto_stats),
             session_snapshot: Arc::clone(&self.session_snapshot),
+            bench: Arc::clone(&self.bench),
         }
     }
 
@@ -982,6 +1021,7 @@ pub struct EngineHandle {
     suite: Arc<std::sync::Mutex<Arc<dyn CryptoSuite>>>,
     crypto_stats: Arc<std::sync::Mutex<HashMap<&'static str, SuiteAccum>>>,
     session_snapshot: Arc<std::sync::Mutex<Vec<SessionDetail>>>,
+    bench: Arc<std::sync::Mutex<Option<CryptoBench>>>,
 }
 
 impl EngineHandle {
@@ -1148,6 +1188,37 @@ impl EngineHandle {
     /// Per-peer live session detail (last refreshed on the keepalive tick).
     pub fn session_details(&self) -> Vec<SessionDetail> {
         self.session_snapshot.lock().unwrap().clone()
+    }
+
+    /// Seal `plaintext` with the test bench's encryptor session (active suite) and
+    /// return the ciphertext bytes — the "inject plaintext → see ciphertext" probe.
+    pub fn bench_encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        self.with_bench(|b| b.encryptor.encrypt(plaintext).map_err(|e| e.to_string()))
+    }
+
+    /// Open `ciphertext` with the test bench's decryptor session (active suite).
+    /// Returns the plaintext, or an error string if it's rejected — e.g. tampered,
+    /// replayed, or (for a time-window cipher) decrypted after its window passed.
+    pub fn bench_decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        self.with_bench(|b| {
+            b.decryptor
+                .decrypt(ciphertext)
+                .map_err(|e| format!("rejected: {e}"))
+        })
+    }
+
+    /// Run `f` against the bench, (re)building the session pair if it's missing or
+    /// was built under a now-swapped suite. The pair persists otherwise, so an
+    /// encrypt and a later decrypt share one session — what lets a time-window
+    /// cipher refuse a ciphertext once its window has elapsed.
+    fn with_bench<R>(&self, f: impl FnOnce(&mut CryptoBench) -> Result<R, String>) -> Result<R, String> {
+        let suite = Arc::clone(&self.suite.lock().unwrap());
+        let mut guard = self.bench.lock().unwrap();
+        let stale = guard.as_ref().map(|b| b.suite) != Some(suite.name());
+        if stale {
+            *guard = Some(build_bench(&suite)?);
+        }
+        f(guard.as_mut().expect("bench just built"))
     }
 }
 
@@ -1879,6 +1950,37 @@ mod tests {
         assert!(
             swapped,
             "sessions must re-handshake under the swapped-in AES-GCM suite"
+        );
+    }
+
+    /// The crypto bench: inject plaintext → get ciphertext → decrypt it back, under
+    /// the active suite; tampering is rejected; swapping the suite rebuilds the
+    /// bench so a ciphertext from the old suite no longer opens (the basis for the
+    /// user's "encrypt now, decrypt later under a time-window cipher → refused").
+    #[test]
+    fn crypto_bench_round_trips_rejects_tampering_and_follows_swaps() {
+        let engine = Engine::new(Identity::generate().unwrap(), EngineConfig::default());
+        let h = engine.handle();
+
+        // Round-trip under the default ChaChaPoly suite.
+        let ct = h.bench_encrypt(b"secret message").unwrap();
+        assert_ne!(ct, b"secret message", "must actually be encrypted");
+        assert_eq!(h.bench_decrypt(&ct).unwrap(), b"secret message");
+
+        // A flipped byte is rejected (integrity).
+        let mut bad = ct.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert!(h.bench_decrypt(&bad).is_err(), "tampered ciphertext rejected");
+
+        // Swap the suite → the bench rebuilds under AES-GCM: new traffic round-trips,
+        // and the old ChaChaPoly ciphertext no longer opens.
+        assert!(h.set_crypto_suite("noise-ik-aesgcm"));
+        let ct2 = h.bench_encrypt(b"under aesgcm").unwrap();
+        assert_eq!(h.bench_decrypt(&ct2).unwrap(), b"under aesgcm");
+        assert!(
+            h.bench_decrypt(&ct).is_err(),
+            "a ChaChaPoly ciphertext must not open under the AES-GCM bench"
         );
     }
 }
