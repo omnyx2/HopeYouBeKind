@@ -102,6 +102,12 @@ fn prefix_to_mask(prefix: u8) -> String {
 
 #[async_trait::async_trait]
 impl TunDevice for WinTun {
+    fn name(&self) -> Option<&str> {
+        // The Wintun adapter name — needed so the daemon can install exit-node
+        // routes against it (else `tun.name()` is None and SetExit can't route).
+        Some(ADAPTER_NAME)
+    }
+
     async fn read_packet(&mut self) -> Result<Vec<u8>, TunError> {
         // Cancellation-safe: just await the channel fed by the dedicated receive
         // thread (see `open`). A closed channel means the receive thread ended
