@@ -91,16 +91,30 @@ that client's internet out through that exit; egress IP must equal the exit's.
 
 | client ↓ \ exit → | Mac | Ubuntu | Windows | Oracle |
 |---|---|---|---|---|
-| **Mac**     | direct | (campus) | (campus) | ✅ 203.0.113.10 |
-| **Ubuntu**  | (campus) | direct | (campus) | (campus) |
-| **Windows** | (campus) | (campus) | direct | (campus) |
-| **Oracle**  | ✅ 118.235.x (Mac) | (campus) | (campus) | direct |
+| **Mac**     | direct | ✅ 203.0.113.30 | ⚠️ Win | ✅ 203.0.113.10 |
+| **Ubuntu**  | ✅ 203.0.113.20 | direct | ⚠️ Win | ✅ 203.0.113.10 |
+| **Windows** | ⚠️ Win | ⚠️ Win | direct | ⚠️ Win |
+| **Oracle**  | ✅ 118.235.x | ✅ 203.0.113.30 | ⚠️ Win | direct |
 
-✅ = verified live (2026-06-14, Mac on cellular ↔ Oracle Tokyo anchor, both
-directions). Cells marked "(campus)" need the campus nodes (Ubuntu/Windows)
-reachable — when the controlling host is off-campus they can't be configured
-(see overlay-MTU gotcha). The code path for every cell is implemented; rerun the
-verification recipe from a host that can reach both ends.
+✅ = verified live 2026-06-14. The whole **macOS + Linux 3-node sub-matrix
+(Mac/Ubuntu/Oracle) is complete — all 6 cross cells pass**: each client's egress
+IP becomes the exit's public IP. Probes were DNS-free (`1.1.1.1/cdn-cgi/trace`,
+`dig @208.67.222.222`); Mac-client cells via full-tunnel, Linux-client cells via
+split-tunnel. Mac↔Oracle was verified with Mac on cellular (egress 118.235.x);
+the rest on campus WiFi. Mac and Windows both NAT behind the campus gateway
+(203.0.113.20), so those two exits share an egress IP — the `exit use <id>`
+target disambiguates which node forwarded.
+
+⚠️ **Win** = the 6 Windows cells are NOT yet passing. Findings: Windows
+route_through now diverts correctly (`Find-NetRoute 1.1.1.1` → the `Lattice`
+Wintun adapter, after fixing `WinTun::name()`), WinNAT is configured, and overlay
+data flows (Win↔Ubuntu/Oracle ping OK) — BUT the engine doesn't forward a
+*non-overlay* packet out the exit (the exit node's TUN sees 0 forwarded packets).
+Likely a Wintun L3 on-link delivery quirk for the 0/1+128/1 routes (no ARP on
+Wintun) — packets are dropped before reaching the daemon's receive ring. Needs
+hands-on Windows debugging. Mac↔Windows also won't form a direct session on the
+current campus WiFi (AP client-isolation) — those cells additionally need a path
+(direct LAN or a relay both can reach).
 
 ## Gotchas found the hard way
 
