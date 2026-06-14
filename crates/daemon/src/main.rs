@@ -349,10 +349,8 @@ async fn main() -> Result<()> {
     // `--public-addr <ip:port>` explicitly — important on clouds (e.g. Oracle)
     // whose outbound source-port PAT makes the STUN reflexive differ from the
     // fixed inbound port. Otherwise we discover it best-effort via STUN.
-    let public_override: Option<SocketAddr> = args
-        .public_addr
-        .as_deref()
-        .and_then(|s| s.parse().ok());
+    let public_override: Option<SocketAddr> =
+        args.public_addr.as_deref().and_then(|s| s.parse().ok());
     let reflexive: Option<SocketAddr> = match public_override {
         Some(addr) => {
             tracing::info!(%addr, "public address (explicit --public-addr)");
@@ -947,7 +945,14 @@ async fn start_dht(
                     match kad.get_record(net.manifest_key()).await {
                         Some(bytes) => match NetworkManifest::from_bytes(&bytes) {
                             Ok(m) if m.verify(&net).is_ok() => {
-                                tracing::debug!(relays = m.relays().len(), "manifest fetched");
+                                tracing::debug!(
+                                    relays = m.relays().len(),
+                                    flows = m.flows().len(),
+                                    "manifest fetched"
+                                );
+                                // Program the SDN data plane from the signed flow
+                                // table (empty ⇒ engine keeps the built-in default).
+                                handle.set_flow_table(m.flows().to_vec());
                                 // Pin EVERY designated relay (each is a publicly
                                 // reachable anchor) so all of them become direct peers —
                                 // usable as a relay-bypass path AND as exit-node
@@ -960,7 +965,9 @@ async fn start_dht(
                                 if m.relays().contains(&me) {
                                     // We're designated a relay: forward on our mesh socket.
                                     if !relay.is_relay_server() {
-                                        tracing::info!("designated as relay — forwarding on mesh socket");
+                                        tracing::info!(
+                                            "designated as relay — forwarding on mesh socket"
+                                        );
                                     }
                                     relay.set_relay_server(true);
                                     // Stop cold-initiating: clients pin us and drive handshakes.
@@ -983,7 +990,9 @@ async fn start_dht(
                                                 handle.set_relay_role(false);
                                                 *relay_id.lock().unwrap() = Some(rid);
                                             }
-                                            None => tracing::debug!(relay = %NodeId(rid).fingerprint(), "relay designated but its endpoint did not resolve"),
+                                            None => {
+                                                tracing::debug!(relay = %NodeId(rid).fingerprint(), "relay designated but its endpoint did not resolve")
+                                            }
                                         },
                                         Err(_) => tracing::debug!("relay endpoint lookup failed"),
                                     }
@@ -992,7 +1001,9 @@ async fn start_dht(
                                     *relay_id.lock().unwrap() = None;
                                 }
                             }
-                            Ok(_) => tracing::warn!("network manifest failed verification — ignoring"),
+                            Ok(_) => {
+                                tracing::warn!("network manifest failed verification — ignoring")
+                            }
                             Err(_) => tracing::warn!("malformed network manifest in DHT"),
                         },
                         None => tracing::debug!("no network manifest in DHT yet"),

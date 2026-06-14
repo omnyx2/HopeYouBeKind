@@ -134,9 +134,13 @@ pub enum Response {
     /// Per-peer live session detail (from `SessionDetails`).
     SessionDetails(Vec<SessionDetail>),
     /// Ciphertext (hex) from a `CryptoEncrypt` bench probe.
-    CryptoBytes { hex: String },
+    CryptoBytes {
+        hex: String,
+    },
     /// Plaintext from a `CryptoDecrypt` bench probe.
-    CryptoText { text: String },
+    CryptoText {
+        text: String,
+    },
     /// A join token (hex-encoded membership cert) handed back from `IssueCert`.
     Token(String),
     /// A command that returns no data succeeded.

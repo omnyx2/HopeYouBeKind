@@ -24,8 +24,16 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use lattice_proto::flow::FlowRule;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
+
+/// Deterministic byte encoding of the flow table, used inside both the manifest's
+/// signed bytes and its wire form so the signature stays consistent. bincode v1
+/// is fixed-layout and deterministic for a given value.
+fn flows_blob(flows: &[FlowRule]) -> Vec<u8> {
+    bincode::serialize(flows).unwrap_or_default()
+}
 
 /// Domain-separation tags so a cert signature can never be reinterpreted as a
 /// revocation signature (or vice versa) even with identical field bytes.
@@ -250,15 +258,17 @@ impl NetworkKey {
         version: u64,
         issued_at: u64,
         relays: Vec<[u8; 32]>,
+        flows: Vec<FlowRule>,
     ) -> NetworkManifest {
         let net = self.network_id().0;
-        let msg = manifest_signing_bytes(&net, version, issued_at, &relays);
+        let msg = manifest_signing_bytes(&net, version, issued_at, &relays, &flows);
         let sig = self.signing.sign(&msg).to_bytes();
         NetworkManifest {
             network_id: NetworkId(net),
             version,
             issued_at,
             relays,
+            flows,
             sig,
         }
     }
@@ -333,8 +343,10 @@ fn manifest_signing_bytes(
     version: u64,
     issued_at: u64,
     relays: &[[u8; 32]],
+    flows: &[FlowRule],
 ) -> Vec<u8> {
-    let mut m = Vec::with_capacity(MANIFEST_DOMAIN.len() + 48 + relays.len() * 32);
+    let fb = flows_blob(flows);
+    let mut m = Vec::with_capacity(MANIFEST_DOMAIN.len() + 52 + relays.len() * 32 + fb.len());
     m.extend_from_slice(MANIFEST_DOMAIN);
     m.extend_from_slice(network_id);
     m.extend_from_slice(&version.to_be_bytes());
@@ -343,6 +355,8 @@ fn manifest_signing_bytes(
     for id in relays {
         m.extend_from_slice(id);
     }
+    m.extend_from_slice(&(fb.len() as u32).to_be_bytes());
+    m.extend_from_slice(&fb);
     m
 }
 
@@ -453,6 +467,9 @@ pub struct NetworkManifest {
     version: u64,
     issued_at: u64,
     relays: Vec<[u8; 32]>,
+    /// The SDN flow table (docs/FLOW_TABLE.md). Empty ⇒ nodes use the built-in
+    /// default (overlay→owner, internet→exit).
+    flows: Vec<FlowRule>,
     sig: [u8; 64],
 }
 
@@ -467,6 +484,10 @@ impl NetworkManifest {
     pub fn relays(&self) -> &[[u8; 32]] {
         &self.relays
     }
+    /// The admin-signed SDN flow table (empty ⇒ default behavior).
+    pub fn flows(&self) -> &[FlowRule] {
+        &self.flows
+    }
 
     /// Verify the manifest is authentic for `network` (signed by its CA). Returns
     /// the version so a reader can keep only the newest it has seen.
@@ -474,7 +495,13 @@ impl NetworkManifest {
         if self.network_id != *network {
             return Err(MembershipError::WrongNetwork);
         }
-        let msg = manifest_signing_bytes(&network.0, self.version, self.issued_at, &self.relays);
+        let msg = manifest_signing_bytes(
+            &network.0,
+            self.version,
+            self.issued_at,
+            &self.relays,
+            &self.flows,
+        );
         let sig = ed25519_dalek::Signature::from_bytes(&self.sig);
         network
             .verifying_key()?
@@ -483,10 +510,11 @@ impl NetworkManifest {
         Ok(self.version)
     }
 
-    /// Wire form: network_id(32) ‖ version(8) ‖ issued_at(8) ‖ count(4) ‖
-    /// relays(32·n) ‖ sig(64). For DHT storage.
+    /// Wire form: network_id(32) ‖ version(8) ‖ issued_at(8) ‖ relay_count(4) ‖
+    /// relays(32·n) ‖ flows_len(4) ‖ flows(bincode) ‖ sig(64). For DHT storage.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(52 + self.relays.len() * 32 + 64);
+        let fb = flows_blob(&self.flows);
+        let mut b = Vec::with_capacity(56 + self.relays.len() * 32 + fb.len() + 64);
         b.extend_from_slice(&self.network_id.0);
         b.extend_from_slice(&self.version.to_be_bytes());
         b.extend_from_slice(&self.issued_at.to_be_bytes());
@@ -494,6 +522,8 @@ impl NetworkManifest {
         for id in &self.relays {
             b.extend_from_slice(id);
         }
+        b.extend_from_slice(&(fb.len() as u32).to_be_bytes());
+        b.extend_from_slice(&fb);
         b.extend_from_slice(&self.sig);
         b
     }
@@ -506,8 +536,9 @@ impl NetworkManifest {
         let version = u64::from_be_bytes(b[32..40].try_into().unwrap());
         let issued_at = u64::from_be_bytes(b[40..48].try_into().unwrap());
         let count = u32::from_be_bytes(b[48..52].try_into().unwrap()) as usize;
-        let want = 52 + count * 32 + 64;
-        if b.len() != want {
+        // relays
+        let flows_len_off = 52 + count * 32;
+        if b.len() < flows_len_off + 4 {
             return Err(MembershipError::Malformed);
         }
         let mut relays = Vec::with_capacity(count);
@@ -515,12 +546,27 @@ impl NetworkManifest {
             let off = 52 + i * 32;
             relays.push(b[off..off + 32].try_into().unwrap());
         }
+        // flows blob
+        let flen =
+            u32::from_be_bytes(b[flows_len_off..flows_len_off + 4].try_into().unwrap()) as usize;
+        let flows_off = flows_len_off + 4;
+        let want = flows_off + flen + 64;
+        if b.len() != want {
+            return Err(MembershipError::Malformed);
+        }
+        let flows: Vec<FlowRule> = if flen == 0 {
+            Vec::new()
+        } else {
+            bincode::deserialize(&b[flows_off..flows_off + flen])
+                .map_err(|_| MembershipError::Malformed)?
+        };
         let sig: [u8; 64] = b[want - 64..want].try_into().unwrap();
         Ok(Self {
             network_id,
             version,
             issued_at,
             relays,
+            flows,
             sig,
         })
     }
@@ -895,14 +941,29 @@ mod tests {
         let net = NetworkKey::generate();
         let id = net.network_id();
         let relays = vec![[9u8; 32], [8u8; 32]];
-        let m = net.sign_manifest(3, 500, relays.clone());
+        let flows = vec![lattice_proto::flow::FlowRule {
+            priority: 90,
+            match_: lattice_proto::flow::FlowMatch {
+                proto: Some(17),
+                dport: Some(53),
+                ..Default::default()
+            },
+            action: lattice_proto::flow::FlowAction::Drop,
+        }];
+        let m = net.sign_manifest(3, 500, relays.clone(), flows.clone());
 
         assert_eq!(m.verify(&id).unwrap(), 3);
         assert_eq!(m.relays(), relays.as_slice());
+        assert_eq!(m.flows(), flows.as_slice());
 
         let back = NetworkManifest::from_bytes(&m.to_bytes()).unwrap();
         assert_eq!(back, m);
         assert_eq!(back.verify(&id).unwrap(), 3);
+        assert_eq!(
+            back.flows(),
+            flows.as_slice(),
+            "signed flow table round-trips"
+        );
 
         // wrong network + tamper both rejected
         assert_eq!(

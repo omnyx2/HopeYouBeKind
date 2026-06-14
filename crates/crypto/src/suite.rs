@@ -223,7 +223,9 @@ mod tests {
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
 
-        let (hs, init) = suite.initiate(a.private_key(), b.public_key(), b"x").unwrap();
+        let (hs, init) = suite
+            .initiate(a.private_key(), b.public_key(), b"x")
+            .unwrap();
         let accepted = suite.respond(b.private_key(), &init, b"y").unwrap();
         let (mut a_sess, _) = hs.complete(&accepted.response).unwrap();
         let mut b_sess = accepted.session;

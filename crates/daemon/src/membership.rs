@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lattice_membership::{
     MemberCert, MemberDirectory, NetworkId, NetworkKey, NetworkManifest, Revocation,
 };
+use lattice_proto::flow::FlowRule;
 use lattice_proto::NodeId;
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +102,9 @@ pub struct Admin {
     key: NetworkKey,
     registry: Registry,
     registry_path: PathBuf,
+    /// The SDN flow table the admin publishes in the manifest (docs/FLOW_TABLE.md).
+    /// Empty ⇒ nodes use the built-in default. Set via `set_flows`.
+    flows: Vec<FlowRule>,
 }
 
 impl Admin {
@@ -119,7 +123,14 @@ impl Admin {
             key,
             registry,
             registry_path,
+            flows: Vec::new(),
         }
+    }
+
+    /// Replace the admin's SDN flow table; takes effect on the next
+    /// `signed_manifest()` publish (and thus on every node's next fetch).
+    pub fn set_flows(&mut self, flows: Vec<FlowRule>) {
+        self.flows = flows;
     }
 
     pub fn network_id(&self) -> NetworkId {
@@ -179,7 +190,7 @@ impl Admin {
             .collect();
         let now = now_unix();
         // `now` doubles as a monotonic version: readers keep the highest they see.
-        self.key.sign_manifest(now, now, relays)
+        self.key.sign_manifest(now, now, relays, self.flows.clone())
     }
 
     /// Build the admin-signed member directory — the non-revoked node ids — for
@@ -237,7 +248,11 @@ mod tests {
         let manifest = admin.signed_manifest();
         let net = admin.network_id();
         assert!(manifest.verify(&net).is_ok(), "manifest signed by the CA");
-        assert_eq!(manifest.relays(), &[[0xA1; 32]], "exactly the designated relay");
+        assert_eq!(
+            manifest.relays(),
+            &[[0xA1; 32]],
+            "exactly the designated relay"
+        );
 
         // Undesignate → back to empty.
         assert!(admin.set_relay(&a, false));

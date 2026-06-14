@@ -589,6 +589,7 @@ dependencies = [
 name = "lattice-membership"
 version = "0.7.0"
 dependencies = [
+ "bincode",
  "blake2",
  "ed25519-dalek",
  "lattice-proto",
