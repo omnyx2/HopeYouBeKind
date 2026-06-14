@@ -103,13 +103,14 @@ pub struct Admin {
     registry: Registry,
     registry_path: PathBuf,
     /// The SDN flow table the admin publishes in the manifest (docs/FLOW_TABLE.md).
-    /// Empty ⇒ nodes use the built-in default. Set via `set_flows`.
+    /// Empty ⇒ nodes use the built-in default. Persisted in a JSON sidecar.
     flows: Vec<FlowRule>,
+    flows_path: PathBuf,
 }
 
 impl Admin {
     /// Load the CA key at `key_path` (generating + saving a new network on first
-    /// run) along with its member registry sidecar.
+    /// run) along with its member registry + flow-table sidecars.
     pub fn load_or_create(key_path: &str) -> Self {
         let path = PathBuf::from(key_path);
         let key = NetworkKey::load(&path).unwrap_or_else(|| {
@@ -119,18 +120,53 @@ impl Admin {
         });
         let registry_path = path.with_extension("members.json");
         let registry = Registry::load(&registry_path);
+        let flows_path = path.with_extension("flows.json");
+        let flows = std::fs::read(&flows_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         Self {
             key,
             registry,
             registry_path,
-            flows: Vec::new(),
+            flows,
+            flows_path,
         }
     }
 
-    /// Replace the admin's SDN flow table; takes effect on the next
-    /// `signed_manifest()` publish (and thus on every node's next fetch).
-    pub fn set_flows(&mut self, flows: Vec<FlowRule>) {
-        self.flows = flows;
+    fn save_flows(&self) {
+        if let Ok(json) = serde_json::to_vec_pretty(&self.flows) {
+            let _ = std::fs::write(&self.flows_path, json);
+        }
+    }
+
+    /// The admin's current SDN flow table.
+    pub fn flows(&self) -> &[FlowRule] {
+        &self.flows
+    }
+
+    /// Append a rule to the flow table (persisted). Takes effect on the next
+    /// `signed_manifest()` publish, hot-reloading every node.
+    pub fn add_flow(&mut self, rule: FlowRule) {
+        self.flows.push(rule);
+        self.save_flows();
+    }
+
+    /// Delete the rule at `index`; false if out of range.
+    pub fn del_flow(&mut self, index: usize) -> bool {
+        if index < self.flows.len() {
+            self.flows.remove(index);
+            self.save_flows();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear the flow table — every node reverts to the built-in default.
+    pub fn clear_flows(&mut self) {
+        self.flows.clear();
+        self.save_flows();
     }
 
     pub fn network_id(&self) -> NetworkId {

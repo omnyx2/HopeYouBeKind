@@ -104,6 +104,15 @@ pub enum Request {
     /// Admin: drain captured packets with `seq > after` (cursor poll), oldest
     /// first. Pass `after: 0` for the first poll.
     Packets { after: u64 },
+    /// Admin: the current SDN flow table (the manifest's `flows`).
+    FlowList,
+    /// Admin: append a rule to the flow table; republished in the signed manifest
+    /// and hot-reloaded by every node. See docs/FLOW_TABLE.md.
+    FlowAdd { rule: crate::flow::FlowRule },
+    /// Admin: delete the flow rule at `index` (as numbered by `FlowList`).
+    FlowDel { index: usize },
+    /// Admin: clear the flow table (revert all nodes to the built-in default).
+    FlowClear,
 }
 
 /// The daemon's reply.
@@ -133,6 +142,8 @@ pub enum Response {
     CryptoStats(Vec<SuiteStat>),
     /// Per-peer live session detail (from `SessionDetails`).
     SessionDetails(Vec<SessionDetail>),
+    /// The SDN flow table (from `FlowList`).
+    FlowRules(Vec<crate::flow::FlowRule>),
     /// Ciphertext (hex) from a `CryptoEncrypt` bench probe.
     CryptoBytes {
         hex: String,

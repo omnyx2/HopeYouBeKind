@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use lattice_proto::flow::{FlowAction, FlowMatch, FlowRule, FlowScope};
 use lattice_proto::ipc::{Request, Response};
 use lattice_proto::NodeId;
 
@@ -49,6 +50,104 @@ enum Command {
     /// this node's internet traffic out through a chosen exit peer.
     #[command(subcommand)]
     Exit(ExitCommand),
+    /// Admin: program the SDN flow table (match→action). Published in the signed
+    /// manifest and hot-reloaded by every node. See docs/FLOW_TABLE.md.
+    #[command(subcommand)]
+    Flow(FlowCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum FlowCommand {
+    /// Show the current flow table (numbered, highest-priority first).
+    List,
+    /// Append a match→action rule.
+    Add {
+        /// Higher wins; ties break toward the earliest rule. Default 50.
+        #[arg(long, default_value_t = 50)]
+        priority: u16,
+        /// Match scope: `overlay` (mesh) or `internet`.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Match destination CIDR, e.g. `1.1.1.1/32` or `10.0.0.0/8`.
+        #[arg(long)]
+        dst: Option<String>,
+        /// Match protocol: `tcp` | `udp` | `icmp` | a number.
+        #[arg(long)]
+        proto: Option<String>,
+        /// Match destination port.
+        #[arg(long)]
+        dport: Option<u16>,
+        /// Action: `drop` | `local` | `overlay` | `exit` | `exit:<64hex>` |
+        /// `peer:<64hex>`.
+        #[arg(long)]
+        action: String,
+    },
+    /// Delete the rule at `index` (as numbered by `list`).
+    Del { index: usize },
+    /// Clear the flow table — every node reverts to the built-in default.
+    Clear,
+}
+
+/// Parse an `--action` string into a `FlowAction`.
+fn parse_action(s: &str) -> Result<FlowAction> {
+    Ok(match s {
+        "drop" => FlowAction::Drop,
+        "local" => FlowAction::Local,
+        "overlay" => FlowAction::ToOverlayOwner,
+        "exit" => FlowAction::ToExit(None),
+        other => {
+            if let Some(hex) = other.strip_prefix("exit:") {
+                FlowAction::ToExit(Some(parse_id(hex)?))
+            } else if let Some(hex) = other.strip_prefix("peer:") {
+                FlowAction::ToPeer(parse_id(hex)?)
+            } else {
+                anyhow::bail!(
+                    "unknown action '{other}' (drop|local|overlay|exit|exit:<id>|peer:<id>)"
+                );
+            }
+        }
+    })
+}
+
+/// Build a `FlowMatch` from the optional CLI fields.
+fn build_match(
+    scope: &Option<String>,
+    dst: &Option<String>,
+    proto: &Option<String>,
+    dport: Option<u16>,
+) -> Result<FlowMatch> {
+    let scope = match scope.as_deref() {
+        None => None,
+        Some("overlay") => Some(FlowScope::Overlay),
+        Some("internet") => Some(FlowScope::Internet),
+        Some(o) => anyhow::bail!("unknown scope '{o}' (overlay|internet)"),
+    };
+    let dst_cidr = match dst {
+        None => None,
+        Some(s) => {
+            let (ip, len) = match s.split_once('/') {
+                Some((ip, len)) => (
+                    ip,
+                    len.parse().map_err(|_| anyhow::anyhow!("bad prefix len"))?,
+                ),
+                None => (s.as_str(), 32u8),
+            };
+            Some((ip.parse().map_err(|_| anyhow::anyhow!("bad dst ip"))?, len))
+        }
+    };
+    let proto = match proto.as_deref() {
+        None => None,
+        Some("tcp") => Some(6),
+        Some("udp") => Some(17),
+        Some("icmp") => Some(1),
+        Some(n) => Some(n.parse().map_err(|_| anyhow::anyhow!("bad proto '{n}'"))?),
+    };
+    Ok(FlowMatch {
+        scope,
+        dst_cidr,
+        proto,
+        dport,
+    })
 }
 
 #[derive(Subcommand, Debug)]
@@ -239,6 +338,23 @@ impl Command {
                     full_tunnel: !split,
                 }
             }
+            Command::Flow(FlowCommand::List) => Request::FlowList,
+            Command::Flow(FlowCommand::Clear) => Request::FlowClear,
+            Command::Flow(FlowCommand::Del { index }) => Request::FlowDel { index: *index },
+            Command::Flow(FlowCommand::Add {
+                priority,
+                scope,
+                dst,
+                proto,
+                dport,
+                action,
+            }) => Request::FlowAdd {
+                rule: FlowRule {
+                    priority: *priority,
+                    match_: build_match(scope, dst, proto, *dport)?,
+                    action: parse_action(action)?,
+                },
+            },
         })
     }
 }
@@ -420,6 +536,63 @@ fn print_response(response: Response) {
                 );
             }
         }
+        Response::FlowRules(rules) => {
+            if rules.is_empty() {
+                println!("flow table empty — nodes use the built-in default (overlay→owner, internet→exit)");
+            }
+            // Show in evaluation order: highest priority first (ties keep input order).
+            let mut idx: Vec<usize> = (0..rules.len()).collect();
+            idx.sort_by(|&a, &b| rules[b].priority.cmp(&rules[a].priority));
+            for i in idx {
+                let r = &rules[i];
+                println!(
+                    "[{i}] prio {:>3}  {:<28} → {}",
+                    r.priority,
+                    fmt_match(&r.match_),
+                    fmt_action(&r.action),
+                );
+            }
+        }
         Response::Error { message } => eprintln!("error: {message}"),
+    }
+}
+
+fn fmt_match(m: &FlowMatch) -> String {
+    let mut parts = Vec::new();
+    match m.scope {
+        Some(FlowScope::Overlay) => parts.push("scope=overlay".to_string()),
+        Some(FlowScope::Internet) => parts.push("scope=internet".to_string()),
+        None => {}
+    }
+    if let Some((ip, len)) = m.dst_cidr {
+        parts.push(format!("dst={ip}/{len}"));
+    }
+    if let Some(p) = m.proto {
+        let name = match p {
+            6 => "tcp".into(),
+            17 => "udp".into(),
+            1 => "icmp".into(),
+            n => n.to_string(),
+        };
+        parts.push(format!("proto={name}"));
+    }
+    if let Some(dp) = m.dport {
+        parts.push(format!("dport={dp}"));
+    }
+    if parts.is_empty() {
+        "*".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn fmt_action(a: &FlowAction) -> String {
+    match a {
+        FlowAction::ToOverlayOwner => "overlay-owner".into(),
+        FlowAction::ToExit(None) => "exit(configured)".into(),
+        FlowAction::ToExit(Some(id)) => format!("exit({})", id.fingerprint()),
+        FlowAction::ToPeer(id) => format!("peer({})", id.fingerprint()),
+        FlowAction::Local => "local".into(),
+        FlowAction::Drop => "DROP".into(),
     }
 }
