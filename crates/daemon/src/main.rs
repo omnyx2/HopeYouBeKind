@@ -756,18 +756,30 @@ async fn main() -> Result<()> {
                             // endpoint (the public one, not a LAN candidate) so it stays
                             // off the tunnel — otherwise the very path carrying the exit
                             // session (and relay/DHT, if same anchor) loops into the tun.
-                            let endpoint_ip = handle
-                                .peers()
-                                .await
-                                .iter()
-                                .find(|p| p.id == id)
+                            let peer = handle.peers().await.into_iter().find(|p| p.id == id);
+                            let endpoint_ip = peer
+                                .as_ref()
                                 .and_then(|p| pick_relay_addr(&p.endpoints).map(|e| e.ip()));
                             match (tun_name.as_deref(), endpoint_ip) {
                                 (Some(name), Some(ip)) => exit::route_through(name, ip),
                                 _ => tracing::warn!("cannot route via exit (no tun or endpoint)"),
                             }
+                            // DNS under full tunnel: point the resolver at the exit's
+                            // in-mesh overlay IP (where a resolver may run), with 1.1.1.1
+                            // as a fallback that also egresses via the exit. Without this
+                            // a campus/private resolver becomes unreachable through the
+                            // exit and name resolution breaks. See docs/FLOW_TABLE.md §8.
+                            if let Some(p) = peer {
+                                exit::set_dns(&[
+                                    std::net::IpAddr::V4(p.virtual_ip.0),
+                                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                                ]);
+                            }
                         }
-                        None => exit::restore_routes(),
+                        None => {
+                            exit::restore_dns();
+                            exit::restore_routes();
+                        }
                     }
                     Response::Done
                 }
@@ -825,8 +837,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Always undo exit-node OS changes so we never leave the host's routing or
-    // NAT in a diverted state.
+    // Always undo exit-node OS changes so we never leave the host's routing,
+    // DNS, or NAT in a diverted state.
+    exit::restore_dns();
     exit::restore_routes();
     exit::disable_nat();
     let _ = std::fs::remove_file("/tmp/lattice-daemon.pid");

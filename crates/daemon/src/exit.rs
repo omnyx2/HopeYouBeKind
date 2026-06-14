@@ -18,6 +18,9 @@ use std::process::Command;
 /// Where we stash the original default route so we can put it back.
 #[cfg(unix)]
 const SAVED: &str = "/tmp/lattice-saved-default";
+/// Where we stash the original DNS config so `restore_dns` can put it back.
+#[cfg(unix)]
+const DNS_SAVED: &str = "/tmp/lattice-saved-resolv";
 
 #[cfg(any(unix, windows))]
 fn run(cmd: &str, args: &[&str]) {
@@ -125,6 +128,61 @@ pub fn disable_nat() {
     run("sysctl", &["-w", "net.inet.ip.forwarding=0"]);
 }
 
+/// The network service (e.g. "Wi-Fi") whose device is the current default-route
+/// interface — what `networksetup` keys DNS changes on.
+#[cfg(target_os = "macos")]
+fn macos_primary_service() -> Option<String> {
+    let iface = macos_default_iface()?;
+    let out = Command::new("networksetup")
+        .args(["-listnetworkserviceorder"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Blocks look like:  "(1) Wi-Fi"  then  "(Hardware Port: Wi-Fi, Device: en0)".
+    let mut last_service: Option<String> = None;
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix('(') {
+            if let Some((_, name)) = rest.split_once(") ") {
+                last_service = Some(name.trim().to_string());
+            }
+        }
+        if l.contains(&format!("Device: {iface})")) {
+            return last_service;
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_dns(servers: &[IpAddr]) {
+    if servers.is_empty() {
+        return;
+    }
+    let Some(svc) = macos_primary_service() else {
+        tracing::warn!("no primary network service; DNS not set");
+        return;
+    };
+    let _ = std::fs::write(DNS_SAVED, &svc);
+    let mut args = vec!["-setdnsservers".to_string(), svc.clone()];
+    args.extend(servers.iter().map(|s| s.to_string()));
+    run(
+        "networksetup",
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    tracing::warn!(service = %svc, ?servers, "DNS pointed through the tunnel (full tunnel)");
+}
+
+#[cfg(target_os = "macos")]
+pub fn restore_dns() {
+    if let Ok(svc) = std::fs::read_to_string(DNS_SAVED) {
+        // "Empty" clears our override, returning the service to DHCP-provided DNS.
+        run("networksetup", &["-setdnsservers", svc.trim(), "Empty"]);
+        let _ = std::fs::remove_file(DNS_SAVED);
+        tracing::info!("DNS restored");
+    }
+}
+
 // ----------------------------- Linux -----------------------------
 #[cfg(target_os = "linux")]
 pub fn route_through(tun: &str, exit_ip: IpAddr) {
@@ -161,6 +219,46 @@ pub fn restore_routes() {
         }
         let _ = std::fs::remove_file(SAVED);
         tracing::info!("default route restored");
+    }
+}
+
+/// Point the host resolver at `servers` (full-tunnel DNS). Backs up the current
+/// `/etc/resolv.conf` — a symlink (systemd-resolved stub) or a plain file — and
+/// replaces it with a static one. So DNS goes through the tunnel to the exit's
+/// in-mesh resolver instead of a local/campus resolver the exit can't reach.
+#[cfg(target_os = "linux")]
+pub fn set_dns(servers: &[IpAddr]) {
+    if servers.is_empty() {
+        return;
+    }
+    if let Ok(target) = std::fs::read_link("/etc/resolv.conf") {
+        let _ = std::fs::write(DNS_SAVED, format!("link:{}", target.display()));
+    } else if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
+        let _ = std::fs::write(DNS_SAVED, format!("file:{content}"));
+    } else {
+        let _ = std::fs::write(DNS_SAVED, "none:");
+    }
+    let mut conf = String::new();
+    for s in servers {
+        conf.push_str(&format!("nameserver {s}\n"));
+    }
+    let _ = std::fs::remove_file("/etc/resolv.conf");
+    if std::fs::write("/etc/resolv.conf", conf).is_ok() {
+        tracing::warn!(?servers, "DNS pointed through the tunnel (full tunnel)");
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn restore_dns() {
+    if let Ok(saved) = std::fs::read_to_string(DNS_SAVED) {
+        let _ = std::fs::remove_file("/etc/resolv.conf");
+        if let Some(t) = saved.strip_prefix("link:") {
+            let _ = std::os::unix::fs::symlink(t.trim(), "/etc/resolv.conf");
+        } else if let Some(c) = saved.strip_prefix("file:") {
+            let _ = std::fs::write("/etc/resolv.conf", c);
+        }
+        let _ = std::fs::remove_file(DNS_SAVED);
+        tracing::info!("DNS restored");
     }
 }
 
@@ -312,6 +410,21 @@ pub fn disable_nat() {
     ps("Remove-NetNat -Name Lattice -Confirm:$false -ErrorAction SilentlyContinue");
 }
 
+#[cfg(target_os = "windows")]
+pub fn set_dns(servers: &[IpAddr]) {
+    if let Some(first) = servers.first() {
+        // Set the Lattice adapter's DNS; full-tunnel routes it through the exit.
+        ps(&format!(
+            "Set-DnsClientServerAddress -InterfaceAlias 'Lattice' -ServerAddresses '{first}' -ErrorAction SilentlyContinue"
+        ));
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn restore_dns() {
+    ps("Set-DnsClientServerAddress -InterfaceAlias 'Lattice' -ResetServerAddresses -ErrorAction SilentlyContinue");
+}
+
 // ------------------------- other platforms -------------------------
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn route_through(_tun: &str, _exit_ip: IpAddr) {
@@ -325,3 +438,7 @@ pub fn enable_nat() {
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn disable_nat() {}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn set_dns(_servers: &[IpAddr]) {}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn restore_dns() {}
