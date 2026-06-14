@@ -199,27 +199,31 @@ impl Command {
                 on: !off,
             },
             Command::Crypto(CryptoCommand::List) => Request::CryptoSuites,
-            Command::Crypto(CryptoCommand::Swap { name }) => Request::SetCryptoSuite {
-                name: name.clone(),
-            },
+            Command::Crypto(CryptoCommand::Swap { name }) => {
+                Request::SetCryptoSuite { name: name.clone() }
+            }
             Command::Crypto(CryptoCommand::Stats) => Request::CryptoStats,
             Command::Crypto(CryptoCommand::Sessions) => Request::SessionDetails,
-            Command::Crypto(CryptoCommand::Encrypt { text }) => Request::CryptoEncrypt {
-                text: text.clone(),
-            },
-            Command::Crypto(CryptoCommand::Decrypt { hex }) => Request::CryptoDecrypt {
-                hex: hex.clone(),
-            },
-            Command::Capture(CaptureCommand::Start { proto, port, peer }) => Request::CaptureStart {
-                filter: lattice_proto::ipc::CaptureFilter {
-                    peer: peer.clone(),
-                    protocol: proto.clone(),
-                    port: *port,
-                },
-            },
+            Command::Crypto(CryptoCommand::Encrypt { text }) => {
+                Request::CryptoEncrypt { text: text.clone() }
+            }
+            Command::Crypto(CryptoCommand::Decrypt { hex }) => {
+                Request::CryptoDecrypt { hex: hex.clone() }
+            }
+            Command::Capture(CaptureCommand::Start { proto, port, peer }) => {
+                Request::CaptureStart {
+                    filter: lattice_proto::ipc::CaptureFilter {
+                        peer: peer.clone(),
+                        protocol: proto.clone(),
+                        port: *port,
+                    },
+                }
+            }
             Command::Capture(CaptureCommand::Stop) => Request::CaptureStop,
             Command::Capture(CaptureCommand::Status) => Request::CaptureStatus,
-            Command::Capture(CaptureCommand::Packets { after }) => Request::Packets { after: *after },
+            Command::Capture(CaptureCommand::Packets { after }) => {
+                Request::Packets { after: *after }
+            }
             Command::Exit(ExitCommand::Allow { off }) => Request::AllowExit { enabled: !off },
             Command::Exit(ExitCommand::Use {
                 node_id,
@@ -386,7 +390,10 @@ fn print_response(response: Response) {
             if stats.is_empty() {
                 println!("no handshakes recorded yet");
             }
-            println!("{:<22} {:>6} {:>5} {:>5} {:>8}", "suite", "count", "init", "resp", "median");
+            println!(
+                "{:<22} {:>6} {:>5} {:>5} {:>8}",
+                "suite", "count", "init", "resp", "median"
+            );
             for s in stats {
                 println!(
                     "{:<22} {:>6} {:>5} {:>5} {:>6}ms",

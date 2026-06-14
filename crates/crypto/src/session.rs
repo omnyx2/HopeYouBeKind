@@ -205,11 +205,22 @@ mod tests {
         let responder = Identity::generate().unwrap();
 
         // 1. initiator → INIT (carrying metadata "macos")
-        let (hs, init_msg) =
-            Handshake::initiate(initiator.private_key(), responder.public_key(), b"macos", crate::NOISE_PARAMS).unwrap();
+        let (hs, init_msg) = Handshake::initiate(
+            initiator.private_key(),
+            responder.public_key(),
+            b"macos",
+            crate::NOISE_PARAMS,
+        )
+        .unwrap();
 
         // 2. responder accepts, learns initiator identity + metadata, → RESP
-        let pending = respond(responder.private_key(), &init_msg, b"linux", crate::NOISE_PARAMS).unwrap();
+        let pending = respond(
+            responder.private_key(),
+            &init_msg,
+            b"linux",
+            crate::NOISE_PARAMS,
+        )
+        .unwrap();
         assert_eq!(
             pending.remote_static,
             initiator.public_key(),
@@ -253,7 +264,10 @@ mod tests {
         let (session, _) = hs.complete(&pending.response).unwrap();
 
         let boxed: Box<dyn TunnelSession> = Box::new(session);
-        assert!(!boxed.rekey_due(Duration::ZERO), "a fresh session is not due");
+        assert!(
+            !boxed.rekey_due(Duration::ZERO),
+            "a fresh session is not due"
+        );
         assert!(
             boxed.rekey_due(DEFAULT_MAX_AGE),
             "a session past the max age is due for rekey"

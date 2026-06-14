@@ -250,7 +250,10 @@ const WIN_SAVED: &str = r"C:\Windows\Temp\lattice-saved-route.txt";
 
 #[cfg(target_os = "windows")]
 fn ps(script: &str) {
-    run("powershell", &["-NoProfile", "-NonInteractive", "-Command", script]);
+    run(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", script],
+    );
 }
 
 #[cfg(target_os = "windows")]

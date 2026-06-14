@@ -120,7 +120,10 @@ impl HandshakeState for CustomHandshake {
         let mut scratch = vec![0u8; 1024];
         let n = self.0.read_message(response, &mut scratch)?;
         let peer_payload = scratch[..n].to_vec();
-        Ok((Box::new(CustomSession::from_handshake(&self.0)), peer_payload))
+        Ok((
+            Box::new(CustomSession::from_handshake(&self.0)),
+            peer_payload,
+        ))
     }
 }
 
@@ -251,7 +254,9 @@ mod tests {
         let suite = CustomSuite;
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
-        let (hs, init) = suite.initiate(a.private_key(), b.public_key(), b"").unwrap();
+        let (hs, init) = suite
+            .initiate(a.private_key(), b.public_key(), b"")
+            .unwrap();
         let accepted = suite.respond(b.private_key(), &init, b"").unwrap();
         let (mut enc, _) = hs.complete(&accepted.response).unwrap();
         let mut dec = accepted.session;
