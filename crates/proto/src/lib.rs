@@ -8,6 +8,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
+pub mod flow;
 pub mod ipc;
 pub mod wire;
 

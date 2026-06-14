@@ -30,6 +30,7 @@ use lattice_crypto::{
 use lattice_membership::{MemberCert, NetworkId, Revocation, RevocationList};
 use lattice_net::{DiscoveredPeer, Discovery, Transport};
 use lattice_overlay::{derive_virtual_ip, Overlay};
+use lattice_proto::flow::{self, FlowAction, FlowKey, FlowRule, FlowScope};
 use lattice_proto::ipc::{CryptoSuiteInfo, FlowRecord, NodeStatus, SessionDetail, SuiteStat};
 use lattice_proto::wire::{self, MessageType};
 use lattice_proto::{NodeId, PeerInfo, PeerStatus, VirtualIp};
@@ -128,6 +129,12 @@ pub struct Engine {
     /// the relay only responds. This also prevents a double-initiation (both the
     /// relay's id-tie-break INIT and the client's pin INIT) that could desync.
     relay_role: Arc<AtomicBool>,
+    /// The SDN flow table (`docs/FLOW_TABLE.md`): an ordered match→action program
+    /// that `on_outbound` evaluates to decide a packet's fate (route to a peer,
+    /// forward to an exit, deliver locally, or drop). Defaults to
+    /// `flow::default_table()` — overlay→owner, internet→exit — which reproduces
+    /// the pre-flow-table behavior. Hot-reloaded from the signed manifest.
+    flow_table: Arc<std::sync::Mutex<Vec<FlowRule>>>,
     /// Initiator side: when we last sent a handshake INIT to each peer. Gates
     /// re-initiation to at most once per [`REKEY_TIMEOUT`] so a re-init never
     /// overwrites an in-flight `pending` before its response can complete it
@@ -256,6 +263,7 @@ impl Engine {
             resync: Arc::new(AtomicBool::new(false)),
             force_initiate: Arc::new(std::sync::Mutex::new(HashSet::new())),
             relay_role: Arc::new(AtomicBool::new(false)),
+            flow_table: Arc::new(std::sync::Mutex::new(flow::default_table())),
             last_init: HashMap::new(),
             last_responded: HashMap::new(),
             established: HashMap::new(),
@@ -302,6 +310,7 @@ impl Engine {
             resync: Arc::clone(&self.resync),
             force_initiate: Arc::clone(&self.force_initiate),
             relay_role: Arc::clone(&self.relay_role),
+            flow_table: Arc::clone(&self.flow_table),
             suite: Arc::clone(&self.suite),
             crypto_stats: Arc::clone(&self.crypto_stats),
             session_snapshot: Arc::clone(&self.session_snapshot),
@@ -557,32 +566,40 @@ impl Engine {
         packet: &[u8],
         transport: &X,
     ) -> Result<(), EngineError> {
-        let Some(dst) = ipv4_dst(packet) else {
+        let Some(key) = ipv4_flow_key(packet) else {
             return Ok(()); // not IPv4 / too short — ignore for now
         };
         if !self.enabled.load(Ordering::Relaxed) {
             return Ok(()); // mesh administratively down
         }
+        let dst = VirtualIp(key.dst);
 
-        // Which peer carries this packet?
-        let peer_id = if is_overlay_ip(dst) {
-            // Mesh traffic → the peer that owns the destination virtual IP.
-            match self.overlay.lock().await.route(&dst) {
+        // SDN flow table (docs/FLOW_TABLE.md): evaluate match→action to decide
+        // which peer (if any) carries this packet. The default table reproduces
+        // the legacy overlay→owner / internet→exit behavior.
+        let action = {
+            let table = self.flow_table.lock().unwrap();
+            flow::first_match(&table, &key).map(|r| r.action.clone())
+        };
+        let peer_id = match action {
+            Some(FlowAction::ToOverlayOwner) => match self.overlay.lock().await.route(&dst) {
                 Ok(peer) => peer.id,
-                Err(_) => return Ok(()),
-            }
-        } else {
-            // Internet-bound traffic → our exit node, if one is selected.
-            // (No exit set ⇒ drop, so nothing leaks outside the tunnel.)
-            match *self.exit_node.lock().unwrap() {
-                Some(id) => {
-                    tracing::debug!(%dst, exit = %id.fingerprint(), "tun: internet-bound packet → exit");
-                    id
-                }
+                Err(_) => return Ok(()), // no route to that VIP yet
+            },
+            Some(FlowAction::ToPeer(id)) => id,
+            Some(FlowAction::ToExit(Some(id))) => id,
+            Some(FlowAction::ToExit(None)) => match *self.exit_node.lock().unwrap() {
+                Some(id) => id,
                 None => {
-                    tracing::debug!(%dst, "tun: internet-bound packet but no exit set — drop");
+                    tracing::debug!(%dst, "flow: internet-bound but no exit configured — drop");
                     return Ok(());
                 }
+            },
+            // `Local` is meaningful only on the inbound side; here, like `Drop`
+            // and a table miss, it fails closed (nothing leaks).
+            Some(FlowAction::Local) | Some(FlowAction::Drop) | None => {
+                tracing::debug!(%dst, "flow: drop (deny / no matching rule)");
+                return Ok(());
             }
         };
 
@@ -1049,6 +1066,7 @@ pub struct EngineHandle {
     resync: Arc<AtomicBool>,
     force_initiate: Arc<std::sync::Mutex<HashSet<NodeId>>>,
     relay_role: Arc<AtomicBool>,
+    flow_table: Arc<std::sync::Mutex<Vec<FlowRule>>>,
     suite: Arc<std::sync::Mutex<Arc<dyn CryptoSuite>>>,
     crypto_stats: Arc<std::sync::Mutex<HashMap<&'static str, SuiteAccum>>>,
     session_snapshot: Arc<std::sync::Mutex<Vec<SessionDetail>>>,
@@ -1092,6 +1110,18 @@ impl EngineHandle {
     /// the daemon's manifest consumer when it learns it's listed as a relay.
     pub fn set_relay_role(&self, on: bool) {
         self.relay_role.store(on, Ordering::Relaxed);
+    }
+
+    /// Install a new SDN flow table (`docs/FLOW_TABLE.md`). An empty table resets
+    /// to the built-in default (overlay→owner, internet→exit). Called by the
+    /// daemon's manifest consumer when the signed manifest carries `flows`.
+    pub fn set_flow_table(&self, rules: Vec<FlowRule>) {
+        let mut t = self.flow_table.lock().unwrap();
+        *t = if rules.is_empty() {
+            flow::default_table()
+        } else {
+            rules
+        };
     }
 
     /// Route this node's internet traffic through `node_id` (or `None` for direct).
@@ -1249,7 +1279,10 @@ impl EngineHandle {
     /// was built under a now-swapped suite. The pair persists otherwise, so an
     /// encrypt and a later decrypt share one session — what lets a time-window
     /// cipher refuse a ciphertext once its window has elapsed.
-    fn with_bench<R>(&self, f: impl FnOnce(&mut CryptoBench) -> Result<R, String>) -> Result<R, String> {
+    fn with_bench<R>(
+        &self,
+        f: impl FnOnce(&mut CryptoBench) -> Result<R, String>,
+    ) -> Result<R, String> {
         let suite = Arc::clone(&self.suite.lock().unwrap());
         let mut guard = self.bench.lock().unwrap();
         let stale = guard.as_ref().map(|b| b.suite) != Some(suite.name());
@@ -1348,6 +1381,39 @@ fn ipv4_dst(packet: &[u8]) -> Option<VirtualIp> {
     }
     let o = &packet[16..20];
     Some(VirtualIp(Ipv4Addr::new(o[0], o[1], o[2], o[3])))
+}
+
+/// Build the flow-table [`FlowKey`] from a raw IPv4 packet: scope (overlay vs
+/// internet), destination, protocol, and destination port (TCP/UDP; 0 otherwise).
+/// `None` for non-IPv4 / too-short packets.
+fn ipv4_flow_key(packet: &[u8]) -> Option<FlowKey> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = (packet[0] & 0x0f) as usize * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return None;
+    }
+    let proto = packet[9];
+    let dst = VirtualIp(Ipv4Addr::new(
+        packet[16], packet[17], packet[18], packet[19],
+    ));
+    let dport = if matches!(proto, 6 | 17) && packet.len() >= ihl + 4 {
+        u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]])
+    } else {
+        0
+    };
+    let scope = if is_overlay_ip(dst) {
+        FlowScope::Overlay
+    } else {
+        FlowScope::Internet
+    };
+    Some(FlowKey {
+        scope,
+        dst: dst.0,
+        proto,
+        dport,
+    })
 }
 
 /// In v0 the 32-byte public key is the NodeId.
@@ -1575,6 +1641,74 @@ mod tests {
         );
     }
 
+    /// A default-deny SDN flow table isolates internet traffic: even with an exit
+    /// configured, the table's terminal `Drop` blocks internet-bound packets at
+    /// the source (the kill-switch / external-isolation property).
+    #[tokio::test]
+    async fn flow_table_default_deny_isolates_internet_traffic() {
+        use lattice_proto::flow::{FlowAction, FlowMatch, FlowRule, FlowScope};
+        let id_a = Identity::generate().unwrap();
+        let id_b = Identity::generate().unwrap();
+        let vip_a = derive_virtual_ip(&id_a.node_id());
+        let a_nodeid = id_a.node_id();
+        let b_nodeid = id_b.node_id();
+        let addr_a: SocketAddr = "10.0.0.1:711".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:711".parse().unwrap();
+        let (ta, tb) = duplex(addr_a, addr_b);
+        let (tun_a, handle_a) = MemoryTun::new();
+        let (tun_b, mut handle_b) = MemoryTun::new();
+        let disc_a = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: b_nodeid,
+            endpoints: vec![addr_b],
+        }]);
+        let disc_b = StaticDiscovery::new(vec![DiscoveredPeer {
+            id: a_nodeid,
+            endpoints: vec![addr_a],
+        }]);
+        let mut engine_a = Engine::new(id_a, EngineConfig::default());
+        let mut engine_b = Engine::new(id_b, EngineConfig::default());
+        let a_mon = engine_a.handle();
+        // A *would* exit through B — but a default-deny flow table blocks internet.
+        a_mon.set_exit_node(Some(b_nodeid));
+        engine_b.handle().set_allow_exit(true);
+        a_mon.set_flow_table(vec![
+            FlowRule {
+                priority: 100,
+                match_: FlowMatch {
+                    scope: Some(FlowScope::Overlay),
+                    ..Default::default()
+                },
+                action: FlowAction::ToOverlayOwner,
+            },
+            FlowRule {
+                priority: 0,
+                match_: FlowMatch::default(),
+                action: FlowAction::Drop,
+            },
+        ]);
+
+        tokio::spawn(async move {
+            let _ = engine_a.run(tun_a, ta, disc_a).await;
+        });
+        tokio::spawn(async move {
+            let _ = engine_b.run(tun_b, tb, disc_b).await;
+        });
+        wait_connected(&a_mon, 1).await;
+
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[12..16].copy_from_slice(&vip_a.0.octets());
+        packet[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        handle_a.inject.send(packet.clone()).await.unwrap();
+
+        // The flow table drops it at A — it must NOT reach the exit.
+        let got = tokio::time::timeout(Duration::from_millis(800), handle_b.observe.recv()).await;
+        assert!(
+            got.is_err(),
+            "default-deny flow table must drop internet traffic, not forward it to the exit"
+        );
+    }
+
     /// Poll until `h` reports at least `want` Connected peers (robust to CI load
     /// where the handshake can take longer than a fixed sleep).
     async fn wait_connected(h: &EngineHandle, want: usize) {
@@ -1755,8 +1889,8 @@ mod tests {
         assert!(evicted, "revoking the re-bound member must evict it");
     }
 
-    use std::sync::atomic::AtomicUsize;
     use lattice_crypto::{Accepted, CryptoError};
+    use std::sync::atomic::AtomicUsize;
 
     /// A crypto suite that wraps the real Noise suite but whose sessions report
     /// `rekey_due` almost immediately, and which counts every handshake it starts.
@@ -1952,7 +2086,10 @@ mod tests {
         // Catalogue + current suite + comparison stats all report ChaChaPoly.
         assert_eq!(a_ctl.crypto_current().name, "noise-ik-chachapoly");
         let cat = a_ctl.crypto_suites();
-        assert!(cat.len() >= 2, "at least the two Noise suites in the catalogue");
+        assert!(
+            cat.len() >= 2,
+            "at least the two Noise suites in the catalogue"
+        );
         assert!(cat.iter().any(|s| s.name == "noise-ik-aesgcm" && !s.active));
         // Session inspector eventually reflects the live session (refreshed on tick).
         let mut saw_chacha = false;
@@ -2016,7 +2153,10 @@ mod tests {
         let mut bad = ct.clone();
         let last = bad.len() - 1;
         bad[last] ^= 0xff;
-        assert!(h.bench_decrypt(&bad).is_err(), "tampered ciphertext rejected");
+        assert!(
+            h.bench_decrypt(&bad).is_err(),
+            "tampered ciphertext rejected"
+        );
 
         // Swap the suite → the bench rebuilds under AES-GCM: new traffic round-trips,
         // and the old ChaChaPoly ciphertext no longer opens.
