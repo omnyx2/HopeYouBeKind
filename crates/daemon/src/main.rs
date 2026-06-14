@@ -567,6 +567,44 @@ async fn main() -> Result<()> {
                         message: "not an admin node".into(),
                     },
                 },
+                Request::FlowList => match &admin {
+                    Some(a) => Response::FlowRules(a.lock().unwrap().flows().to_vec()),
+                    None => Response::Error {
+                        message: "not an admin node".into(),
+                    },
+                },
+                Request::FlowAdd { rule } => match &admin {
+                    Some(a) => {
+                        a.lock().unwrap().add_flow(rule);
+                        Response::Done
+                    }
+                    None => Response::Error {
+                        message: "not an admin node".into(),
+                    },
+                },
+                Request::FlowDel { index } => match &admin {
+                    Some(a) => {
+                        if a.lock().unwrap().del_flow(index) {
+                            Response::Done
+                        } else {
+                            Response::Error {
+                                message: "no flow rule at that index".into(),
+                            }
+                        }
+                    }
+                    None => Response::Error {
+                        message: "not an admin node".into(),
+                    },
+                },
+                Request::FlowClear => match &admin {
+                    Some(a) => {
+                        a.lock().unwrap().clear_flows();
+                        Response::Done
+                    }
+                    None => Response::Error {
+                        message: "not an admin node".into(),
+                    },
+                },
                 Request::Members => match &admin {
                     Some(a) => {
                         let members = a
