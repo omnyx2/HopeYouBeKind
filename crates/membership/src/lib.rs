@@ -139,6 +139,22 @@ impl NetworkId {
         out
     }
 
+    /// The DHT key a node's self-published **connectivity record** is stored
+    /// under (the set of peers it currently has direct sessions with). Keyed by
+    /// network + node id so any member can fetch any node's connectivity to
+    /// compute relay bridges automatically. See the daemon's bridge election.
+    pub fn connectivity_key(&self, node_id: &[u8; 32]) -> [u8; 32] {
+        use blake2::digest::{Update, VariableOutput};
+        use blake2::Blake2bVar;
+        let mut h = Blake2bVar::new(32).expect("32 is a valid blake2 output len");
+        h.update(b"lattice-connectivity-key-v1");
+        h.update(&self.0);
+        h.update(node_id);
+        let mut out = [0u8; 32];
+        h.finalize_variable(&mut out).expect("32-byte output");
+        out
+    }
+
     /// The DHT key the admin-signed network manifest is stored under.
     pub fn manifest_key(&self) -> [u8; 32] {
         use blake2::digest::{Update, VariableOutput};

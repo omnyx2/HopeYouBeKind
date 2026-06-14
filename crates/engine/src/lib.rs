@@ -1138,6 +1138,19 @@ impl EngineHandle {
         self.overlay.lock().await.peers().cloned().collect()
     }
 
+    /// The peers we currently have a *direct* (Connected) session with — the input
+    /// to automatic relay-bridge election (the daemon publishes this so other
+    /// nodes can find a node that reaches both ends of an unreachable pair).
+    pub async fn connected_peers(&self) -> Vec<NodeId> {
+        self.overlay
+            .lock()
+            .await
+            .peers()
+            .filter(|p| p.status == PeerStatus::Connected)
+            .map(|p| p.id)
+            .collect()
+    }
+
     /// Live traffic flows observed crossing the tunnel, most-recent first.
     pub fn flows(&self) -> Vec<FlowRecord> {
         self.monitor.snapshot()

@@ -163,6 +163,31 @@ fn pick_relay_addr(addrs: &[SocketAddr]) -> Option<SocketAddr> {
         .or_else(|| addrs.first().copied())
 }
 
+/// Serialize a node's set of directly-connected peer ids as a flat 32-byte-per-id
+/// blob — the **connectivity record** each node self-publishes to the DHT so any
+/// member can compute a relay bridge (a node that reaches both ends of an
+/// otherwise-unreachable pair). See the directory consumer's bridge election.
+fn encode_ids(ids: &[[u8; 32]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ids.len() * 32);
+    for id in ids {
+        out.extend_from_slice(id);
+    }
+    out
+}
+
+/// Parse a connectivity record back into a set of node ids (trailing partial id,
+/// if any, is ignored).
+fn decode_ids(bytes: &[u8]) -> std::collections::HashSet<[u8; 32]> {
+    bytes
+        .chunks_exact(32)
+        .map(|c| {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(c);
+            a
+        })
+        .collect()
+}
+
 /// Parse lowercase/uppercase hex into bytes (tolerates internal whitespace so a
 /// pasted ciphertext with spaces/newlines still decodes). `None` if malformed.
 fn from_hex(s: &str) -> Option<Vec<u8>> {
@@ -1014,43 +1039,29 @@ async fn start_dht(
                                     }
                                 }
                                 if m.relays().contains(&me) {
-                                    // We're designated a relay: forward on our mesh socket.
+                                    // Designated relay/anchor: forward relay frames on
+                                    // our mesh socket for any peer that elects us. We
+                                    // still dial out normally — a NAT'd forwarder must
+                                    // initiate to punch to the anchors it bridges — so
+                                    // we do NOT take the cold-initiate-off relay role.
                                     if !relay.is_relay_server() {
                                         tracing::info!(
                                             "designated as relay — forwarding on mesh socket"
                                         );
                                     }
                                     relay.set_relay_server(true);
-                                    // Stop cold-initiating: clients pin us and drive handshakes.
-                                    handle.set_relay_role(true);
-                                    *relay_id.lock().unwrap() = None;
-                                } else if let Some(&rid) = m.relays().iter().find(|&&r| r != me) {
-                                    // Point at the first relay that isn't us and resolves.
-                                    match kad.lookup(rid).await {
-                                        Ok(addrs) => match pick_relay_addr(&addrs) {
-                                            Some(addr) => {
-                                                if relay.current_relay() != Some(addr) {
-                                                    tracing::info!(relay = %NodeId(rid).fingerprint(), %addr, "relay selected from manifest");
-                                                }
-                                                relay.set_relay(Some(addr));
-                                                // Pin the public anchor: drive a direct handshake to
-                                                // it regardless of id tie-break (it's reachable to us
-                                                // but can't dial us back), so it becomes a usable
-                                                // direct peer (relay-bypass + exit-node candidate).
-                                                handle.pin_peer(NodeId(rid));
-                                                handle.set_relay_role(false);
-                                                *relay_id.lock().unwrap() = Some(rid);
-                                            }
-                                            None => {
-                                                tracing::debug!(relay = %NodeId(rid).fingerprint(), "relay designated but its endpoint did not resolve")
-                                            }
-                                        },
-                                        Err(_) => tracing::debug!("relay endpoint lookup failed"),
-                                    }
                                 } else {
-                                    relay.set_relay(None);
-                                    *relay_id.lock().unwrap() = None;
+                                    relay.set_relay_server(false);
                                 }
+                                handle.set_relay_role(false);
+                                // Designation only PINS anchors (loop above) so we
+                                // connect to them directly where reachable. It does NOT
+                                // choose the forwarding relay (current_relay): which node
+                                // actually relays an otherwise-unreachable pair is the
+                                // directory consumer's automatic bridge election (a node
+                                // BOTH ends can reach). Keep relay_id clear so the
+                                // election always runs and owns current_relay.
+                                *relay_id.lock().unwrap() = None;
                             }
                             Ok(_) => {
                                 tracing::warn!("network manifest failed verification — ignoring")
@@ -1079,30 +1090,146 @@ async fn start_dht(
                     if let Some(bytes) = kad.get_record(net.directory_key()).await {
                         match lattice_membership::MemberDirectory::from_bytes(&bytes) {
                             Ok(dir) if dir.verify(&net).is_ok() => {
-                                // Who are we already directly connected to? The relay
-                                // is only a fallback for peers we can't reach directly.
-                                let connected: std::collections::HashSet<[u8; 32]> = handle
-                                    .peers()
-                                    .await
+                                // Who are we already directly connected to? A relay or
+                                // bridge is only a fallback for peers we can't reach
+                                // directly.
+                                let peers = handle.peers().await;
+                                let connected_vec: Vec<[u8; 32]> = peers
                                     .iter()
                                     .filter(|p| p.status == PeerStatus::Connected)
                                     .map(|p| p.id.0)
                                     .collect();
+                                let connected: std::collections::HashSet<[u8; 32]> =
+                                    connected_vec.iter().copied().collect();
+                                // The address we actually reach each connected peer at
+                                // (the engine records the working endpoint on connect).
+                                // An elected bridge must be relayed-to at THIS reachable
+                                // address — e.g. a same-LAN IP — not a public candidate
+                                // that can fail via hairpin NAT.
+                                let connected_addr: std::collections::HashMap<
+                                    [u8; 32],
+                                    std::net::SocketAddr,
+                                > = peers
+                                    .iter()
+                                    .filter(|p| p.status == PeerStatus::Connected)
+                                    .filter_map(|p| p.endpoints.first().map(|a| (p.id.0, *a)))
+                                    .collect();
+                                // Seed the relay forwarder with every directly-connected
+                                // peer's address. An elected bridge is connected to both
+                                // ends of the pair it bridges, so it can now forward to
+                                // each WITHOUT waiting for a relay registration to arrive
+                                // (which a multi-homed/NAT'd endpoint may be unable to
+                                // deliver).
+                                for (&id, &addr) in &connected_addr {
+                                    relay.learn(id, addr);
+                                }
+
+                                // Self-publish our connectivity (the peers we reach
+                                // directly) so every other node can compute a common
+                                // relay bridge for pairs that can't connect directly.
+                                kad.publish_record(
+                                    net.connectivity_key(&me),
+                                    encode_ids(&connected_vec),
+                                )
+                                .await;
+
+                                // The admin-designated relay (signed manifest) wins if
+                                // present. Otherwise elect a bridge AUTOMATICALLY: a
+                                // node we're connected to that is ALSO connected to an
+                                // otherwise-unreachable peer. Both ends run the same
+                                // deterministic election (widest coverage, lowest id on
+                                // a tie) so they choose the SAME bridge and rendezvous
+                                // there — no manual `lattice net relay` needed.
+                                let mut active_relay = *relay_id.lock().unwrap();
+                                if active_relay.is_none() {
+                                    let unreachable: std::collections::HashSet<[u8; 32]> = dir
+                                        .node_ids()
+                                        .iter()
+                                        .copied()
+                                        .filter(|&id| id != me && !connected.contains(&id))
+                                        .collect();
+                                    // Look at each node we ARE connected to (a candidate
+                                    // bridge) and fetch ITS connectivity record. Fetching
+                                    // a node we can reach is reliable; fetching the
+                                    // unreachable target's own record is not (it may only
+                                    // have been able to push it to a third party). A
+                                    // bridge covers every unreachable peer it is itself
+                                    // connected to.
+                                    let mut best: Option<([u8; 32], usize)> = None;
+                                    if !unreachable.is_empty() {
+                                        tracing::debug!(
+                                            unreachable = unreachable.len(),
+                                            candidates = connected_vec.len(),
+                                            "bridge election: looking for a relay bridge"
+                                        );
+                                        for &r in &connected_vec {
+                                            let rec = kad.get_record(net.connectivity_key(&r)).await;
+                                            let rconn = rec
+                                                .as_deref()
+                                                .map(decode_ids)
+                                                .unwrap_or_default();
+                                            let cov = unreachable
+                                                .iter()
+                                                .filter(|t| rconn.contains(*t))
+                                                .count();
+                                            tracing::debug!(
+                                                candidate = %NodeId(r).fingerprint(),
+                                                conn_record = rec.is_some(),
+                                                conn_peers = rconn.len(),
+                                                covers = cov,
+                                                "bridge election: candidate"
+                                            );
+                                            if cov == 0 {
+                                                continue;
+                                            }
+                                            // Widest coverage; lowest id breaks ties so
+                                            // both ends of a pair agree on one rendezvous.
+                                            let better = match best {
+                                                None => true,
+                                                Some((bid, bcov)) => {
+                                                    cov > bcov || (cov == bcov && r < bid)
+                                                }
+                                            };
+                                            if better {
+                                                best = Some((r, cov));
+                                            }
+                                        }
+                                    }
+                                    if let Some((bridge, _)) = best {
+                                        // Relay to the bridge at the address we're already
+                                        // connected to it at (reachable — e.g. same-LAN),
+                                        // NOT a public candidate that hairpin-NAT may drop.
+                                        if let Some(&addr) = connected_addr.get(&bridge) {
+                                            if relay.current_relay() != Some(addr) {
+                                                tracing::info!(
+                                                    bridge = %NodeId(bridge).fingerprint(),
+                                                    %addr,
+                                                    "auto-elected relay bridge (reaches an unreachable peer)"
+                                                );
+                                            }
+                                            relay.set_relay(Some(addr));
+                                            // Pin the bridge so it stays a usable direct
+                                            // peer we can rendezvous through.
+                                            handle.pin_peer(NodeId(bridge));
+                                            active_relay = Some(bridge);
+                                        }
+                                    }
+                                }
+
                                 let configured_relay = relay.current_relay().is_some();
-                                let relay_node = *relay_id.lock().unwrap();
                                 for &id in dir.node_ids() {
                                     if id == me {
                                         continue;
                                     }
                                     let mut endpoints = kad.lookup(id).await.unwrap_or_default();
                                     // Relay fallback: not yet connected directly, a
-                                    // relay is configured, and this peer isn't the
-                                    // relay itself → add its synthetic relay endpoint
-                                    // so the engine's multi-candidate handshake can
-                                    // connect through the relay when direct fails.
+                                    // relay/bridge is configured, and this peer isn't
+                                    // the bridge itself → add its synthetic relay
+                                    // endpoint so the engine's multi-candidate handshake
+                                    // can connect through the bridge when direct fails.
                                     if configured_relay
                                         && !connected.contains(&id)
-                                        && relay_node != Some(id)
+                                        && active_relay != Some(id)
                                     {
                                         endpoints.push(relay.endpoint_for(id));
                                     }

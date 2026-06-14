@@ -88,6 +88,13 @@ pub struct RelayTransport<T> {
     /// `node id -> last-seen address`, learned from relay frames while acting as a
     /// relay server, so we can forward by destination id (DERP-style).
     fwd: Mutex<HashMap<[u8; 32], SocketAddr>>,
+    /// `peer id -> the relay address its frames last arrived through`. When a
+    /// relayed frame reaches us, we remember which relay delivered it and reply to
+    /// that peer back through the SAME relay — even if our own configured relay is
+    /// a different (possibly unreachable) address. Makes the return path symmetric
+    /// through whatever bridge actually works, which matters when the bridge is
+    /// multi-homed and our handshake-time address for it is stale.
+    relay_path: Mutex<HashMap<[u8; 32], SocketAddr>>,
     /// Whether this node forwards relay frames addressed to *other* nodes (it was
     /// designated a relay by the admin manifest). Off by default: a plain client
     /// only unwraps frames addressed to itself.
@@ -103,6 +110,7 @@ impl<T: Transport> RelayTransport<T> {
             self_id,
             synth: Mutex::new(Synth::default()),
             fwd: Mutex::new(HashMap::new()),
+            relay_path: Mutex::new(HashMap::new()),
             relay_server: AtomicBool::new(false),
         }
     }
@@ -143,6 +151,16 @@ impl<T: Transport> RelayTransport<T> {
         addr
     }
 
+    /// Seed the forwarding table with a peer's known address, so this node can
+    /// relay frames to it WITHOUT waiting for that peer to register over the relay.
+    /// The daemon calls this for every directly-connected peer: an elected bridge
+    /// is by definition connected to both ends of the pair it bridges, so it can
+    /// forward to each at the address its own direct session uses — robust even
+    /// when a multi-homed/NAT'd endpoint can't deliver a relay registration.
+    pub fn learn(&self, id: [u8; 32], addr: SocketAddr) {
+        self.fwd.lock().unwrap().insert(id, addr);
+    }
+
     /// Tell the relay our address (so peers can be forwarded to us).
     pub async fn register(&self) -> Result<(), NetError> {
         if let Some(relay) = self.current_relay() {
@@ -156,12 +174,21 @@ impl<T: Transport> RelayTransport<T> {
 #[async_trait::async_trait]
 impl<T: Transport> Transport for RelayTransport<T> {
     async fn send_to(&self, data: &[u8], dest: SocketAddr) -> Result<(), NetError> {
-        if let Some(relay) = self.current_relay() {
-            let peer = self.synth.lock().unwrap().to_id.get(&dest).copied();
-            if let Some(peer) = peer {
-                // Relayed peer: wrap and send to the relay instead.
+        let peer = self.synth.lock().unwrap().to_id.get(&dest).copied();
+        if let Some(peer) = peer {
+            // Relayed peer: wrap and send THROUGH a relay. Prefer the relay this
+            // peer's frames last reached us through (the proven-working return path),
+            // falling back to our configured relay for the first packet.
+            let via = self
+                .relay_path
+                .lock()
+                .unwrap()
+                .get(&peer)
+                .copied()
+                .or_else(|| self.current_relay());
+            if let Some(via) = via {
                 let frame = encode(&peer, &self.self_id, data);
-                return self.inner.send_to(&frame, relay).await;
+                return self.inner.send_to(&frame, via).await;
             }
         }
         self.inner.send_to(data, dest).await
@@ -176,19 +203,25 @@ impl<T: Transport> Transport for RelayTransport<T> {
             let Some((dest, src, inner)) = decode(&data) else {
                 return Ok((data, from)); // an ordinary mesh datagram
             };
-            // As a relay server, remember where every sender lives (registrations
-            // and data frames alike) so we can forward to it by id.
-            if self.is_relay_server() {
-                self.fwd.lock().unwrap().insert(src, from);
-            }
+            // Remember where every sender lives (registrations and data frames
+            // alike) so we can forward to it by id. Learned unconditionally so any
+            // node can act as an *automatically elected* relay bridge — a peer
+            // only ever registers with a node it picked as its relay, so this map
+            // is bounded to those who opted in (see the daemon's bridge election).
+            self.fwd.lock().unwrap().insert(src, from);
             if dest == self.self_id {
-                // Relayed to us — unwrap and surface as the peer's synthetic
-                // endpoint so the engine treats it like a direct datagram.
+                // Relayed to us — remember which relay delivered it so our replies
+                // to `src` go back through the same (working) bridge, then unwrap and
+                // surface as the peer's synthetic endpoint so the engine treats it
+                // like a direct datagram.
+                self.relay_path.lock().unwrap().insert(src, from);
                 let synth = self.endpoint_for(src);
                 return Ok((inner.to_vec(), synth));
             }
-            if self.is_relay_server() && dest != ZERO_ID {
-                // Forward to the destination's last-seen address (drop if unknown).
+            if dest != ZERO_ID {
+                // Forward to the destination's last-seen address. Drop if unknown
+                // (the dest hasn't registered with us) — so we only ever relay for
+                // peers that elected us, never arbitrary strangers.
                 let dest_addr = self.fwd.lock().unwrap().get(&dest).copied();
                 if let Some(addr) = dest_addr {
                     let _ = self.inner.send_to(&data, addr).await;
@@ -354,5 +387,70 @@ mod tests {
             .expect("A should receive the relayed reply")
             .unwrap();
         assert_eq!(data2, b"reply");
+    }
+
+    /// Automatic relay-bridge election: a node that was NEVER designated a relay
+    /// server (`set_relay_server` is never called) still forwards relay frames for
+    /// peers that registered with it. This is what lets any well-connected node be
+    /// elected as a bridge on the fly — the daemon's bridge election points two
+    /// clients at it and they rendezvous through it with no manual designation.
+    #[tokio::test]
+    async fn undesignated_node_forwards_for_registrants() {
+        let r_id = [0x11; 32];
+        let a_id = [0x22; 32];
+        let b_id = [0x33; 32];
+
+        // R is a plain node — NOT a relay server (the key difference).
+        let r = Arc::new(RelayTransport::new(
+            UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+            None,
+            r_id,
+        ));
+        assert!(!r.is_relay_server(), "R must not be a designated relay server");
+        let r_addr = r.local_addr().unwrap();
+
+        let ta = Arc::new(RelayTransport::new(
+            UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+            Some(r_addr),
+            a_id,
+        ));
+        let tb = Arc::new(RelayTransport::new(
+            UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+            Some(r_addr),
+            b_id,
+        ));
+
+        {
+            let r = Arc::clone(&r);
+            tokio::spawn(async move {
+                loop {
+                    if r.recv_from().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Both clients elect R and register — R learns their addresses by id even
+        // though it was never told to be a relay.
+        ta.register().await.unwrap();
+        tb.register().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let synth_b = ta.endpoint_for(b_id);
+        ta.send_to(b"bridged with no designation", synth_b)
+            .await
+            .unwrap();
+        let (data, _) = tokio::time::timeout(Duration::from_secs(2), tb.recv_from())
+            .await
+            .expect("B should receive the relayed packet via the undesignated bridge")
+            .unwrap();
+        assert_eq!(data, b"bridged with no designation");
     }
 }
