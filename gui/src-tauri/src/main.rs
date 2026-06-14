@@ -185,7 +185,11 @@ async fn set_exit(node_id: Option<String>) -> Result<(), String> {
         Some(hex) => Some(parse_node_id(&hex).ok_or("invalid node id")?),
         None => None,
     };
-    send(Request::SetExit { node_id: parsed }).await
+    send(Request::SetExit {
+        node_id: parsed,
+        full_tunnel: true,
+    })
+    .await
 }
 
 /// Volunteer (or stop) as an exit node for other peers.

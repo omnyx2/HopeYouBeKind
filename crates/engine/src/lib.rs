@@ -122,6 +122,12 @@ pub struct Engine {
     /// where the tie-break's designated initiator may be the unreachable side.
     /// Shared so the IPC handle can register pins at runtime.
     force_initiate: Arc<std::sync::Mutex<HashSet<NodeId>>>,
+    /// Set when this node is the designated relay server. A relay is publicly
+    /// reachable and NAT'd peers can't be cold-dialled, so it never *initiates*
+    /// handshakes — clients pin it (`force_initiate`) and drive the handshake,
+    /// the relay only responds. This also prevents a double-initiation (both the
+    /// relay's id-tie-break INIT and the client's pin INIT) that could desync.
+    relay_role: Arc<AtomicBool>,
     /// Initiator side: when we last sent a handshake INIT to each peer. Gates
     /// re-initiation to at most once per [`REKEY_TIMEOUT`] so a re-init never
     /// overwrites an in-flight `pending` before its response can complete it
@@ -249,6 +255,7 @@ impl Engine {
             peer_serial: HashMap::new(),
             resync: Arc::new(AtomicBool::new(false)),
             force_initiate: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            relay_role: Arc::new(AtomicBool::new(false)),
             last_init: HashMap::new(),
             last_responded: HashMap::new(),
             established: HashMap::new(),
@@ -294,6 +301,7 @@ impl Engine {
             revocations: Arc::clone(&self.revocations),
             resync: Arc::clone(&self.resync),
             force_initiate: Arc::clone(&self.force_initiate),
+            relay_role: Arc::clone(&self.relay_role),
             suite: Arc::clone(&self.suite),
             crypto_stats: Arc::clone(&self.crypto_stats),
             session_snapshot: Arc::clone(&self.session_snapshot),
@@ -432,8 +440,17 @@ impl Engine {
     /// drives the handshake regardless of id ordering (the unreachable side's
     /// INIT goes nowhere anyway).
     fn should_initiate_to(&self, peer: &NodeId) -> bool {
-        self.force_initiate.lock().unwrap().contains(peer)
-            || self.identity.node_id().0 < peer.0
+        // An explicit pin always wins (we hold a reachable address).
+        if self.force_initiate.lock().unwrap().contains(peer) {
+            return true;
+        }
+        // A relay server never cold-initiates: it's the publicly-reachable side,
+        // its peers are NAT'd (uncallable), and clients pin it and drive the
+        // handshake. Initiating here would only race the client's pin INIT.
+        if self.relay_role.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.identity.node_id().0 < peer.0
     }
 
     /// Send a handshake INIT toward every candidate `endpoints` at once (hole
@@ -1023,6 +1040,7 @@ pub struct EngineHandle {
     revocations: Arc<std::sync::Mutex<RevocationList>>,
     resync: Arc<AtomicBool>,
     force_initiate: Arc<std::sync::Mutex<HashSet<NodeId>>>,
+    relay_role: Arc<AtomicBool>,
     suite: Arc<std::sync::Mutex<Arc<dyn CryptoSuite>>>,
     crypto_stats: Arc<std::sync::Mutex<HashMap<&'static str, SuiteAccum>>>,
     session_snapshot: Arc<std::sync::Mutex<Vec<SessionDetail>>>,
@@ -1059,6 +1077,13 @@ impl EngineHandle {
     /// pinning side drives the handshake even when reachability is one-sided.
     pub fn pin_peer(&self, id: NodeId) {
         self.force_initiate.lock().unwrap().insert(id);
+    }
+
+    /// Mark (or unmark) this node as the designated relay server, so it stops
+    /// cold-initiating handshakes (clients pin it and drive them instead). Set by
+    /// the daemon's manifest consumer when it learns it's listed as a relay.
+    pub fn set_relay_role(&self, on: bool) {
+        self.relay_role.store(on, Ordering::Relaxed);
     }
 
     /// Route this node's internet traffic through `node_id` (or `None` for direct).

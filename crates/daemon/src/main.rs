@@ -702,16 +702,30 @@ async fn main() -> Result<()> {
                     handle.set_enabled(false);
                     Response::Done
                 }
-                Request::SetExit { node_id } => {
+                Request::SetExit {
+                    node_id,
+                    full_tunnel,
+                } => {
                     handle.set_exit_node(node_id);
                     match node_id {
+                        // Split tunnel: engine forwards to the exit, but we leave the
+                        // OS default route alone (the caller routes only chosen
+                        // destinations into the TUN). Non-disruptive — never knocks
+                        // the host offline, used for verification + selective routing.
+                        Some(_) if !full_tunnel => {
+                            tracing::info!("exit set (split tunnel — default route untouched)");
+                        }
                         Some(id) => {
+                            // Full tunnel: pin a host route to the exit's *real* underlay
+                            // endpoint (the public one, not a LAN candidate) so it stays
+                            // off the tunnel — otherwise the very path carrying the exit
+                            // session (and relay/DHT, if same anchor) loops into the tun.
                             let endpoint_ip = handle
                                 .peers()
                                 .await
                                 .iter()
                                 .find(|p| p.id == id)
-                                .and_then(|p| p.endpoints.first().map(|e| e.ip()));
+                                .and_then(|p| pick_relay_addr(&p.endpoints).map(|e| e.ip()));
                             match (tun_name.as_deref(), endpoint_ip) {
                                 (Some(name), Some(ip)) => exit::route_through(name, ip),
                                 _ => tracing::warn!("cannot route via exit (no tun or endpoint)"),
@@ -934,12 +948,23 @@ async fn start_dht(
                         Some(bytes) => match NetworkManifest::from_bytes(&bytes) {
                             Ok(m) if m.verify(&net).is_ok() => {
                                 tracing::debug!(relays = m.relays().len(), "manifest fetched");
+                                // Pin EVERY designated relay (each is a publicly
+                                // reachable anchor) so all of them become direct peers —
+                                // usable as a relay-bypass path AND as exit-node
+                                // candidates — not just the one we select for relaying.
+                                for &r in m.relays() {
+                                    if r != me {
+                                        handle.pin_peer(NodeId(r));
+                                    }
+                                }
                                 if m.relays().contains(&me) {
                                     // We're designated a relay: forward on our mesh socket.
                                     if !relay.is_relay_server() {
                                         tracing::info!("designated as relay — forwarding on mesh socket");
                                     }
                                     relay.set_relay_server(true);
+                                    // Stop cold-initiating: clients pin us and drive handshakes.
+                                    handle.set_relay_role(true);
                                     *relay_id.lock().unwrap() = None;
                                 } else if let Some(&rid) = m.relays().iter().find(|&&r| r != me) {
                                     // Point at the first relay that isn't us and resolves.
@@ -950,6 +975,12 @@ async fn start_dht(
                                                     tracing::info!(relay = %NodeId(rid).fingerprint(), %addr, "relay selected from manifest");
                                                 }
                                                 relay.set_relay(Some(addr));
+                                                // Pin the public anchor: drive a direct handshake to
+                                                // it regardless of id tie-break (it's reachable to us
+                                                // but can't dial us back), so it becomes a usable
+                                                // direct peer (relay-bypass + exit-node candidate).
+                                                handle.pin_peer(NodeId(rid));
+                                                handle.set_relay_role(false);
                                                 *relay_id.lock().unwrap() = Some(rid);
                                             }
                                             None => tracing::debug!(relay = %NodeId(rid).fingerprint(), "relay designated but its endpoint did not resolve"),
