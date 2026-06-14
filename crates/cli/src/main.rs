@@ -45,6 +45,34 @@ enum Command {
     /// daemon's `--admin-allow` list (run this as a name on that list).
     #[command(subcommand)]
     Capture(CaptureCommand),
+    /// Exit node (VPN-style full tunnel): act as an exit for others, or route
+    /// this node's internet traffic out through a chosen exit peer.
+    #[command(subcommand)]
+    Exit(ExitCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum ExitCommand {
+    /// Volunteer this node as an exit (IP forwarding + source-NAT). `--off` stops.
+    Allow {
+        /// Stop acting as an exit node.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Route this node's internet traffic through exit peer `node_id` (full
+    /// tunnel). `--off` (or omitting node_id) goes back to direct.
+    Use {
+        /// The exit peer's 64-hex node id (from `peers` / its Status).
+        node_id: Option<String>,
+        /// Go back to direct internet (no exit).
+        #[arg(long)]
+        off: bool,
+        /// Split tunnel: forward to the exit but DON'T divert the OS default
+        /// route — only destinations you route into the TUN egress via the exit.
+        /// Non-disruptive (won't knock the host offline); use for verification.
+        #[arg(long)]
+        split: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -192,6 +220,21 @@ impl Command {
             Command::Capture(CaptureCommand::Stop) => Request::CaptureStop,
             Command::Capture(CaptureCommand::Status) => Request::CaptureStatus,
             Command::Capture(CaptureCommand::Packets { after }) => Request::Packets { after: *after },
+            Command::Exit(ExitCommand::Allow { off }) => Request::AllowExit { enabled: !off },
+            Command::Exit(ExitCommand::Use {
+                node_id,
+                off,
+                split,
+            }) => {
+                let node_id = match (off, node_id) {
+                    (true, _) | (false, None) => None,
+                    (false, Some(hex)) => Some(parse_id(hex)?),
+                };
+                Request::SetExit {
+                    node_id,
+                    full_tunnel: !split,
+                }
+            }
         })
     }
 }
@@ -222,6 +265,13 @@ fn print_response(response: Response) {
             );
             println!("mesh      {}", if s.running { "up" } else { "down" });
             println!("peers     {}", s.peer_count);
+            println!(
+                "exit-via  {}",
+                s.exit_node
+                    .map(|e| e.fingerprint())
+                    .unwrap_or_else(|| "direct".into())
+            );
+            println!("is-exit   {}", if s.is_exit { "yes" } else { "no" });
         }
         Response::Peers(peers) => {
             if peers.is_empty() {

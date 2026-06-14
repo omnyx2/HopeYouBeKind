@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{NodeId, PeerInfo, VirtualIp};
 
+/// Serde default for `SetExit::full_tunnel` — a `set_exit` without the field
+/// (e.g. from the GUI) means classic full-tunnel VPN.
+fn default_true() -> bool {
+    true
+}
+
 /// A command from a client to the daemon.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -22,8 +28,16 @@ pub enum Request {
     /// List known peers.
     Peers,
     /// Route this node's internet traffic through `node_id` (or `None` to stop
-    /// using an exit node and go direct again).
-    SetExit { node_id: Option<NodeId> },
+    /// using an exit node and go direct again). `full_tunnel` diverts the OS
+    /// default route into the tunnel (classic VPN); when false (split tunnel) the
+    /// engine still forwards to the exit but the OS default route is left alone,
+    /// so only destinations the caller routes into the TUN egress via the exit
+    /// (used for non-disruptive verification — never knocks the host offline).
+    SetExit {
+        node_id: Option<NodeId>,
+        #[serde(default = "default_true")]
+        full_tunnel: bool,
+    },
     /// Allow (or stop allowing) this node to act as an exit for others.
     AllowExit { enabled: bool },
     /// Manually pin a peer by node id + physical address — connect across the
