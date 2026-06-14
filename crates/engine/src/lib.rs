@@ -575,15 +575,23 @@ impl Engine {
             // Internet-bound traffic → our exit node, if one is selected.
             // (No exit set ⇒ drop, so nothing leaks outside the tunnel.)
             match *self.exit_node.lock().unwrap() {
-                Some(id) => id,
-                None => return Ok(()),
+                Some(id) => {
+                    tracing::debug!(%dst, exit = %id.fingerprint(), "tun: internet-bound packet → exit");
+                    id
+                }
+                None => {
+                    tracing::debug!(%dst, "tun: internet-bound packet but no exit set — drop");
+                    return Ok(());
+                }
             }
         };
 
         let Some(endpoint) = self.endpoint_for(&peer_id).await else {
+            tracing::debug!(peer = %peer_id.fingerprint(), "tun: no endpoint for target — drop");
             return Ok(()); // no path to this peer yet
         };
         let Some(session) = self.sessions.get_mut(&endpoint) else {
+            tracing::debug!(%endpoint, "tun: no session for endpoint — drop");
             return Ok(()); // session still being established
         };
         // Observe what we're sending before it's sealed (the monitor needs the
