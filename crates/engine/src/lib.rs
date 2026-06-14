@@ -1129,6 +1129,11 @@ impl EngineHandle {
         *self.exit_node.lock().unwrap() = node_id;
     }
 
+    /// The exit node our internet is currently routed through, if any.
+    pub fn exit_node(&self) -> Option<NodeId> {
+        *self.exit_node.lock().unwrap()
+    }
+
     /// Volunteer (or stop volunteering) as an exit node for other peers.
     pub fn set_allow_exit(&self, allow: bool) {
         self.allow_exit.store(allow, Ordering::Relaxed);

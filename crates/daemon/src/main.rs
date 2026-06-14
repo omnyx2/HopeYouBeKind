@@ -800,6 +800,39 @@ async fn main() -> Result<()> {
                                     std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
                                 ]);
                             }
+                            // Kill-switch watchdog: full tunnel diverts the OS default
+                            // route through the exit, so if that exit path can't actually
+                            // carry traffic (a flaky/relayed exit is common) the host is
+                            // stranded OFFLINE. Probe the internet through the tunnel a
+                            // few seconds after switching; if it's dead, auto-revert to
+                            // direct internet so the user isn't cut off. (Internet that
+                            // works answers well within 20s.)
+                            let wd = handle.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(20)).await;
+                                // Bail if the user already changed/cleared the exit.
+                                if wd.exit_node() != Some(id) {
+                                    return;
+                                }
+                                // A successful TCP connect to a public host travels
+                                // through the tun → engine → exit, so it proves the exit
+                                // is actually forwarding our internet.
+                                let alive = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    tokio::net::TcpStream::connect("1.1.1.1:443"),
+                                )
+                                .await
+                                .map(|r| r.is_ok())
+                                .unwrap_or(false);
+                                if !alive && wd.exit_node() == Some(id) {
+                                    tracing::warn!(
+                                        "kill-switch: full-tunnel exit not passing traffic ~20s after switch — auto-reverting to direct internet"
+                                    );
+                                    exit::restore_dns();
+                                    exit::restore_routes();
+                                    wd.set_exit_node(None);
+                                }
+                            });
                         }
                         None => {
                             exit::restore_dns();
