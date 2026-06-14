@@ -204,13 +204,16 @@ pub fn enable_nat() {
                 "MASQUERADE",
             ],
         );
+        // INSERT at the top, not append: distros like RHEL/Oracle Linux ship a
+        // default `FORWARD -j REJECT` rule, so an appended ACCEPT never runs and
+        // forwarded (exit) traffic is rejected. -I puts us before that REJECT.
         run(
             "iptables",
-            &["-A", "FORWARD", "-s", "100.64.0.0/10", "-j", "ACCEPT"],
+            &["-I", "FORWARD", "1", "-s", "100.64.0.0/10", "-j", "ACCEPT"],
         );
         run(
             "iptables",
-            &["-A", "FORWARD", "-d", "100.64.0.0/10", "-j", "ACCEPT"],
+            &["-I", "FORWARD", "1", "-d", "100.64.0.0/10", "-j", "ACCEPT"],
         );
         tracing::warn!(wan, "exit NAT enabled (masquerade)");
     }
