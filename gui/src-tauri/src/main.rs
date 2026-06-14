@@ -9,6 +9,7 @@
     windows_subsystem = "windows"
 )]
 
+use lattice_proto::flow::{FlowAction, FlowMatch, FlowRule, FlowScope};
 use lattice_proto::ipc::{Request, Response};
 use serde::Serialize;
 
@@ -116,6 +117,76 @@ async fn list_flows() -> Result<Vec<FlowView>, String> {
             })
             .collect()),
         Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Err("unexpected response".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[derive(Serialize)]
+struct FlowRuleView {
+    priority: u16,
+    matcher: String,
+    action: String,
+}
+
+fn fmt_flow_match(m: &FlowMatch) -> String {
+    let mut p = Vec::new();
+    match m.scope {
+        Some(FlowScope::Overlay) => p.push("scope=overlay".to_string()),
+        Some(FlowScope::Internet) => p.push("scope=internet".to_string()),
+        None => {}
+    }
+    if let Some((ip, len)) = m.dst_cidr {
+        p.push(format!("dst={ip}/{len}"));
+    }
+    if let Some(pr) = m.proto {
+        let n = match pr {
+            6 => "tcp".into(),
+            17 => "udp".into(),
+            1 => "icmp".into(),
+            x => x.to_string(),
+        };
+        p.push(format!("proto={n}"));
+    }
+    if let Some(dp) = m.dport {
+        p.push(format!("dport={dp}"));
+    }
+    if p.is_empty() {
+        "*".into()
+    } else {
+        p.join(" ")
+    }
+}
+
+fn fmt_flow_action(a: &FlowAction) -> String {
+    match a {
+        FlowAction::ToOverlayOwner => "overlay-owner".into(),
+        FlowAction::ToExit(None) => "exit(configured)".into(),
+        FlowAction::ToExit(Some(id)) => format!("exit({})", id.fingerprint()),
+        FlowAction::ToPeer(id) => format!("peer({})", id.fingerprint()),
+        FlowAction::Local => "local".into(),
+        FlowAction::Drop => "DROP".into(),
+    }
+}
+
+/// The SDN flow table (admin-signed, shared by every node). Admin-only — a member
+/// node's daemon answers "not an admin node", which we surface as an empty table.
+#[tauri::command]
+async fn list_flow_rules() -> Result<Vec<FlowRuleView>, String> {
+    match lattice_ipc::request(SOCKET, Request::FlowList).await {
+        Ok(Response::FlowRules(mut rules)) => {
+            rules.sort_by(|a: &FlowRule, b: &FlowRule| b.priority.cmp(&a.priority));
+            Ok(rules
+                .into_iter()
+                .map(|r| FlowRuleView {
+                    priority: r.priority,
+                    matcher: fmt_flow_match(&r.match_),
+                    action: fmt_flow_action(&r.action),
+                })
+                .collect())
+        }
+        // Not admin (or no rules) → empty table; the GUI shows the default note.
+        Ok(Response::Error { .. }) => Ok(Vec::new()),
         Ok(_) => Err("unexpected response".into()),
         Err(e) => Err(e.to_string()),
     }
@@ -397,6 +468,7 @@ fn main() {
             get_status,
             list_peers,
             list_flows,
+            list_flow_rules,
             network_info,
             join_network,
             mesh_up,

@@ -28,6 +28,9 @@
           <button class="nav-item" data-tab="network">
             <span class="nav-ico">⇄</span> Network
           </button>
+          <button class="nav-item" data-tab="topology">
+            <span class="nav-ico">🕸</span> Topology
+          </button>
         </div>
         <div class="sidebar-foot">
           <span id="conn-dot" class="conn-dot off"></span>
@@ -203,6 +206,40 @@
             </div>
             <p class="hint">A relay forwards your encrypted traffic when a peer
               can't be reached directly (CGNAT). Set it on both ends.</p>
+          </div>
+        </section>
+
+        <!-- ===== TOPOLOGY ===== -->
+        <section data-panel="topology" class="panel hidden">
+          <h1 class="panel-title">Topology</h1>
+          <p class="panel-sub">The mesh from this node — direct, relayed, and exit
+            links. Click a node for its routing &amp; flow tables.</p>
+          <div class="topo-wrap">
+            <div class="topo-graph card">
+              <canvas id="topo-canvas"></canvas>
+              <div class="topo-legend">
+                <span><i class="ln direct"></i> direct</span>
+                <span><i class="ln relay"></i> relayed</span>
+                <span><i class="ln connecting"></i> connecting</span>
+                <span><i class="dot-ex"></i> exit</span>
+              </div>
+            </div>
+            <aside class="topo-side card">
+              <div id="topo-detail">
+                <h3 class="topo-h">Selected node</h3>
+                <p class="muted small">Click a node in the graph.</p>
+              </div>
+              <h3 class="topo-h">Routing table</h3>
+              <table class="topo-table" id="topo-routes">
+                <thead><tr><th>virtual IP</th><th>via</th><th>state</th></tr></thead>
+                <tbody></tbody>
+              </table>
+              <h3 class="topo-h">Flow table <span class="muted small">(SDN, signed)</span></h3>
+              <table class="topo-table" id="topo-flows">
+                <thead><tr><th>pri</th><th>match</th><th>action</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </aside>
           </div>
         </section>
       </main>

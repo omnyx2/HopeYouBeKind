@@ -180,3 +180,25 @@ table.flows tbody tr:hover { background: #1b2030; }
   background: #2a2e3a; color: var(--text); padding: 10px 16px; border-radius: 10px;
   font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,0.45); z-index: 10;
 }
+
+/* ===== Topology ===== */
+.panel-sub { color: var(--muted, #94a3b8); font-size: 13px; margin: -4px 0 14px; }
+.topo-wrap { display: flex; gap: 14px; align-items: stretch; height: calc(100vh - 150px); min-height: 420px; }
+.topo-graph { position: relative; flex: 1 1 60%; padding: 0; overflow: hidden; }
+#topo-canvas { width: 100%; height: 100%; display: block; }
+.topo-legend { position: absolute; left: 12px; bottom: 10px; display: flex; gap: 14px; font-size: 11px; color: var(--muted, #94a3b8); background: rgba(15,23,42,.55); padding: 6px 10px; border-radius: 8px; }
+.topo-legend i.ln { display: inline-block; width: 16px; height: 0; border-top-width: 2px; border-top-style: solid; vertical-align: middle; margin-right: 4px; }
+.topo-legend i.ln.direct { border-color: #34d399; }
+.topo-legend i.ln.relay { border-color: #fbbf24; border-top-style: dashed; }
+.topo-legend i.ln.connecting { border-color: #64748b; border-top-style: dotted; }
+.topo-legend i.dot-ex { display: inline-block; width: 10px; height: 10px; border: 2px solid #a78bfa; border-radius: 50%; vertical-align: middle; margin-right: 4px; }
+.topo-side { flex: 0 0 320px; overflow-y: auto; }
+.topo-h { font-size: 13px; margin: 14px 0 6px; color: #cbd5e1; }
+.topo-h:first-child { margin-top: 0; }
+.topo-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.topo-table th { text-align: left; color: var(--muted, #94a3b8); font-weight: 500; padding: 4px 6px; border-bottom: 1px solid rgba(148,163,184,.2); }
+.topo-table td { padding: 4px 6px; border-bottom: 1px solid rgba(148,163,184,.08); }
+.topo-table .small { font-size: 11px; }
+.kv { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
+.kv span { color: var(--muted, #94a3b8); }
+.small { font-size: 11px; }
