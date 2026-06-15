@@ -1,0 +1,19 @@
+[package]
+name = "lattice-meshd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "v2 multi-mesh control-plane daemon (meshd): holds the MeshContainer and serves the v2 IPC over a unix socket."
+
+[[bin]]
+name = "meshd"
+path = "src/main.rs"
+
+[dependencies]
+lattice-mesh = { path = "../mesh", version = "0.7.0" }
+lattice-proto.workspace = true
+tokio = { workspace = true }
+serde_json.workspace = true
+rand.workspace = true
+anyhow.workspace = true

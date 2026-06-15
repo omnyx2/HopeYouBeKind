@@ -609,6 +609,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-meshd"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "lattice-mesh",
+ "lattice-proto",
+ "rand",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lattice-net"
 version = "0.7.0"
 dependencies = [

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use lattice_proto::wire_v2::{MemberId, MeshId};
 
 pub mod charter;
+pub mod ipc;
 pub mod policy;
 pub mod roster;
 
@@ -33,6 +34,8 @@ pub use roster::{Member, Roster, RosterError};
 pub struct Mesh {
     /// This computer's local 1-byte handle for the mesh (the `meshid` header field).
     pub id: MeshId,
+    /// A human label for the mesh (UX only; not part of the signed charter).
+    pub name: String,
     pub charter: GenesisCharter,
     pub roster: Roster,
     /// Monotonic crypto epoch — 0 at genesis, +1 per re-cipher (§5).
@@ -46,9 +49,10 @@ pub struct Mesh {
 
 impl Mesh {
     /// A freshly-joined mesh at epoch 0 with an empty exit selection.
-    pub fn new(id: MeshId, charter: GenesisCharter, me: MemberId) -> Self {
+    pub fn new(id: MeshId, name: String, charter: GenesisCharter, me: MemberId) -> Self {
         Self {
             id,
+            name,
             charter,
             roster: Roster::new(),
             epoch: 0,
@@ -122,7 +126,7 @@ mod tests {
 
     #[test]
     fn new_mesh_starts_at_epoch_zero_with_no_exit() {
-        let m = Mesh::new(3, charter(), 1);
+        let m = Mesh::new(3, "home".into(), charter(), 1);
         assert_eq!(m.id, 3);
         assert_eq!(m.epoch, 0);
         assert_eq!(m.me, 1);
@@ -134,8 +138,8 @@ mod tests {
     fn container_holds_meshes_by_handle() {
         let mut c = MeshContainer::new();
         assert!(c.is_empty());
-        assert!(c.add(Mesh::new(1, charter(), 1)).is_none());
-        assert!(c.add(Mesh::new(2, charter(), 1)).is_none());
+        assert!(c.add(Mesh::new(1, "a".into(), charter(), 1)).is_none());
+        assert!(c.add(Mesh::new(2, "b".into(), charter(), 1)).is_none());
         assert_eq!(c.len(), 2);
         assert_eq!(c.get(1).unwrap().id, 1);
         assert!(c.get(9).is_none());
@@ -153,8 +157,8 @@ mod tests {
     #[test]
     fn add_returns_replaced_mesh() {
         let mut c = MeshContainer::new();
-        c.add(Mesh::new(1, charter(), 1));
-        let prev = c.add(Mesh::new(1, charter(), 5));
+        c.add(Mesh::new(1, "a".into(), charter(), 1));
+        let prev = c.add(Mesh::new(1, "a".into(), charter(), 5));
         assert_eq!(prev.unwrap().me, 1);
         assert_eq!(c.get(1).unwrap().me, 5);
     }
