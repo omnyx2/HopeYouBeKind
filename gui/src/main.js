@@ -46,12 +46,8 @@ function activateTab(name) {
 }
 
 async function setMode(mode) {
-  if (mode === "mesh") {
-    if (CURRENT_MESH == null) {
-      try { CURRENT_MESH = ((await meshd("ListMeshes")).Meshes || [])[0]?.id ?? null; } catch {}
-    }
-    if (CURRENT_MESH == null) { toast("no mesh yet — create one in User mode"); mode = "user"; }
-  }
+  // No auto-picking a mesh: Mesh mode shows whatever mesh is current (set via the
+  // egress dropdown / `manage ›`), or a plain page when on the default network.
   MODE = mode;
   document.body.classList.toggle("mode-mesh", mode === "mesh");
   document.body.classList.toggle("mode-user", mode === "user");
@@ -61,9 +57,21 @@ async function setMode(mode) {
 }
 
 async function refreshMode() {
-  if (MODE === "mesh" && CURRENT_MESH != null) await renderOverview(CURRENT_MESH);
-  else await renderMeshes();
+  if (MODE === "mesh") {
+    if (CURRENT_MESH != null) await renderOverview(CURRENT_MESH);
+    else renderMeshPlain();
+  } else {
+    await renderMeshes();
+  }
   refreshTopbar();
+}
+
+// Mesh mode with no mesh selected (you're on the default network) — a plain page.
+function renderMeshPlain() {
+  el("mesh-detail").innerHTML = `<div class="empty" style="padding:48px 24px;text-align:center">
+      On the default network — no mesh selected.
+      <div class="muted small" style="margin-top:8px">Pick a mesh as egress above, or open one from the Meshes page.</div>
+    </div>`;
 }
 
 // ---- Mesh mode: Topology page (§4 — static graph from MeshInfo) ----
@@ -149,8 +157,16 @@ async function renderMeshes() {
     el("mesh-list").innerHTML = `<li class="empty">meshd not reachable — start it: <code>./target/debug/meshd</code></li>`;
     return;
   }
-  // Just the meshes — no "Default network" row. The no-mesh / direct-internet
-  // egress is chosen from the top-bar egress dropdown.
+  const noEgress = !meshes.some((m) => m.is_current);
+  const originRow = `<li>
+      <div class="peer-left">
+        <span class="dot ${noEgress ? "connected" : "known"}"></span>
+        <b>Default network</b>
+        <span class="muted small">${noEgress ? "in use — your normal internet, no mesh" : "your normal internet, no mesh"}</span>
+        ${noEgress ? `<span class="pill on">in use</span>` : ""}
+      </div>
+      <div><button class="small-btn" data-origin ${noEgress ? "disabled" : ""}>use this</button></div>
+    </li>`;
   const rows = meshes.length ? meshes.map((m) => {
     const egress = m.is_current ? `<span class="pill on">egress</span>` : "";
     const exit = m.exit != null ? `exit #${m.exit}` : "no exit";
@@ -167,7 +183,7 @@ async function renderMeshes() {
       </div>
     </li>`;
   }).join("") : `<li class="empty">no meshes yet — create one above</li>`;
-  el("mesh-list").innerHTML = rows;
+  el("mesh-list").innerHTML = originRow + rows;
 }
 
 el("mesh-list").addEventListener("click", async (e) => {
@@ -177,12 +193,15 @@ el("mesh-list").addEventListener("click", async (e) => {
   if (origin) {
     try { await meshd({ SetCurrent: { mesh: null } }); toast("Using default network"); }
     catch (x) { toast(String(x)); }
+    CURRENT_MESH = null;
     return refreshMode();
   }
   if (manage) { CURRENT_MESH = parseInt(manage.dataset.manage, 10); return setMode("mesh"); }
   if (egress) {
-    try { await meshd({ SetCurrent: { mesh: parseInt(egress.dataset.egress, 10) } }); toast("egress set"); }
+    const id = parseInt(egress.dataset.egress, 10);
+    try { await meshd({ SetCurrent: { mesh: id } }); toast("egress set"); }
     catch (x) { toast(String(x)); }
+    CURRENT_MESH = id;
     return refreshMode();
   }
 });
@@ -302,6 +321,9 @@ el("tb-egress").addEventListener("change", async (e) => {
     await meshd({ SetCurrent: { mesh: v === "origin" ? null : parseInt(v, 10) } });
     toast(v === "origin" ? "Using default network" : "egress set");
   } catch (err) { toast(String(err)); }
+  // The selected egress is also the mesh shown in Mesh mode — Default network ⇒
+  // no mesh ⇒ plain Mesh page.
+  CURRENT_MESH = v === "origin" ? null : parseInt(v, 10);
   refreshMode();
 });
 
