@@ -44,6 +44,10 @@ async fn main() -> anyhow::Result<()> {
         tun.name()
     );
     let transport = UdpTransport::bind(bind).await?;
+    // If this node is the exit, NAT the mesh's overlay /24 out to the internet.
+    if std::env::var("EXIT_NODE").as_deref() == Ok("1") {
+        enable_exit_nat(prefix, mesh);
+    }
     let dp = MeshDataPlane::new(mesh, my, prefix, suite("default", &secret, 0));
     lattice_meshrun::run(dp, tun, transport, endpoints, exit).await;
     Ok(())
@@ -51,6 +55,26 @@ async fn main() -> anyhow::Result<()> {
 
 fn env(k: &str) -> anyhow::Result<String> {
     std::env::var(k).map_err(|_| anyhow::anyhow!("missing env {k}"))
+}
+
+/// Make this node an exit: forward + masquerade the mesh's overlay /24 out to the
+/// real internet (Linux; reuses the v1 exit.rs recipe). macOS exit would use pf.
+#[cfg(target_os = "linux")]
+fn enable_exit_nat(prefix: [u8; 2], mesh: u8) {
+    use std::process::Command;
+    let cidr = format!("{}.{}.{}.0/24", prefix[0], prefix[1], mesh);
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).status();
+    let _ = Command::new("iptables")
+        .args(["-t", "nat", "-A", "POSTROUTING", "-s", &cidr, "-j", "MASQUERADE"])
+        .status();
+    let _ = Command::new("iptables").args(["-A", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]).status();
+    let _ = Command::new("iptables").args(["-A", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]).status();
+    eprintln!("meshrun: exit NAT enabled for {cidr}");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_exit_nat(_prefix: [u8; 2], _mesh: u8) {
+    eprintln!("meshrun: exit NAT is implemented for Linux (the Oracle exit); skipped");
 }
 
 fn parse_prefix(s: &str) -> anyhow::Result<[u8; 2]> {
