@@ -33,10 +33,16 @@ async fn main() -> anyhow::Result<()> {
     let exit: Option<MemberId> = std::env::var("EXIT").ok().and_then(|s| s.parse().ok());
 
     let overlay = Ipv4Addr::new(prefix[0], prefix[1], mesh, my);
+    // Conservative overlay MTU. The sealed datagram = inner(≤MTU) + 29B (5B header
+    // + 8B seq + 16B tag) + 28B IP/UDP. Keep it small enough to never need IP
+    // fragmentation on a reduced-PMTU underlay (campus firewalls drop fragments,
+    // which silently kills large packets like SSH's PQ KEX reply). 1280 mirrors
+    // Tailscale's default. Override with MTU= if the path allows larger.
+    let mtu: u16 = std::env::var("MTU").ok().and_then(|s| s.parse().ok()).unwrap_or(1280);
     let tun = open(TunConfig {
         address: VirtualIp(overlay),
         prefix_len: 24,
-        mtu: 1380,
+        mtu,
     })
     .await?;
     eprintln!(

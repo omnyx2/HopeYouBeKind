@@ -84,12 +84,11 @@ impl LinuxTun {
 fn configure_interface(name: &str, config: &TunConfig) -> Result<(), TunError> {
     let cidr = format!("{}/{}", config.address, config.prefix_len);
     run(&["addr", "add", &cidr, "dev", name])?;
-    run(&["link", "set", name, "up"])?;
-    // Route the overlay subnet through this interface (non-fatal if it exists).
-    let (net, prefix) = lattice_proto::OVERLAY_SUBNET;
-    let _ = Command::new("ip")
-        .args(["route", "add", &format!("{net}/{prefix}"), "dev", name])
-        .status();
+    // Set the overlay MTU (conservative, to avoid underlay fragmentation) and bring
+    // the link up. `ip addr add` already installs the connected /prefix route for
+    // this interface's own subnet, so no separate route command is needed.
+    let mtu = config.mtu.to_string();
+    run(&["link", "set", name, "mtu", &mtu, "up"])?;
     Ok(())
 }
 

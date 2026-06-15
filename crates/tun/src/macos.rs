@@ -114,9 +114,10 @@ fn tracing_name(_name: &str) {
 /// Bring the interface up with its overlay address and route the overlay subnet.
 fn configure_interface(name: &str, config: &TunConfig) -> Result<(), TunError> {
     let ip = config.address.to_string();
-    // utun is point-to-point: `ifconfig utunN <ip> <ip> up`.
+    let mtu = config.mtu.to_string();
+    // utun is point-to-point: `ifconfig utunN <ip> <ip> mtu <mtu> up`.
     let status = Command::new("ifconfig")
-        .args([name, &ip, &ip, "up"])
+        .args([name, &ip, &ip, "mtu", &mtu, "up"])
         .status()
         .map_err(|e| TunError::Io(format!("spawn ifconfig: {e}")))?;
     if !status.success() {
