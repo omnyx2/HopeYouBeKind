@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub mod flow;
 pub mod ipc;
 pub mod wire;
+pub mod wire_v2;
 
 /// A stable, content-addressed identifier for a node.
 ///
