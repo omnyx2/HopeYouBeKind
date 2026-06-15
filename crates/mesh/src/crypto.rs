@@ -60,6 +60,40 @@ impl MeshCipher {
     }
 }
 
+/// The **cipher seam** — a mesh's symmetric suite, kept deliberately separate so the
+/// data plane is suite-agnostic. The research time-window cipher
+/// (docs/CIPHER_TIMEWINDOW.md) will be a second `impl MeshSuite`, dropped in here
+/// without touching any caller. It is **parked** for now; we ship the simple
+/// default.
+pub trait MeshSuite: Send + Sync {
+    /// Suite name (logged / matched against `charter.initial_cipher`).
+    fn name(&self) -> &'static str;
+    /// Seal `plaintext` under per-message `seq`, authenticating `aad` (the header).
+    fn seal(&self, seq: u64, plaintext: &[u8], aad: &[u8]) -> Vec<u8>;
+    /// Open; `None` on auth failure (or, for forward-secure suites, once the key for
+    /// `seq` has been erased).
+    fn open(&self, seq: u64, ciphertext: &[u8], aad: &[u8]) -> Option<Vec<u8>>;
+}
+
+impl MeshSuite for MeshCipher {
+    fn name(&self) -> &'static str {
+        "chachapoly-epoch"
+    }
+    fn seal(&self, seq: u64, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+        MeshCipher::seal(self, seq, plaintext, aad)
+    }
+    fn open(&self, seq: u64, ciphertext: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
+        MeshCipher::open(self, seq, ciphertext, aad)
+    }
+}
+
+/// Build a mesh's cipher suite by name (from `charter.initial_cipher`). For now
+/// every name maps to the simple epoch-keyed default; the research time-window
+/// suite lands here later (one extra match arm + impl).
+pub fn suite(_name: &str, secret: &[u8; 32], epoch: u64) -> Box<dyn MeshSuite> {
+    Box::new(MeshCipher::new(secret, epoch))
+}
+
 fn epoch_key(secret: &[u8; 32], epoch: u64) -> [u8; 32] {
     let mut h = Blake2s256::new();
     h.update(b"lattice-mesh-epoch-v2");
@@ -127,5 +161,14 @@ mod tests {
     fn distinct_nonces_give_distinct_ciphertext() {
         let c = MeshCipher::new(&SECRET, 0);
         assert_ne!(c.seal(1, b"same", AAD), c.seal(2, b"same", AAD));
+    }
+
+    #[test]
+    fn suite_seam_round_trips() {
+        let s = suite("noise-ik-chachapoly", &SECRET, 0);
+        assert_eq!(s.name(), "chachapoly-epoch");
+        let ct = s.seal(1, b"via the seam", AAD);
+        assert_eq!(s.open(1, &ct, AAD).unwrap(), b"via the seam");
+        assert!(s.open(2, &ct, AAD).is_none());
     }
 }
