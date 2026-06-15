@@ -122,20 +122,31 @@ fn configure_interface(name: &str, config: &TunConfig) -> Result<(), TunError> {
     if !status.success() {
         return Err(TunError::Io(format!("ifconfig {name} failed: {status}")));
     }
-    // Route the whole overlay range through this interface. Non-fatal if the
-    // route already exists.
-    let (net, prefix) = lattice_proto::OVERLAY_SUBNET;
+    // Route THIS interface's own overlay subnet through it — derived from the
+    // configured address + prefix, not a hard-coded range. utun's point-to-point
+    // address only yields a host route, so the subnet route is required. (v1 passes
+    // the 100.64/10 overlay with prefix 10, so it still gets its /10; v2 per-mesh
+    // /24s like 10.99.3.0/24 now route correctly instead of leaking to the default
+    // gateway.) Non-fatal if the route already exists.
+    let net = subnet_base(config.address.0, config.prefix_len);
     let _ = Command::new("route")
         .args([
             "-q",
             "add",
             "-net",
-            &format!("{net}/{prefix}"),
+            &format!("{net}/{}", config.prefix_len),
             "-interface",
             name,
         ])
         .status();
     Ok(())
+}
+
+/// Network base address for `ip`/`prefix` (e.g. 10.99.3.1/24 → 10.99.3.0).
+fn subnet_base(ip: std::net::Ipv4Addr, prefix: u8) -> std::net::Ipv4Addr {
+    let bits = u32::from(ip);
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    std::net::Ipv4Addr::from(bits & mask)
 }
 
 #[async_trait::async_trait]

@@ -29,7 +29,7 @@ pub async fn run<X: Transport + 'static>(
     dp: MeshDataPlane,
     mut tun: Box<dyn TunDevice>,
     transport: X,
-    endpoints: HashMap<MemberId, SocketAddr>,
+    mut endpoints: HashMap<MemberId, SocketAddr>,
     exit: Option<MemberId>,
 ) {
     loop {
@@ -49,7 +49,14 @@ pub async fn run<X: Transport + 'static>(
             }
             // A frame from a peer → open & deliver to the TUN, or relay it onward.
             inbound = transport.recv_from() => {
-                let Ok((frame, _from)) = inbound else { break };
+                let Ok((frame, from)) = inbound else { break };
+                // P6.3b discovery: learn the sender's endpoint from the frame header's
+                // src so we can route replies back without pre-seeding every peer. A
+                // node that only knows where to *reach* a peer once that peer has
+                // spoken first (the exit learns the client; relays learn both sides).
+                if let Some((hdr, _)) = lattice_proto::wire_v2::decode(&frame) {
+                    endpoints.insert(hdr.src, from);
+                }
                 match dp.recv(&frame) {
                     Some(Inbound::Deliver(inner)) => { let _ = tun.write_packet(&inner).await; }
                     // P5 relay: we're a hop, not the destination — pass the frame on
