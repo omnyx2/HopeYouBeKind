@@ -33,7 +33,11 @@ use lattice_tun::{open as tun_open, TunConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1.
+
 const DEFAULT_SOCKET: &str = "/tmp/lattice-meshd.sock";
+/// Public resolver used for full-tunnel DNS (routed through the exit).
+const FULL_TUNNEL_DNS: &str = "1.1.1.1";
 /// A member is "live" if heard from within this window.
 const LIVE_WINDOW_MS: u64 = 30_000;
 /// Per-mesh UDP base port (mesh id is added).
@@ -62,6 +66,9 @@ struct MeshState {
     links: PeerLinks,
     /// The egress member, shared with the loop so SetExit steers it live.
     exit_sel: SharedExit,
+    /// The OS interface name of this mesh's TUN (set at bringup) — needed to divert
+    /// the default route for full-tunnel egress.
+    tun_name: Option<String>,
 }
 
 impl MeshState {
@@ -149,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
                             handle(req, &mut st)
                         };
                         if let Some(b) = bringup {
-                            bringup_dataplane(b).await;
+                            bringup_dataplane(b, Arc::clone(&state)).await;
                         }
                         resp
                     }
@@ -170,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
 /// Open the per-mesh TUN + UDP and spawn the data-plane loop. Failures (e.g. no
 /// root for the TUN) are logged and non-fatal: meshd keeps serving the control
 /// plane. The `links`/`exit_sel` handles are shared with [`MeshState`].
-async fn bringup_dataplane(b: Bringup) {
+async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     let overlay = Ipv4Addr::new(b.prefix[0], b.prefix[1], b.mesh_id, b.my_id);
     let tun = match tun_open(TunConfig {
         address: VirtualIp(overlay),
@@ -201,7 +208,20 @@ async fn bringup_dataplane(b: Bringup) {
         }
     };
     let dp = MeshDataPlane::new(b.mesh_id, b.my_id, b.prefix, suite(&b.cipher, &b.secret, 0));
-    eprintln!("meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}", b.mesh_id);
+    // Record the TUN name (needed to divert the default route for full-tunnel) and
+    // make this node able to serve as an exit for others — ip_forward + NAT, which
+    // is idempotent and unused unless a peer routes through us (reuses v1 exit.rs).
+    let tun_name = tun.name().map(|s| s.to_string());
+    if let Some(name) = tun_name.clone() {
+        if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
+            ms.tun_name = Some(name);
+        }
+    }
+    exit::enable_nat();
+    eprintln!(
+        "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}",
+        b.mesh_id
+    );
     tokio::spawn(lattice_meshrun::run(dp, tun, transport, b.links, b.exit_sel));
 }
 
@@ -286,6 +306,8 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<Bringup>) {
             }
             if exit.is_none() && st.current == Some(mesh) {
                 st.current = None;
+                exit::restore_routes();
+                exit::restore_dns();
             }
             (Response::Ok, None)
         }
@@ -310,22 +332,47 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<Bringup>) {
         Request::SetCurrent { mesh } => match mesh {
             None => {
                 st.current = None;
+                // Back to the default network: undo the full-tunnel diversion.
+                exit::restore_routes();
+                exit::restore_dns();
                 (Response::Ok, None)
             }
-            Some(id) => match st.meshes.get(&id) {
-                Some(ms) if ms.mesh.exit.is_some() => {
-                    st.current = Some(id);
-                    (Response::Ok, None)
+            Some(id) => {
+                // Collect the exit's TUN + physical endpoint, then divert all traffic
+                // through it (full tunnel). Early-return on the error cases.
+                let plan = match st.meshes.get(&id) {
+                    Some(ms) if ms.mesh.exit.is_some() => {
+                        let exit_id = ms.mesh.exit.unwrap();
+                        let exit_ip = ms.links.lock().unwrap().get(&exit_id).map(|l| l.endpoint.ip());
+                        (ms.tun_name.clone(), exit_ip)
+                    }
+                    Some(_) => {
+                        return (err(&format!("set an exit for mesh {id} before making it current")), None)
+                    }
+                    None => return (no_mesh(id), None),
+                };
+                st.current = Some(id);
+                match plan {
+                    (Some(tun), Some(ip)) => {
+                        exit::route_through(&tun, ip);
+                        if let Ok(dns) = FULL_TUNNEL_DNS.parse() {
+                            exit::set_dns(&[dns]);
+                        }
+                    }
+                    _ => eprintln!(
+                        "meshd: full-tunnel not plumbed for mesh {id} — TUN or exit endpoint unknown (is the data plane up + exit reachable?)"
+                    ),
                 }
-                Some(_) => (err(&format!("set an exit for mesh {id} before making it current")), None),
-                None => (no_mesh(id), None),
-            },
+                (Response::Ok, None)
+            }
         },
 
         Request::RemoveMesh { mesh } => {
             if st.meshes.remove(&mesh).is_some() {
                 if st.current == Some(mesh) {
                     st.current = None;
+                    exit::restore_routes();
+                    exit::restore_dns();
                 }
                 (Response::Ok, None)
             } else {
@@ -449,6 +496,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<Bringup>) 
             secret,
             links,
             exit_sel,
+            tun_name: None,
         },
     );
     (Response::MeshCreated { mesh: invite.mesh_id }, bringup)
@@ -508,6 +556,7 @@ fn create_mesh(
             secret,
             links,
             exit_sel,
+            tun_name: None,
         },
     );
     (Response::MeshCreated { mesh: id }, bringup)
