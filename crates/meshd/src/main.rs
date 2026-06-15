@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lattice_mesh::charter::{GenesisCharter, InviteTopology, RecipherTrigger};
+use lattice_mesh::crypto::suite;
+use lattice_mesh::dataplane::MeshDataPlane;
 use lattice_mesh::ipc::{MemberView, MeshDetail, MeshSummary, PolicyView, Request, Response};
 use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey};
 use lattice_mesh::Mesh;
@@ -31,6 +33,13 @@ struct MeshState {
     my_key: MemberKey,
     /// Every known cert. The roster = those that validly chain to the master.
     certs: Vec<Cert>,
+    /// The mesh's shared symmetric secret (epoch 0) — keys the data-plane cipher.
+    #[allow(dead_code)] // read once the run loop spawns (P6.3c)
+    secret: [u8; 32],
+    /// The per-mesh data plane (framing + crypto). Built now; dormant until P6.3c
+    /// gives it a real TUN + transport.
+    #[allow(dead_code)]
+    dataplane: MeshDataPlane,
 }
 
 impl MeshState {
@@ -59,6 +68,9 @@ struct State {
     meshes: HashMap<MeshId, MeshState>,
     /// The mesh currently selected for egress (the §1 cur-mesh).
     current: Option<MeshId>,
+    /// Whether the data-plane mode is on (`DATA_PLANE=1`). For P6.3a it only marks
+    /// intent + logs; the TUN/transport run loop spawns at P6.3c.
+    data_plane: bool,
 }
 
 fn now_ms() -> u64 {
@@ -76,6 +88,16 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("meshd: listening on {socket}");
 
     let state = Arc::new(Mutex::new(State::default()));
+    let data_plane = matches!(std::env::var("DATA_PLANE").as_deref(), Ok("1"));
+    state.lock().unwrap().data_plane = data_plane;
+    eprintln!(
+        "meshd: data-plane mode {}",
+        if data_plane {
+            "ON (per-mesh dataplane built; run loop spawns at P6.3c)"
+        } else {
+            "off"
+        }
+    );
     loop {
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
@@ -254,8 +276,30 @@ fn create_mesh(st: &mut State, name: String, my_name: String, max_members: u8) -
     }
     // The creator is member #1, with a master-signed cert.
     let cert = master.issue(my_key.pubkey(), 1, &my_name, now_ms());
+    // The mesh's shared symmetric secret + its per-mesh data plane (dormant until
+    // the run loop spawns, P6.3c).
+    let prefix = charter.overlay_prefix;
+    let cipher_name = charter.initial_cipher.clone();
+    let secret: [u8; 32] = rand::random();
+    let dataplane = MeshDataPlane::new(id, 1, prefix, suite(&cipher_name, &secret, 0));
     let mesh = Mesh::new(id, name, charter, 1);
-    st.meshes.insert(id, MeshState { mesh, master, my_key, certs: vec![cert] });
+    if st.data_plane {
+        eprintln!(
+            "meshd: data-plane built for mesh {id} (overlay {}.{}.{id}.1)",
+            prefix[0], prefix[1]
+        );
+    }
+    st.meshes.insert(
+        id,
+        MeshState {
+            mesh,
+            master,
+            my_key,
+            certs: vec![cert],
+            secret,
+            dataplane,
+        },
+    );
     Response::MeshCreated { mesh: id }
 }
 
