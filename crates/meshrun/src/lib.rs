@@ -47,11 +47,19 @@ pub async fn run<X: Transport + 'static>(
                     }
                 }
             }
-            // A frame from a peer → open, deliver to the TUN (or forward, later).
+            // A frame from a peer → open & deliver to the TUN, or relay it onward.
             inbound = transport.recv_from() => {
                 let Ok((frame, _from)) = inbound else { break };
-                if let Some(Inbound::Deliver(inner)) = dp.recv(&frame) {
-                    let _ = tun.write_packet(&inner).await;
+                match dp.recv(&frame) {
+                    Some(Inbound::Deliver(inner)) => { let _ = tun.write_packet(&inner).await; }
+                    // P5 relay: we're a hop, not the destination — pass the frame on
+                    // unchanged (we don't need to decrypt to forward).
+                    Some(Inbound::Forward { to }) => {
+                        if let Some(addr) = endpoints.get(&to) {
+                            let _ = transport.send_to(&frame, *addr).await;
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -130,6 +138,87 @@ mod tests {
             .await
             .expect("timed out — internet packet did not reach the exit")
             .expect("exit tun closed");
+        assert_eq!(got, packet);
+    }
+
+    /// A test-only in-memory N-node network: `send_to(addr)` delivers to whoever
+    /// bound `addr`, so we can wire more than the point-to-point `duplex`.
+    mod hub {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::mpsc;
+
+        type Inbox = mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>;
+
+        #[derive(Clone, Default)]
+        pub struct Hub(Arc<Mutex<std::collections::HashMap<SocketAddr, Inbox>>>);
+
+        impl Hub {
+            pub fn node(&self, addr: SocketAddr) -> Router {
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.0.lock().unwrap().insert(addr, tx);
+                Router {
+                    me: addr,
+                    hub: self.clone(),
+                    rx: tokio::sync::Mutex::new(rx),
+                }
+            }
+        }
+
+        pub struct Router {
+            me: SocketAddr,
+            hub: Hub,
+            rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl lattice_net::Transport for Router {
+            async fn send_to(&self, data: &[u8], dest: SocketAddr) -> Result<(), lattice_net::NetError> {
+                if let Some(tx) = self.hub.0.lock().unwrap().get(&dest) {
+                    let _ = tx.send((data.to_vec(), self.me));
+                }
+                Ok(())
+            }
+            async fn recv_from(&self) -> Result<(Vec<u8>, SocketAddr), lattice_net::NetError> {
+                self.rx
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or_else(|| lattice_net::NetError::Discovery("hub closed".into()))
+            }
+            fn local_addr(&self) -> Result<SocketAddr, lattice_net::NetError> {
+                Ok(self.me)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_a_frame_to_an_unreachable_member() {
+        let net = hub::Hub::default();
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2".parse().unwrap();
+        let c: SocketAddr = "10.0.0.3:3".parse().unwrap();
+        let (atun, ahandle) = MemoryTun::new();
+        let (btun, _bh) = MemoryTun::new();
+        let (ctun, mut ch) = MemoryTun::new();
+
+        // A reaches C only via the relay B; B reaches C directly.
+        let a_eps: HashMap<MemberId, SocketAddr> = std::iter::once((3u8, b)).collect();
+        let b_eps: HashMap<MemberId, SocketAddr> = std::iter::once((3u8, c)).collect();
+        let c_eps: HashMap<MemberId, SocketAddr> = HashMap::new();
+
+        tokio::spawn(run(dp(1), Box::new(atun), net.node(a), a_eps, None));
+        tokio::spawn(run(dp(2), Box::new(btun), net.node(b), b_eps, None)); // relay hop
+        tokio::spawn(run(dp(3), Box::new(ctun), net.node(c), c_eps, None));
+
+        let packet = ipv4_to("100.80.3.3".parse().unwrap()); // member 3 = C
+        ahandle.inject.send(packet.clone()).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(2), ch.observe.recv())
+            .await
+            .expect("timed out — relayed packet did not reach C")
+            .expect("c's tun closed");
         assert_eq!(got, packet);
     }
 }

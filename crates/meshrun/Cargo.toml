@@ -17,3 +17,6 @@ lattice-net.workspace = true
 lattice-proto.workspace = true
 tokio = { workspace = true }
 anyhow.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
