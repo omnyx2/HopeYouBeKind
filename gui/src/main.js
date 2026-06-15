@@ -153,11 +153,11 @@ async function renderMeshes() {
   const originRow = `<li>
       <div class="peer-left">
         <span class="dot ${noEgress ? "connected" : "known"}"></span>
-        <b>Origin</b>
-        <span class="muted small">your computer's normal internet — no mesh</span>
-        ${noEgress ? `<span class="pill on">egress</span>` : ""}
+        <b>Default network</b>
+        <span class="muted small">${noEgress ? "in use — your normal internet, no mesh" : "your normal internet, no mesh"}</span>
+        ${noEgress ? `<span class="pill on">in use</span>` : ""}
       </div>
-      <div><button class="small-btn" data-origin ${noEgress ? "disabled" : ""}>make egress</button></div>
+      <div><button class="small-btn" data-origin ${noEgress ? "disabled" : ""}>use this</button></div>
     </li>`;
   const rows = meshes.length ? meshes.map((m) => {
     const egress = m.is_current ? `<span class="pill on">egress</span>` : "";
@@ -183,7 +183,7 @@ el("mesh-list").addEventListener("click", async (e) => {
   const manage = e.target.closest("[data-manage]");
   const egress = e.target.closest("[data-egress]");
   if (origin) {
-    try { await meshd({ SetCurrent: { mesh: null } }); toast("egress: origin"); }
+    try { await meshd({ SetCurrent: { mesh: null } }); toast("Using default network"); }
     catch (x) { toast(String(x)); }
     return refreshMode();
   }
@@ -286,16 +286,16 @@ async function refreshTopbar() {
   sel.disabled = false;
   const egress = meshes.find((m) => m.is_current);
   // egress dropdown: Origin + meshes; the selected one is the current egress.
-  sel.innerHTML = [`<option value="origin" ${!egress ? "selected" : ""}>Origin (your internet)</option>`]
+  sel.innerHTML = [`<option value="origin" ${!egress ? "selected" : ""}>Default network</option>`]
     .concat(meshes.map((m) => `<option value="${m.id}" ${m.is_current ? "selected" : ""}>⬢ ${esc(m.name)} #${m.id}</option>`))
     .join("");
   // far-left status mirrors the current egress.
   if (egress) {
     dot.className = "conn-dot on";
-    sum.textContent = `egress: ${egress.name}${egress.exit != null ? " · exit #" + egress.exit : ""}`;
+    sum.textContent = `Routing via ${egress.name}${egress.exit != null ? " · exit #" + egress.exit : ""}`;
   } else {
     dot.className = "conn-dot warn";
-    sum.textContent = "egress: origin";
+    sum.textContent = "Using default network";
   }
 }
 
@@ -308,7 +308,7 @@ el("tb-egress").addEventListener("change", async (e) => {
   const v = e.target.value;
   try {
     await meshd({ SetCurrent: { mesh: v === "origin" ? null : parseInt(v, 10) } });
-    toast(v === "origin" ? "egress: origin" : "egress set");
+    toast(v === "origin" ? "Using default network" : "egress set");
   } catch (err) { toast(String(err)); }
   refreshMode();
 });
