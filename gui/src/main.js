@@ -8,6 +8,9 @@ if (!window.__TAURI__) {
 
 const el = (id) => document.getElementById(id);
 let starting = false;
+// Whether this node holds the network CA key. Flow-table editing is admin-only;
+// member nodes see the table read-only (the daemon rejects their edits anyway).
+let IS_ADMIN = false;
 
 // ---- tab navigation ----
 document.querySelectorAll(".nav-item").forEach((btn) => {
@@ -53,7 +56,12 @@ async function refresh() {
   el("node-id").textContent = nodeId ? nodeId.slice(0, 20) + "…" : "—";
   el("node-id").dataset.full = nodeId;
   el("mesh-toggle").checked = meshUp;
-  el("relay-status").textContent = status.relay ?? "off";
+  el("relay-status").textContent = status.relay ?? "automatic (bridge elected)";
+  const rs = el("relay-state");
+  if (rs) {
+    rs.textContent = status.relay ? "manual" : "auto";
+    rs.className = "pill " + (status.relay ? "warn" : "ok");
+  }
 
   // peers
   let peers = [];
@@ -67,6 +75,12 @@ async function refresh() {
   renderPeers(peers);
   updateExitSelect(peers, status.exit_node);
   el("exit-toggle").checked = !!status.is_exit;
+  const exitOn = !!status.exit_node;
+  const ep = el("exit-state");
+  if (ep) {
+    ep.textContent = exitOn ? (exitMode === "split" ? "split tunnel" : "full tunnel") : "direct";
+    ep.className = "pill " + (exitOn ? "on" : "off");
+  }
 
   // traffic — only when the user hasn't paused the live view
   if (el("traffic-live").checked) {
@@ -102,6 +116,8 @@ async function refresh() {
 // network CA key) are deliberately NOT in the user surface — they live in the
 // separate admin CLI/tooling. So there's no members list or issue/revoke UI here.
 async function renderMesh(net) {
+  IS_ADMIN = !!net.is_admin;
+  el("flow-admin")?.classList.toggle("hidden", !IS_ADMIN);
   const hasNet = !!net.network_id;
   el("mesh-role").textContent = hasNet ? "member" : "open mode (no network)";
   const idEl = el("mesh-id");
@@ -171,17 +187,23 @@ function renderPeers(peers) {
   }
   for (const p of peers) {
     const li = document.createElement("li");
+    const ct = linkType(p); // "direct" | "relay" | "connecting"
+    const ctLabel = ct === "relay" ? "via bridge" : ct;
     const ip = document.createElement("span");
     ip.className = "mono copy";
     ip.title = "Click to copy";
     ip.textContent = p.virtual_ip;
     ip.addEventListener("click", () => copy(p.virtual_ip));
     const left = document.createElement("span");
-    left.innerHTML = `<span class="dot ${p.status}"></span>`;
+    left.className = "peer-left";
+    left.innerHTML = `<span class="dot ${p.status}"></span><span class="conn ${ct}">${ctLabel}</span>`;
     left.appendChild(ip);
     const right = document.createElement("span");
     right.className = "muted mono small";
-    right.textContent = [osLabel(p.os), p.fingerprint, p.endpoint].filter(Boolean).join(" · ");
+    // hide the synthetic 192.0.2.x relay endpoint from the readout — it's not a
+    // real address; the "via bridge" badge already conveys the relayed path.
+    const ep = p.endpoint && p.endpoint.startsWith("192.0.2.") ? null : p.endpoint;
+    right.textContent = [osLabel(p.os), p.fingerprint, ep].filter(Boolean).join(" · ");
     li.appendChild(left);
     li.appendChild(right);
     ul.appendChild(li);
@@ -235,14 +257,26 @@ el("mesh-toggle").addEventListener("change", async (e) => {
   refresh();
 });
 
-el("exit-select").addEventListener("change", async (e) => {
+let exitMode = "split"; // "split" | "full"
+async function applyExit() {
+  const nodeId = el("exit-select").value || null;
   try {
-    await invoke("set_exit", { nodeId: e.target.value || null });
+    await invoke("set_exit", { nodeId, split: exitMode === "split" });
   } catch (err) {
     toast(String(err));
   }
   refresh();
-});
+}
+el("exit-select").addEventListener("change", applyExit);
+document.querySelectorAll("#exit-mode .seg-btn").forEach((b) =>
+  b.addEventListener("click", () => {
+    exitMode = b.dataset.mode;
+    document
+      .querySelectorAll("#exit-mode .seg-btn")
+      .forEach((x) => x.classList.toggle("active", x === b));
+    if (el("exit-select").value) applyExit(); // re-apply current exit in the new mode
+  })
+);
 
 el("exit-toggle").addEventListener("change", async (e) => {
   try {
@@ -292,6 +326,77 @@ el("join-net").addEventListener("click", async () => {
 
 bindAdd("add-peer", "peer-spec", (v) => invoke("add_peer", { spec: v }), "peer added");
 bindAdd("add-relay-peer", "relay-peer-id", (v) => invoke("relay_peer", { nodeId: v }), "peer added via relay");
+
+// ---- flow-table editor (admin) ----
+// Delete buttons are delegated: the table body re-renders on every refresh, so
+// we listen on the stable parent and read the rule's storage index off the click.
+el("topo-flows")?.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".flow-del");
+  if (!btn) return;
+  const index = parseInt(btn.dataset.idx, 10);
+  if (Number.isNaN(index)) return;
+  try {
+    await invoke("del_flow_rule", { index });
+    toast("rule deleted");
+  } catch (err) {
+    toast(String(err));
+  }
+  refresh();
+});
+
+// The exit:/peer: actions need a node id — reveal the field only for those.
+el("fr-action")?.addEventListener("change", () => {
+  const v = el("fr-action").value;
+  el("fr-node").classList.toggle("hidden", v !== "exit:" && v !== "peer:");
+});
+
+el("fr-add")?.addEventListener("click", async () => {
+  const priRaw = el("fr-priority").value.trim();
+  const priority = priRaw === "" ? 50 : parseInt(priRaw, 10);
+  if (Number.isNaN(priority) || priority < 0 || priority > 65535) {
+    return toast("priority must be 0–65535");
+  }
+  const dportRaw = el("fr-dport").value.trim();
+  const dport = dportRaw === "" ? null : parseInt(dportRaw, 10);
+  if (dport !== null && (Number.isNaN(dport) || dport < 0 || dport > 65535)) {
+    return toast("dport must be 0–65535");
+  }
+  let action = el("fr-action").value;
+  if (action === "exit:" || action === "peer:") {
+    const node = el("fr-node").value.trim();
+    if (!node) return toast("this action needs a node id (64 hex chars)");
+    action += node;
+  }
+  try {
+    await invoke("add_flow_rule", {
+      priority,
+      scope: el("fr-scope").value || null,
+      dst: el("fr-dst").value.trim() || null,
+      proto: el("fr-proto").value || null,
+      dport,
+      action,
+    });
+    el("fr-priority").value = "";
+    el("fr-dst").value = "";
+    el("fr-dport").value = "";
+    el("fr-node").value = "";
+    toast("rule added");
+  } catch (err) {
+    toast(String(err));
+  }
+  refresh();
+});
+
+el("fr-clear")?.addEventListener("click", async () => {
+  if (!confirm("Clear the entire flow table? Every node reverts to the built-in default.")) return;
+  try {
+    await invoke("clear_flow_rules");
+    toast("flow table cleared");
+  } catch (err) {
+    toast(String(err));
+  }
+  refresh();
+});
 
 el("virtual-ip").addEventListener("click", () => maybeCopy("virtual-ip"));
 el("node-id").addEventListener("click", () => {
@@ -460,28 +565,32 @@ function topoTick() {
   // draw
   const g = c.getContext("2d");
   g.clearRect(0, 0, W, H);
-  const COL = { direct: "#34d399", relay: "#fbbf24", connecting: "#64748b" };
+  const COL = { direct: "#34d399", relay: "#a78bfa", connecting: "#64748b" };
   for (const e of TOPO.edges) {
     const a = TOPO.byId.get(e.from), b = TOPO.byId.get(e.to);
     if (!a || !b) continue;
     g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y);
     g.strokeStyle = COL[e.type] || "#64748b";
-    g.lineWidth = e.exit ? 3 : 1.6;
+    g.lineWidth = e.exit ? 3 : 1.8;
+    g.globalAlpha = e.type === "connecting" ? 0.5 : 0.85;
     g.setLineDash(e.type === "relay" ? [6, 5] : e.type === "connecting" ? [2, 4] : []);
-    g.stroke(); g.setLineDash([]);
+    g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
   }
   for (const n of nodes) {
     const sel = n.id === TOPO.selected;
-    const r = n.isMe ? 16 : 12;
+    const r = n.isMe ? 17 : 12;
+    const fill = n.isMe ? "#60a5fa" : n.state === "connected" ? "#34d399" : "#475569";
     if (n.isExit) { g.beginPath(); g.arc(n.x, n.y, r + 5, 0, 7); g.strokeStyle = "#a78bfa"; g.lineWidth = 2.5; g.stroke(); }
-    g.beginPath(); g.arc(n.x, n.y, r, 0, 7);
-    g.fillStyle = n.isMe ? "#60a5fa" : n.state === "connected" ? "#34d399" : "#475569";
-    g.fill();
-    if (sel) { g.strokeStyle = "#fff"; g.lineWidth = 2.5; g.stroke(); }
-    g.fillStyle = "#e2e8f0"; g.font = "11px ui-monospace, monospace"; g.textAlign = "center";
-    g.fillText(n.label, n.x, n.y - r - 6);
+    // node with a soft glow (brighter for me / connected)
+    g.save();
+    g.shadowColor = fill; g.shadowBlur = n.isMe ? 18 : n.state === "connected" ? 10 : 0;
+    g.beginPath(); g.arc(n.x, n.y, r, 0, 7); g.fillStyle = fill; g.fill();
+    g.restore();
+    if (sel) { g.beginPath(); g.arc(n.x, n.y, r + 3, 0, 7); g.strokeStyle = "#fff"; g.lineWidth = 2; g.stroke(); }
+    g.fillStyle = "#e2e8f0"; g.font = "600 11px ui-monospace, monospace"; g.textAlign = "center";
+    g.fillText(n.label, n.x, n.y - r - 7);
     g.fillStyle = "#94a3b8"; g.font = "10px ui-monospace, monospace";
-    g.fillText(n.vip, n.x, n.y + r + 13);
+    g.fillText(n.vip, n.x, n.y + r + 14);
   }
   // keep animating while it settles or stays visible
   TOPO.raf = requestAnimationFrame(topoTick);
@@ -513,8 +622,13 @@ function renderTopoSide() {
   const ft = el("topo-flows")?.querySelector("tbody");
   if (ft) {
     ft.innerHTML = TOPO.flows.length
-      ? TOPO.flows.map((r) => `<tr><td>${r.priority}</td><td class="mono small">${r.matcher}</td><td class="mono small">${r.action}</td></tr>`).join("")
-      : `<tr><td colspan="3" class="muted">default (overlay→owner, internet→exit)</td></tr>`;
+      ? TOPO.flows.map((r) => {
+          // Delete by the rule's storage index (carried from the backend), so
+          // removing the visually-sorted row hits the right rule in the table.
+          const del = IS_ADMIN ? `<button class="flow-del" data-idx="${r.index}" title="delete rule">×</button>` : "";
+          return `<tr><td>${r.priority}</td><td class="mono small">${r.matcher}</td><td class="mono small">${r.action}</td><td class="flow-del-cell">${del}</td></tr>`;
+        }).join("")
+      : `<tr><td colspan="4" class="muted">default (overlay→owner, internet→exit)</td></tr>`;
   }
 }
 
@@ -538,6 +652,237 @@ document.querySelectorAll('.nav-item[data-tab="topology"]').forEach((b) =>
 setInterval(refresh, 2000);
 
 // ---- development mock (only outside Tauri) ----
+// ===== v2 Meshes (multi-mesh control plane via meshd) =====
+async function meshd(req) {
+  const s = await invoke("meshd", { request: JSON.stringify(req) });
+  let r;
+  try { r = JSON.parse(s); } catch { throw new Error("bad meshd response"); }
+  if (r && r.Error) throw new Error(r.Error.message);
+  return r;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function randHex64() {
+  let s = "";
+  for (let i = 0; i < 64; i++) s += "0123456789abcdef"[Math.floor(Math.random() * 16)];
+  return s;
+}
+
+// Two modes toggled from the top widget bar: "user" (this computer — manage all
+// your meshes) and "mesh" (manage the one mesh picked in the dropdown).
+let MODE = "user";
+let CURRENT_MESH = null;
+
+function activateTab(name) {
+  document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== name));
+}
+
+async function setMode(mode) {
+  if (mode === "mesh") {
+    if (CURRENT_MESH == null) {
+      try { CURRENT_MESH = ((await meshd("ListMeshes")).Meshes || [])[0]?.id ?? null; } catch {}
+    }
+    if (CURRENT_MESH == null) { toast("no mesh yet — create one in User mode"); mode = "user"; }
+  }
+  MODE = mode;
+  document.body.classList.toggle("mode-mesh", mode === "mesh");
+  document.body.classList.toggle("mode-user", mode === "user");
+  document.querySelectorAll("#mode-toggle .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
+  // user mode lands on Meshes; mesh mode lands on the per-mesh Overview.
+  activateTab(mode === "mesh" ? "mesh-overview" : "meshes");
+  await refreshMode();
+}
+
+async function refreshMode() {
+  if (MODE === "mesh" && CURRENT_MESH != null) await renderOneMesh(CURRENT_MESH);
+  else await renderComputer();
+  refreshTopbar();
+}
+
+// ---- User mode: manage the SET of meshes on this computer ----
+async function renderComputer() {
+  let meshes = [];
+  try { meshes = (await meshd("ListMeshes")).Meshes || []; }
+  catch {
+    el("mesh-list").innerHTML = `<li class="empty">meshd not reachable — start it: <code>./target/debug/meshd</code></li>`;
+    return;
+  }
+  const noEgress = !meshes.some((m) => m.is_current);
+  const originRow = `<li>
+      <div class="peer-left">
+        <span class="dot ${noEgress ? "connected" : "known"}"></span>
+        <b>Origin</b>
+        <span class="muted small">your computer's normal internet — no mesh</span>
+        ${noEgress ? `<span class="pill on">egress</span>` : ""}
+      </div>
+      <div>
+        <button class="small-btn" data-mesh-origin="1" ${noEgress ? "disabled" : ""}>make egress</button>
+      </div>
+    </li>`;
+  const meshRows = meshes.length ? meshes.map((m) => {
+    const egress = m.is_current ? `<span class="pill on">egress</span>` : "";
+    const exit = m.exit != null ? `exit #${m.exit}` : "no exit";
+    return `<li>
+      <div class="peer-left">
+        <span class="dot ${m.is_current ? "connected" : "known"}"></span>
+        <b>${esc(m.name)}</b>
+        <span class="muted small">#${m.id} · ${m.members} members · epoch ${m.epoch} · ${exit}</span>
+        ${egress}
+      </div>
+      <div>
+        <button class="small-btn" data-mesh-open="${m.id}">manage ›</button>
+        <button class="small-btn" data-mesh-current="${m.id}">make egress</button>
+      </div>
+    </li>`;
+  }).join("") : `<li class="empty">no meshes yet — create one above</li>`;
+  el("mesh-list").innerHTML = originRow + meshRows;
+}
+
+// ---- Mesh scope: manage ONE mesh ----
+async function renderOneMesh(id) {
+  let d;
+  try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
+  catch (e) { toast(String(e)); return setMode("user"); }
+  const rows = d.members.map((mb) =>
+    `<tr><td>${mb.id}</td><td>${esc(mb.name)}${mb.is_me ? ' <span class="muted small">(me)</span>' : ""}</td><td class="mono small">${mb.pubkey_fp}</td></tr>`
+  ).join("");
+  const exitOpts = [`<option value="">— none —</option>`].concat(
+    d.members.map((mb) => `<option value="${mb.id}" ${d.exit === mb.id ? "selected" : ""}>#${mb.id} ${esc(mb.name)}</option>`)
+  ).join("");
+  el("mesh-detail").innerHTML = `
+    <div class="card-head">
+      <h2 class="card-title">⬢ ${esc(d.name)} <span class="muted small">#${d.id}</span></h2>
+      <div>
+        <button class="small-btn" id="mesh-make-current">make egress</button>
+        <button class="small-btn" id="mesh-remove">wipe mesh</button>
+      </div>
+    </div>
+    <div class="kv"><span>charter</span><b class="small">${d.invite} · ${esc(d.trigger)} · max ${d.max_members}</b></div>
+    <div class="kv"><span>cipher</span><b class="mono small">${esc(d.cipher)}</b></div>
+    <div class="kv"><span>epoch</span><b>${d.epoch}</b></div>
+    <div class="kv"><span>my exit</span><b>${d.exit != null ? "#" + d.exit : "none"}</b></div>
+    <h3 class="topo-h">Roster <span class="muted small">(${d.members.length})</span></h3>
+    <table class="topo-table"><thead><tr><th>id</th><th>name</th><th>pubkey</th></tr></thead><tbody>${rows}</tbody></table>
+    <h3 class="topo-h">Set my exit</h3>
+    <div class="add-row">
+      <select id="mesh-exit" class="select">${exitOpts}</select>
+      <button class="small-btn" id="mesh-exit-set">set exit</button>
+    </div>
+    <h3 class="topo-h">Admit a member <span class="muted small">(demo)</span></h3>
+    <div class="add-row">
+      <input id="mesh-admit-name" placeholder="name" />
+      <input id="mesh-admit-pk" placeholder="pubkey 64 hex (blank = random)" />
+      <button class="small-btn" id="mesh-admit">admit</button>
+    </div>`;
+  el("mesh-make-current").onclick = async () => {
+    try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); }
+    refreshMode();
+  };
+  el("mesh-remove").onclick = async () => {
+    if (!confirm(`Wipe mesh "${d.name}" locally? (the §5 compromise response)`)) return;
+    try { await meshd({ RemoveMesh: { mesh: id } }); toast("mesh wiped"); } catch (e) { toast(String(e)); }
+    CURRENT_MESH = null;
+    setMode("user");
+  };
+  el("mesh-exit-set").onclick = async () => {
+    const v = el("mesh-exit").value;
+    try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("exit set"); } catch (e) { toast(String(e)); }
+    refreshMode();
+  };
+  el("mesh-admit").onclick = async () => {
+    const name = el("mesh-admit-name").value.trim();
+    let pk = el("mesh-admit-pk").value.trim();
+    if (!name) return toast("name required");
+    if (!/^[0-9a-fA-F]{64}$/.test(pk)) pk = randHex64();
+    try { await meshd({ AdmitMember: { mesh: id, name, pubkey_hex: pk } }); toast("member admitted"); } catch (e) { toast(String(e)); }
+    refreshMode();
+  };
+}
+
+// computer-scope list buttons (delegated)
+el("mesh-list").addEventListener("click", async (e) => {
+  const origin = e.target.closest("[data-mesh-origin]");
+  const open = e.target.closest("[data-mesh-open]");
+  const cur = e.target.closest("[data-mesh-current]");
+  if (origin) {
+    try { await meshd({ SetCurrent: { mesh: null } }); toast("egress: origin"); }
+    catch (err) { toast(String(err)); }
+    return refreshMode();
+  }
+  if (open) { CURRENT_MESH = parseInt(open.dataset.meshOpen, 10); return setMode("mesh"); }
+  if (cur) {
+    try { await meshd({ SetCurrent: { mesh: parseInt(cur.dataset.meshCurrent, 10) } }); toast("egress set"); }
+    catch (err) { toast(String(err)); }
+    refreshMode();
+  }
+});
+
+el("mesh-create").addEventListener("click", async () => {
+  const name = el("mesh-name").value.trim();
+  const myName = el("mesh-myname").value.trim() || "me";
+  const maxRaw = el("mesh-max").value.trim();
+  const max = maxRaw === "" ? 254 : parseInt(maxRaw, 10);
+  if (!name) return toast("mesh name required");
+  if (Number.isNaN(max) || max < 1 || max > 254) return toast("max must be 1–254");
+  try {
+    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max } });
+    el("mesh-name").value = "";
+    el("mesh-myname").value = "";
+    toast(`mesh created (#${r.MeshCreated.mesh})`);
+    CURRENT_MESH = r.MeshCreated.mesh;
+    return setMode("mesh"); // jump straight into the new mesh
+  } catch (e) { toast(String(e)); }
+  refreshMode();
+});
+
+// sidebar "Meshes" item → user mode (the meshes list)
+document.querySelector('.nav-item[data-tab="meshes"]')?.addEventListener("click", () => setMode("user"));
+
+// ===== top widget bar: status (far left) + User/Mesh toggle + mesh dropdown =====
+async function refreshTopbar() {
+  const dot = el("tb-dot"), sum = el("tb-summary"), sel = el("tb-egress");
+  let meshes = [];
+  try { meshes = (await meshd("ListMeshes")).Meshes || []; }
+  catch {
+    dot.className = "conn-dot off"; sum.textContent = "meshd offline";
+    sel.innerHTML = `<option value="origin">Origin</option>`; sel.disabled = true; return;
+  }
+  sel.disabled = false;
+  const egress = meshes.find((m) => m.is_current);
+  // egress dropdown: Origin + meshes; the selected one is the current egress.
+  sel.innerHTML = [`<option value="origin" ${!egress ? "selected" : ""}>Origin (your internet)</option>`]
+    .concat(meshes.map((m) => `<option value="${m.id}" ${m.is_current ? "selected" : ""}>⬢ ${esc(m.name)} #${m.id}</option>`))
+    .join("");
+  // far-left status: mirror the current egress.
+  if (egress) {
+    dot.className = "conn-dot on";
+    sum.textContent = `egress: ${egress.name}${egress.exit != null ? " · exit #" + egress.exit : ""}`;
+  } else {
+    dot.className = "conn-dot warn";
+    sum.textContent = "egress: origin";
+  }
+}
+
+// [User|Mesh] = view toggle.
+document.querySelectorAll("#mode-toggle .seg-btn").forEach((b) =>
+  b.addEventListener("click", () => setMode(b.dataset.mode))
+);
+// the dropdown = egress selector (Origin or a mesh); independent of the view.
+el("tb-egress").addEventListener("change", async (e) => {
+  const v = e.target.value;
+  try {
+    await meshd({ SetCurrent: { mesh: v === "origin" ? null : parseInt(v, 10) } });
+    toast(v === "origin" ? "egress: origin" : "egress set");
+  } catch (err) { toast(String(err)); }
+  refreshMode();
+});
+
+setMode("user");
+setInterval(refreshTopbar, 3000);
+
 function mockInvoke(cmd, args) {
   const s = (mockInvoke.s ??= { up: false, mesh: true, exit: null, isExit: false, relay: null });
   switch (cmd) {
@@ -568,10 +913,10 @@ function mockInvoke(cmd, args) {
     case "join_network": return Promise.resolve();
     case "list_flow_rules":
       return Promise.resolve(s.up ? [
-        { priority: 100, matcher: "scope=overlay", action: "overlay-owner" },
-        { priority: 90, matcher: "proto=udp dport=53", action: "exit(39d55445)" },
-        { priority: 50, matcher: "scope=internet", action: "exit(configured)" },
-        { priority: 0, matcher: "*", action: "DROP" },
+        { index: 0, priority: 100, matcher: "scope=overlay", action: "overlay-owner" },
+        { index: 3, priority: 90, matcher: "proto=udp dport=53", action: "exit(39d55445)" },
+        { index: 1, priority: 50, matcher: "scope=internet", action: "exit(configured)" },
+        { index: 2, priority: 0, matcher: "*", action: "DROP" },
       ] : []);
     case "list_flows":
       return Promise.resolve(s.up ? [
@@ -579,6 +924,7 @@ function mockInvoke(cmd, args) {
         { peer: "demo", protocol: "ICMP", local: "100.64.0.1", remote: "100.64.0.2", tx_packets: 50, tx_bytes: 4200, rx_packets: 50, rx_bytes: 4200, last_active_secs: 2 },
         { peer: "demo", protocol: "UDP", local: "100.64.0.1:51820", remote: "100.64.0.2:443", tx_packets: 12, tx_bytes: 1536, rx_packets: 9, rx_bytes: 12000, last_active_secs: 40 },
       ] : []);
+    case "meshd": return Promise.reject("meshd not running (browser demo)");
     default: return Promise.resolve(null);
   }
 }

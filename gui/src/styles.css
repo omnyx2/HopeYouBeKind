@@ -17,7 +17,22 @@
 html, body { height: 100%; margin: 0; }
 body { background: var(--bg); color: var(--text); overflow: hidden; }
 
-.app { display: flex; height: 100vh; }
+.app { display: flex; flex-direction: column; height: 100vh; }
+.app-body { display: flex; flex: 1; min-height: 0; }
+
+/* ---------- top widget bar (macOS-menubar-style mode summary + switcher) ---------- */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  height: 38px; flex-shrink: 0; padding: 0 14px;
+  background: var(--panel); border-bottom: 1px solid var(--line); font-size: 13px;
+}
+.tb-state { display: flex; align-items: center; gap: 8px; min-width: 0; }
+#tb-summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tb-right { display: flex; align-items: center; gap: 10px; }
+.tb-right .select { max-width: 200px; padding: 4px 8px; font-size: 12px; margin: 0; }
+/* Sidebar nav items are grouped by mode; show only the active mode's group. */
+body.mode-user .nav-item[data-grp="mesh"] { display: none; }
+body.mode-mesh .nav-item[data-grp="user"] { display: none; }
 
 /* ---------- sidebar ---------- */
 .sidebar {
@@ -189,7 +204,7 @@ table.flows tbody tr:hover { background: #1b2030; }
 .topo-legend { position: absolute; left: 12px; bottom: 10px; display: flex; gap: 14px; font-size: 11px; color: var(--muted, #94a3b8); background: rgba(15,23,42,.55); padding: 6px 10px; border-radius: 8px; }
 .topo-legend i.ln { display: inline-block; width: 16px; height: 0; border-top-width: 2px; border-top-style: solid; vertical-align: middle; margin-right: 4px; }
 .topo-legend i.ln.direct { border-color: #34d399; }
-.topo-legend i.ln.relay { border-color: #fbbf24; border-top-style: dashed; }
+.topo-legend i.ln.relay { border-color: #a78bfa; border-top-style: dashed; }
 .topo-legend i.ln.connecting { border-color: #64748b; border-top-style: dotted; }
 .topo-legend i.dot-ex { display: inline-block; width: 10px; height: 10px; border: 2px solid #a78bfa; border-radius: 50%; vertical-align: middle; margin-right: 4px; }
 .topo-side { flex: 0 0 320px; overflow-y: auto; }
@@ -199,6 +214,65 @@ table.flows tbody tr:hover { background: #1b2030; }
 .topo-table th { text-align: left; color: var(--muted, #94a3b8); font-weight: 500; padding: 4px 6px; border-bottom: 1px solid rgba(148,163,184,.2); }
 .topo-table td { padding: 4px 6px; border-bottom: 1px solid rgba(148,163,184,.08); }
 .topo-table .small { font-size: 11px; }
+/* flow-table editor (admin-only) */
+.flow-del-cell { width: 22px; text-align: center; }
+.flow-del {
+  background: transparent; border: none; color: var(--muted, #94a3b8);
+  cursor: pointer; font-size: 15px; line-height: 1; padding: 0 4px; border-radius: 4px;
+}
+.flow-del:hover { color: var(--bad, #f87171); background: rgba(248,113,113,.12); }
+.flow-admin { margin-top: 12px; }
+.flow-form { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.flow-form input, .flow-form .select {
+  width: 100%; max-width: none; box-sizing: border-box;
+  background: #11141b; color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 9px; font-size: 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.flow-form button { margin-top: 2px; }
+.flow-clear { margin-top: 8px; width: 100%; color: var(--bad, #f87171); }
 .kv { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
 .kv span { color: var(--muted, #94a3b8); }
 .small { font-size: 11px; }
+
+/* ---------- status pills + card headers ---------- */
+.card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.card-head h2 { margin: 0; }
+.pill {
+  font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 999px;
+  letter-spacing: .02em; border: 1px solid transparent; white-space: nowrap;
+}
+.pill.on   { background: rgba(52,211,153,.14);  color: var(--ok);     border-color: rgba(52,211,153,.35); }
+.pill.ok   { background: rgba(52,211,153,.14);  color: var(--ok);     border-color: rgba(52,211,153,.35); }
+.pill.warn { background: rgba(217,162,58,.16);  color: var(--warn);   border-color: rgba(217,162,58,.4); }
+.pill.off  { background: #232838;               color: var(--muted);  border-color: var(--line); }
+
+/* ---------- segmented control (split / full) ---------- */
+.seg { display: inline-flex; background: #11141b; border: 1px solid var(--line); border-radius: 9px; padding: 2px; }
+.seg-btn {
+  border: none; background: transparent; color: var(--muted); cursor: pointer;
+  font-size: 12px; font-weight: 600; padding: 5px 14px; border-radius: 7px;
+}
+.seg-btn.active { background: var(--accent); color: #fff; }
+.seg-btn:not(.active):hover { color: var(--text); }
+
+/* ---------- peer connection badge ---------- */
+.peer-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.conn {
+  font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 999px;
+  text-transform: uppercase; letter-spacing: .03em;
+}
+.conn.direct     { background: rgba(52,211,153,.14); color: var(--ok); }
+.conn.relay      { background: rgba(167,139,250,.16); color: #a78bfa; }
+.conn.connecting { background: rgba(217,162,58,.16); color: var(--warn); }
+
+/* ---------- advanced (collapsible) ---------- */
+.advanced { margin-top: 10px; }
+.advanced > summary {
+  cursor: pointer; color: var(--muted); font-size: 12px; list-style: none;
+  padding: 2px 0; user-select: none;
+}
+.advanced > summary::-webkit-details-marker { display: none; }
+.advanced > summary::before { content: "▸ "; }
+.advanced[open] > summary::before { content: "▾ "; }
+.advanced > summary:hover { color: var(--text); }

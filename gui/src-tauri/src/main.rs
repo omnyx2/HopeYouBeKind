@@ -16,6 +16,36 @@ use serde::Serialize;
 /// Where the daemon listens. (Configurable via the GUI settings in a later pass.)
 const SOCKET: &str = "/tmp/lattice.sock";
 
+/// Where the v2 multi-mesh control-plane daemon (`meshd`) listens.
+const MESHD_SOCKET: &str = "/tmp/lattice-meshd.sock";
+
+/// Proxy one newline-JSON request to `meshd` and hand back its response line. The
+/// v2 multi-mesh logic lives in the front-end + meshd; this is just the socket
+/// bridge (browsers/JS can't open a unix socket).
+#[cfg(unix)]
+#[tauri::command]
+fn meshd(request: String) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let stream = UnixStream::connect(MESHD_SOCKET)
+        .map_err(|e| format!("meshd not running ({MESHD_SOCKET}): {e}"))?;
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut line = request;
+    line.push('\n');
+    writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    let mut resp = String::new();
+    BufReader::new(stream)
+        .read_line(&mut resp)
+        .map_err(|e| e.to_string())?;
+    Ok(resp.trim_end().to_string())
+}
+
+#[cfg(not(unix))]
+#[tauri::command]
+fn meshd(_request: String) -> Result<String, String> {
+    Err("meshd is available on macOS/Linux".into())
+}
+
 #[derive(Serialize)]
 struct StatusView {
     running: bool,
@@ -124,6 +154,11 @@ async fn list_flows() -> Result<Vec<FlowView>, String> {
 
 #[derive(Serialize)]
 struct FlowRuleView {
+    /// Storage index in the daemon's table — what `FlowDel` deletes by. Stable
+    /// across the priority-sort we do for display, so the GUI's delete button
+    /// removes the row the user actually sees (not whatever sits at that sorted
+    /// position). Mirrors the `[i]` numbering the CLI prints.
+    index: usize,
     priority: u16,
     matcher: String,
     action: String,
@@ -174,14 +209,23 @@ fn fmt_flow_action(a: &FlowAction) -> String {
 #[tauri::command]
 async fn list_flow_rules() -> Result<Vec<FlowRuleView>, String> {
     match lattice_ipc::request(SOCKET, Request::FlowList).await {
-        Ok(Response::FlowRules(mut rules)) => {
-            rules.sort_by(|a: &FlowRule, b: &FlowRule| b.priority.cmp(&a.priority));
-            Ok(rules
+        Ok(Response::FlowRules(rules)) => {
+            // Display highest-priority first (evaluation order), but carry each
+            // rule's ORIGINAL storage index so the delete button targets the
+            // right rule — `FlowDel` removes by storage position, not by the
+            // sorted order shown here.
+            let mut order: Vec<usize> = (0..rules.len()).collect();
+            order.sort_by(|&a, &b| rules[b].priority.cmp(&rules[a].priority));
+            Ok(order
                 .into_iter()
-                .map(|r| FlowRuleView {
-                    priority: r.priority,
-                    matcher: fmt_flow_match(&r.match_),
-                    action: fmt_flow_action(&r.action),
+                .map(|i| {
+                    let r: &FlowRule = &rules[i];
+                    FlowRuleView {
+                        index: i,
+                        priority: r.priority,
+                        matcher: fmt_flow_match(&r.match_),
+                        action: fmt_flow_action(&r.action),
+                    }
                 })
                 .collect())
         }
@@ -237,6 +281,120 @@ async fn send(req: Request) -> Result<(), String> {
     }
 }
 
+/// Like `send`, but surfaces a daemon-side `Response::Error` as `Err` instead of
+/// swallowing it. The flow-table edits are admin-gated — a member node replies
+/// "not an admin node", and the user needs to see that rather than a false "ok".
+async fn send_checked(req: Request) -> Result<(), String> {
+    match lattice_ipc::request(SOCKET, req).await {
+        Ok(Response::Error { message }) => Err(message),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Parse a GUI `--action`-style string into a `FlowAction`. Mirrors the CLI's
+/// `parse_action` so the GUI and `lattice flow add` accept the same vocabulary.
+fn parse_flow_action(s: &str) -> Result<FlowAction, String> {
+    Ok(match s.trim() {
+        "drop" => FlowAction::Drop,
+        "local" => FlowAction::Local,
+        "overlay" => FlowAction::ToOverlayOwner,
+        "exit" => FlowAction::ToExit(None),
+        other => {
+            if let Some(hex) = other.strip_prefix("exit:") {
+                FlowAction::ToExit(Some(
+                    parse_node_id(hex.trim()).ok_or("invalid exit node id (need 64 hex chars)")?,
+                ))
+            } else if let Some(hex) = other.strip_prefix("peer:") {
+                FlowAction::ToPeer(
+                    parse_node_id(hex.trim()).ok_or("invalid peer node id (need 64 hex chars)")?,
+                )
+            } else {
+                return Err(format!(
+                    "unknown action '{other}' (drop|local|overlay|exit|exit:<id>|peer:<id>)"
+                ));
+            }
+        }
+    })
+}
+
+/// Build a `FlowMatch` from the GUI form fields. Empty/absent fields are
+/// wildcards. Mirrors the CLI's `build_match`.
+fn build_flow_match(
+    scope: Option<String>,
+    dst: Option<String>,
+    proto: Option<String>,
+    dport: Option<u16>,
+) -> Result<FlowMatch, String> {
+    let scope = match scope.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some("overlay") => Some(FlowScope::Overlay),
+        Some("internet") => Some(FlowScope::Internet),
+        Some(o) => return Err(format!("unknown scope '{o}' (overlay|internet)")),
+    };
+    let dst_cidr = match dst.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => {
+            let (ip, len) = match s.split_once('/') {
+                Some((ip, len)) => (
+                    ip.trim(),
+                    len.trim().parse().map_err(|_| "bad prefix length".to_string())?,
+                ),
+                None => (s, 32u8),
+            };
+            if len > 32 {
+                return Err("prefix length must be 0–32".into());
+            }
+            Some((ip.parse().map_err(|_| "bad destination IP".to_string())?, len))
+        }
+    };
+    let proto = match proto.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some("tcp") => Some(6),
+        Some("udp") => Some(17),
+        Some("icmp") => Some(1),
+        Some(n) => Some(n.parse().map_err(|_| format!("bad protocol '{n}'"))?),
+    };
+    Ok(FlowMatch {
+        scope,
+        dst_cidr,
+        proto,
+        dport,
+    })
+}
+
+/// Admin: append a rule to the signed SDN flow table. Republished in the
+/// manifest and hot-reloaded by every node. Member nodes get "not an admin".
+#[tauri::command]
+async fn add_flow_rule(
+    priority: u16,
+    scope: Option<String>,
+    dst: Option<String>,
+    proto: Option<String>,
+    dport: Option<u16>,
+    action: String,
+) -> Result<(), String> {
+    let rule = FlowRule {
+        priority,
+        match_: build_flow_match(scope, dst, proto, dport)?,
+        action: parse_flow_action(&action)?,
+    };
+    send_checked(Request::FlowAdd { rule }).await
+}
+
+/// Admin: delete the flow rule at `index` (the storage index carried by
+/// `list_flow_rules`).
+#[tauri::command]
+async fn del_flow_rule(index: usize) -> Result<(), String> {
+    send_checked(Request::FlowDel { index }).await
+}
+
+/// Admin: clear the flow table — every node reverts to the built-in default.
+#[tauri::command]
+async fn clear_flow_rules() -> Result<(), String> {
+    send_checked(Request::FlowClear).await
+}
+
 fn parse_node_id(hex: &str) -> Option<lattice_proto::NodeId> {
     if hex.len() != 64 {
         return None;
@@ -251,14 +409,17 @@ fn parse_node_id(hex: &str) -> Option<lattice_proto::NodeId> {
 /// Route this node's internet traffic through a peer (by full hex id), or
 /// `None` to go direct again.
 #[tauri::command]
-async fn set_exit(node_id: Option<String>) -> Result<(), String> {
+async fn set_exit(node_id: Option<String>, split: Option<bool>) -> Result<(), String> {
     let parsed = match node_id {
         Some(hex) => Some(parse_node_id(&hex).ok_or("invalid node id")?),
         None => None,
     };
+    // Split tunnel forwards to the exit but leaves the OS default route alone
+    // (non-disruptive — won't knock the host offline); full tunnel diverts all
+    // internet traffic out through the exit.
     send(Request::SetExit {
         node_id: parsed,
-        full_tunnel: true,
+        full_tunnel: !split.unwrap_or(false),
     })
     .await
 }
@@ -469,6 +630,9 @@ fn main() {
             list_peers,
             list_flows,
             list_flow_rules,
+            add_flow_rule,
+            del_flow_rule,
+            clear_flow_rules,
             network_info,
             join_network,
             mesh_up,
@@ -479,7 +643,8 @@ fn main() {
             allow_exit,
             add_peer,
             set_relay,
-            relay_peer
+            relay_peer,
+            meshd
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");
