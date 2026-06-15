@@ -1,33 +1,71 @@
 //! **meshd** — the v2 multi-mesh control-plane daemon (`docs/MESH_V2.md`).
 //!
-//! Holds this computer's [`MeshContainer`] and serves the v2 IPC
-//! ([`lattice_mesh::ipc`]) over a unix socket: create / inspect / select meshes.
-//! This is the **control plane only** — there is no data plane yet (no TUN demux,
-//! per-mesh crypto, or discovery), so packets do not flow; the GUI can already
-//! show real mesh state, create meshes, populate rosters, and pick exits.
-//!
-//! State is in-memory (lost on restart). Master keypairs are **placeholders**
-//! (random bytes) until the membership/crypto core lands.
+//! Holds this computer's meshes and serves the v2 IPC (`lattice_mesh::ipc`) over a
+//! unix socket. Backed by the REAL membership engine (`lattice_mesh::membership`):
+//! each mesh has a master keypair, members are admitted via **signed certs**, and
+//! the roster is the set of certs that validly chain to the master. The discovery
+//! "where" (endpoints) and the data plane arrive later. State is in-memory.
 
+use std::collections::HashSet;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lattice_mesh::charter::{GenesisCharter, InviteTopology, RecipherTrigger};
 use lattice_mesh::ipc::{MemberView, MeshDetail, MeshSummary, PolicyView, Request, Response};
-use lattice_mesh::{Member, Mesh, MeshContainer};
-use lattice_proto::wire_v2::MeshId;
+use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey};
+use lattice_mesh::Mesh;
+use lattice_proto::wire_v2::{MemberId, MeshId};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 const DEFAULT_SOCKET: &str = "/tmp/lattice-meshd.sock";
 
+/// One mesh plus the real trust state for it.
+struct MeshState {
+    mesh: Mesh,
+    /// The mesh's root of trust. We created the mesh, so we hold the master key
+    /// (the creator). Its private half never leaves this node.
+    master: MasterKey,
+    /// This node's own member keypair in this mesh.
+    my_key: MemberKey,
+    /// Every known cert. The roster = those that validly chain to the master.
+    certs: Vec<Cert>,
+}
+
+impl MeshState {
+    fn topology(&self) -> InviteTopology {
+        self.mesh.charter.invite
+    }
+    /// The validated roster (certs chaining to the master), id-sorted.
+    fn roster(&self) -> Vec<Cert> {
+        let mut v: Vec<Cert> =
+            valid_members(&self.mesh.charter.master_pubkey, &self.certs, self.topology())
+                .into_iter()
+                .cloned()
+                .collect();
+        v.sort_by_key(|c| c.id);
+        v
+    }
+    /// This node's in-mesh id (from its own cert).
+    fn my_id(&self) -> MemberId {
+        let me = self.my_key.pubkey();
+        self.certs.iter().find(|c| c.member == me).map(|c| c.id).unwrap_or(0)
+    }
+}
+
 #[derive(Default)]
 struct State {
-    container: MeshContainer,
-    /// Creator-held master private keys (placeholder bytes for now), per mesh.
-    masters: HashMap<MeshId, [u8; 32]>,
+    meshes: HashMap<MeshId, MeshState>,
     /// The mesh currently selected for egress (the §1 cur-mesh).
     current: Option<MeshId>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[tokio::main]
@@ -68,73 +106,73 @@ async fn main() -> anyhow::Result<()> {
 
 fn handle(req: Request, st: &mut State) -> Response {
     match req {
-        Request::CreateMesh {
-            name,
-            my_name,
-            max_members,
-        } => create_mesh(st, name, my_name, max_members),
+        Request::CreateMesh { name, my_name, max_members } => {
+            create_mesh(st, name, my_name, max_members)
+        }
 
         Request::ListMeshes => {
             let cur = st.current;
             let mut meshes: Vec<MeshSummary> = st
-                .container
-                .iter()
-                .map(|m| MeshSummary {
-                    id: m.id,
-                    name: m.name.clone(),
-                    members: m.roster.len(),
-                    epoch: m.epoch,
-                    exit: m.exit,
-                    is_current: cur == Some(m.id),
+                .meshes
+                .values()
+                .map(|ms| MeshSummary {
+                    id: ms.mesh.id,
+                    name: ms.mesh.name.clone(),
+                    members: ms.roster().len(),
+                    epoch: ms.mesh.epoch,
+                    exit: ms.mesh.exit,
+                    is_current: cur == Some(ms.mesh.id),
                 })
                 .collect();
             meshes.sort_by_key(|s| s.id);
             Response::Meshes(meshes)
         }
 
-        Request::MeshInfo { mesh } => match st.container.get(mesh) {
-            Some(m) => Response::Mesh(detail(m)),
+        Request::MeshInfo { mesh } => match st.meshes.get(&mesh) {
+            Some(ms) => Response::Mesh(detail(ms)),
             None => no_mesh(mesh),
         },
 
-        Request::AdmitMember {
-            mesh,
-            name,
-            pubkey_hex,
-        } => {
+        Request::AdmitMember { mesh, name, pubkey_hex } => {
             let pubkey = match parse_hex32(&pubkey_hex) {
                 Some(p) => p,
-                None => {
-                    return Response::Error {
-                        message: "pubkey must be 64 hex chars".into(),
-                    }
-                }
+                None => return Response::Error { message: "pubkey must be 64 hex chars".into() },
             };
-            match st.container.get_mut(mesh) {
-                Some(m) => {
-                    let max = m.charter.max_members;
-                    match m.roster.admit(Member { name, pubkey }, max) {
-                        Ok(_) => Response::Ok,
-                        Err(e) => Response::Error {
-                            message: e.to_string(),
-                        },
-                    }
-                }
-                None => no_mesh(mesh),
+            let ms = match st.meshes.get_mut(&mesh) {
+                Some(m) => m,
+                None => return no_mesh(mesh),
+            };
+            let roster = ms.roster();
+            if roster.len() >= ms.mesh.charter.max_members as usize {
+                return Response::Error {
+                    message: format!("mesh is full (max {})", ms.mesh.charter.max_members),
+                };
             }
+            if roster.iter().any(|c| c.member == pubkey) {
+                return Response::Error { message: "already a member".into() };
+            }
+            let used: HashSet<MemberId> = roster.iter().map(|c| c.id).collect();
+            let id = match (1u8..=254).find(|i| !used.contains(i)) {
+                Some(i) => i,
+                None => return Response::Error { message: "no free member id".into() },
+            };
+            // The master (held by this node) issues the cert binding the member.
+            let cert = ms.master.issue(pubkey, id, &name, now_ms());
+            ms.certs.push(cert);
+            Response::Ok
         }
 
         Request::SetExit { mesh, exit } => {
-            let ok = match st.container.get_mut(mesh) {
-                Some(m) => {
+            let ok = match st.meshes.get_mut(&mesh) {
+                Some(ms) => {
                     if let Some(e) = exit {
-                        if !m.roster.contains(e) {
+                        if !ms.roster().iter().any(|c| c.id == e) {
                             return Response::Error {
                                 message: format!("no member {e} in mesh {mesh}"),
                             };
                         }
                     }
-                    m.exit = exit;
+                    ms.mesh.exit = exit;
                     true
                 }
                 None => false,
@@ -142,7 +180,6 @@ fn handle(req: Request, st: &mut State) -> Response {
             if !ok {
                 return no_mesh(mesh);
             }
-            // A current mesh with no exit can't egress — drop the selection.
             if exit.is_none() && st.current == Some(mesh) {
                 st.current = None;
             }
@@ -154,8 +191,8 @@ fn handle(req: Request, st: &mut State) -> Response {
                 st.current = None;
                 Response::Ok
             }
-            Some(id) => match st.container.get(id) {
-                Some(m) if m.exit.is_some() => {
+            Some(id) => match st.meshes.get(&id) {
+                Some(ms) if ms.mesh.exit.is_some() => {
                     st.current = Some(id);
                     Response::Ok
                 }
@@ -167,8 +204,7 @@ fn handle(req: Request, st: &mut State) -> Response {
         },
 
         Request::RemoveMesh { mesh } => {
-            if st.container.remove(mesh).is_some() {
-                st.masters.remove(&mesh);
+            if st.meshes.remove(&mesh).is_some() {
                 if st.current == Some(mesh) {
                     st.current = None;
                 }
@@ -179,9 +215,9 @@ fn handle(req: Request, st: &mut State) -> Response {
         }
 
         Request::GetPolicy => {
-            let default = match st.current.and_then(|id| st.container.get(id)) {
-                Some(m) => match m.exit {
-                    Some(e) => format!("via mesh {} exit {}", m.id, e),
+            let default = match st.current.and_then(|id| st.meshes.get(&id)) {
+                Some(ms) => match ms.mesh.exit {
+                    Some(e) => format!("via mesh {} exit {}", ms.mesh.id, e),
                     None => "direct".into(),
                 },
                 None => "direct".into(),
@@ -195,7 +231,7 @@ fn handle(req: Request, st: &mut State) -> Response {
 }
 
 fn create_mesh(st: &mut State, name: String, my_name: String, max_members: u8) -> Response {
-    let id = match (1u8..=255).find(|id| st.container.get(*id).is_none()) {
+    let id = match (1u8..=255).find(|id| !st.meshes.contains_key(id)) {
         Some(id) => id,
         None => {
             return Response::Error {
@@ -203,13 +239,10 @@ fn create_mesh(st: &mut State, name: String, my_name: String, max_members: u8) -
             }
         }
     };
-    // Placeholder keypairs — real keygen lands with the membership/crypto core.
-    let master_pubkey: [u8; 32] = rand::random();
-    let master_priv: [u8; 32] = rand::random();
-    let creator_pubkey: [u8; 32] = rand::random();
-
+    let master = MasterKey::generate();
+    let my_key = MemberKey::generate();
     let charter = GenesisCharter {
-        master_pubkey,
+        master_pubkey: master.network(),
         invite: InviteTopology::OpenChain,
         trigger: RecipherTrigger::Quorum { k: 2 },
         max_members,
@@ -217,62 +250,47 @@ fn create_mesh(st: &mut State, name: String, my_name: String, max_members: u8) -
         overlay_prefix: [100, 80],
     };
     if let Err(e) = charter.validate() {
-        return Response::Error {
-            message: e.to_string(),
-        };
+        return Response::Error { message: e.to_string() };
     }
-
-    let mut mesh = Mesh::new(id, name, charter, 1);
-    // The creator joins as member #1.
-    if let Err(e) = mesh.roster.admit(
-        Member {
-            name: my_name,
-            pubkey: creator_pubkey,
-        },
-        max_members,
-    ) {
-        return Response::Error {
-            message: e.to_string(),
-        };
-    }
-    st.container.add(mesh);
-    st.masters.insert(id, master_priv);
+    // The creator is member #1, with a master-signed cert.
+    let cert = master.issue(my_key.pubkey(), 1, &my_name, now_ms());
+    let mesh = Mesh::new(id, name, charter, 1);
+    st.meshes.insert(id, MeshState { mesh, master, my_key, certs: vec![cert] });
     Response::MeshCreated { mesh: id }
 }
 
-fn detail(m: &Mesh) -> MeshDetail {
-    let mut members: Vec<MemberView> = m
-        .roster
+fn detail(ms: &MeshState) -> MeshDetail {
+    let me = ms.my_key.pubkey();
+    let members: Vec<MemberView> = ms
+        .roster()
         .iter()
-        .map(|(id, mem)| MemberView {
-            id,
-            name: mem.name.clone(),
-            pubkey_fp: fp(&mem.pubkey),
-            is_me: id == m.me,
+        .map(|c| MemberView {
+            id: c.id,
+            name: c.name.clone(),
+            pubkey_fp: fp(&c.member),
+            is_me: c.member == me,
         })
         .collect();
-    members.sort_by_key(|x| x.id);
+    let ch = &ms.mesh.charter;
     MeshDetail {
-        id: m.id,
-        name: m.name.clone(),
-        epoch: m.epoch,
-        me: m.me,
-        exit: m.exit,
-        invite: format!("{:?}", m.charter.invite),
-        trigger: format!("{:?}", m.charter.trigger),
-        max_members: m.charter.max_members,
-        cipher: m.charter.initial_cipher.clone(),
+        id: ms.mesh.id,
+        name: ms.mesh.name.clone(),
+        epoch: ms.mesh.epoch,
+        me: ms.my_id(),
+        exit: ms.mesh.exit,
+        invite: format!("{:?}", ch.invite),
+        trigger: format!("{:?}", ch.trigger),
+        max_members: ch.max_members,
+        cipher: ch.initial_cipher.clone(),
         members,
     }
 }
 
 fn no_mesh(id: MeshId) -> Response {
-    Response::Error {
-        message: format!("no mesh {id}"),
-    }
+    Response::Error { message: format!("no mesh {id}") }
 }
 
-fn fp(pk: &[u8; 32]) -> String {
+fn fp(pk: &PubKey) -> String {
     pk[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
