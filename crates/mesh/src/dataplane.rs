@@ -10,6 +10,7 @@
 //! (so a tampered header or a wrong `seq` fails to open).
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lattice_proto::wire_v2::{self, FrameType, Header, MemberId, MeshId};
 
@@ -31,8 +32,9 @@ pub struct MeshDataPlane {
     /// First two octets of this mesh's overlay /24 (the §2 prefix; charter-chosen).
     overlay_prefix: [u8; 2],
     suite: Box<dyn MeshSuite>,
-    /// Outbound counter — the per-message AEAD nonce.
-    send_seq: u64,
+    /// Outbound counter — the per-message AEAD nonce. Atomic so the run loop can
+    /// seal and recv concurrently behind a shared `&MeshDataPlane`.
+    send_seq: AtomicU64,
 }
 
 impl MeshDataPlane {
@@ -42,7 +44,7 @@ impl MeshDataPlane {
             my_id,
             overlay_prefix,
             suite,
-            send_seq: 0,
+            send_seq: AtomicU64::new(0),
         }
     }
 
@@ -60,11 +62,10 @@ impl MeshDataPlane {
     }
 
     /// Frame an inner packet for member `dst`: `header ‖ seq ‖ seal(inner)`.
-    pub fn seal_to(&mut self, dst: MemberId, inner: &[u8]) -> Vec<u8> {
+    pub fn seal_to(&self, dst: MemberId, inner: &[u8]) -> Vec<u8> {
         let header = Header::new(self.mesh_id, self.my_id, dst, FrameType::Transport);
         let aad = wire_v2::encode(header, &[]); // the 5 header bytes
-        let seq = self.send_seq;
-        self.send_seq += 1;
+        let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
         let ct = self.suite.seal(seq, inner, &aad);
         let mut body = Vec::with_capacity(8 + ct.len());
         body.extend_from_slice(&seq.to_be_bytes());
@@ -107,7 +108,7 @@ mod tests {
 
     #[test]
     fn loopback_seal_then_open() {
-        let mut alice = node(1);
+        let alice = node(1);
         let bob = node(2);
         let packet = b"an inner IP packet (pretend)";
         let frame = alice.seal_to(2, packet);
@@ -116,7 +117,7 @@ mod tests {
 
     #[test]
     fn frame_addressed_to_someone_else_is_forwarded() {
-        let mut alice = node(1);
+        let alice = node(1);
         let bob = node(2);
         let frame = alice.seal_to(7, b"for member 7");
         // bob (id 2) is not the dst → forward, no decrypt.
@@ -125,7 +126,7 @@ mod tests {
 
     #[test]
     fn other_mesh_frame_is_dropped() {
-        let mut alice = node(1);
+        let alice = node(1);
         let other_mesh = MeshDataPlane::new(9, 2, PREFIX, suite("default", &SECRET, 0));
         let frame = alice.seal_to(2, b"x");
         assert_eq!(other_mesh.recv(&frame), None); // mesh id mismatch
@@ -133,7 +134,7 @@ mod tests {
 
     #[test]
     fn tampered_frame_fails_to_open() {
-        let mut alice = node(1);
+        let alice = node(1);
         let bob = node(2);
         let mut frame = alice.seal_to(2, b"secret");
         let n = frame.len();

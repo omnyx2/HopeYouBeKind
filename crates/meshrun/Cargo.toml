@@ -1,0 +1,19 @@
+[package]
+name = "lattice-meshrun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "v2 data-plane runner: ties the TUN, transport, and a mesh's data plane into one loop (docs/DATA_PLANE.md P2)."
+
+[[bin]]
+name = "meshrun"
+path = "src/main.rs"
+
+[dependencies]
+lattice-mesh = { path = "../mesh", version = "0.7.0" }
+lattice-tun.workspace = true
+lattice-net.workspace = true
+lattice-proto.workspace = true
+tokio = { workspace = true }
+anyhow.workspace = true

@@ -15,6 +15,7 @@ members = [
     "crates/overlay",
     "crates/mesh",
     "crates/meshd",
+    "crates/meshrun",
     "crates/engine",
     "crates/membership",
     "crates/dht",

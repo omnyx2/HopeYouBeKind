@@ -625,6 +625,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-meshrun"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "lattice-mesh",
+ "lattice-net",
+ "lattice-proto",
+ "lattice-tun",
+ "tokio",
+]
+
+[[package]]
 name = "lattice-net"
 version = "0.7.0"
 dependencies = [
