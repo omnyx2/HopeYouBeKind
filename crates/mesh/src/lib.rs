@@ -24,6 +24,7 @@ pub mod crypto;
 pub mod dataplane;
 pub mod discovery;
 pub mod ipc;
+pub mod keydist;
 pub mod membership;
 pub mod policy;
 pub mod roster;

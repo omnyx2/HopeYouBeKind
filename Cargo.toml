@@ -64,6 +64,7 @@ rand = "0.8"
 zeroize = "1"           # wipe key material from memory
 blake2 = "0.10"         # keyed MAC for stateless handshake cookies
 chacha20poly1305 = "0.10" # AEAD for the v2 per-mesh symmetric cipher
+x25519-dalek = { version = "2", features = ["static_secrets"] } # ECDH for sealing the mesh secret at join
 # network-CA signatures (membership certs / revocation). default-features off so
 # we don't pull `pkcs8`→`base64ct` (latter needs edition2024, unsupported on 1.79).
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
