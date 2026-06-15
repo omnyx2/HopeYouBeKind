@@ -55,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
         enable_exit_nat(prefix, mesh);
     }
     let dp = MeshDataPlane::new(mesh, my, prefix, suite("default", &secret, 0));
-    lattice_meshrun::run(dp, tun, transport, endpoints, exit).await;
+    let links = lattice_meshrun::seed_links(endpoints);
+    let exit = std::sync::Arc::new(std::sync::Mutex::new(exit));
+    lattice_meshrun::run(dp, tun, transport, links, exit).await;
     Ok(())
 }
 
