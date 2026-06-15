@@ -149,16 +149,8 @@ async function renderMeshes() {
     el("mesh-list").innerHTML = `<li class="empty">meshd not reachable — start it: <code>./target/debug/meshd</code></li>`;
     return;
   }
-  const noEgress = !meshes.some((m) => m.is_current);
-  const originRow = `<li>
-      <div class="peer-left">
-        <span class="dot ${noEgress ? "connected" : "known"}"></span>
-        <b>Default network</b>
-        <span class="muted small">${noEgress ? "in use — your normal internet, no mesh" : "your normal internet, no mesh"}</span>
-        ${noEgress ? `<span class="pill on">in use</span>` : ""}
-      </div>
-      <div><button class="small-btn" data-origin ${noEgress ? "disabled" : ""}>use this</button></div>
-    </li>`;
+  // Just the meshes — no "Default network" row. The no-mesh / direct-internet
+  // egress is chosen from the top-bar egress dropdown.
   const rows = meshes.length ? meshes.map((m) => {
     const egress = m.is_current ? `<span class="pill on">egress</span>` : "";
     const exit = m.exit != null ? `exit #${m.exit}` : "no exit";
@@ -175,7 +167,7 @@ async function renderMeshes() {
       </div>
     </li>`;
   }).join("") : `<li class="empty">no meshes yet — create one above</li>`;
-  el("mesh-list").innerHTML = originRow + rows;
+  el("mesh-list").innerHTML = rows;
 }
 
 el("mesh-list").addEventListener("click", async (e) => {
