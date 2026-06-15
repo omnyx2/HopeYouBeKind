@@ -15,22 +15,33 @@ const MESHD_SOCKET: &str = "/tmp/lattice-meshd.sock";
 /// Proxy one newline-JSON request to `meshd` and hand back its response line.
 /// Browsers/JS can't open a unix socket, so this thin bridge is the GUI's only
 /// native code.
+/// Proxy one request to meshd. ASYNC + on a blocking thread + with socket
+/// timeouts, so a slow/unresponsive meshd can NEVER hang the webview: the UI thread
+/// is never touched, and every call returns (or errors) within a few seconds
+/// instead of leaving a wedged blocking read that piles up across the 3s polls.
 #[cfg(unix)]
 #[tauri::command]
-fn meshd(request: String) -> Result<String, String> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    let stream = UnixStream::connect(MESHD_SOCKET)
-        .map_err(|e| format!("meshd not running ({MESHD_SOCKET}): {e}"))?;
-    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
-    let mut line = request;
-    line.push('\n');
-    writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    let mut resp = String::new();
-    BufReader::new(stream)
-        .read_line(&mut resp)
-        .map_err(|e| e.to_string())?;
-    Ok(resp.trim_end().to_string())
+async fn meshd(request: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+        let stream = UnixStream::connect(MESHD_SOCKET)
+            .map_err(|e| format!("meshd not running ({MESHD_SOCKET}): {e}"))?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+        let mut line = request;
+        line.push('\n');
+        writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        let mut resp = String::new();
+        BufReader::new(stream)
+            .read_line(&mut resp)
+            .map_err(|e| e.to_string())?;
+        Ok(resp.trim_end().to_string())
+    })
+    .await
+    .map_err(|e| format!("meshd bridge task failed: {e}"))?
 }
 
 #[cfg(not(unix))]
