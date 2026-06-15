@@ -1,0 +1,12 @@
+[package]
+name = "lattice-mesh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "v2 multi-mesh container: per-mesh roster + immutable charter, the set of meshes a computer joins, and the per-computer routing policy that demuxes one TUN across them."
+
+[dependencies]
+lattice-proto.workspace = true
+serde.workspace = true
+thiserror.workspace = true

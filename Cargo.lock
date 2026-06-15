@@ -600,6 +600,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-mesh"
+version = "0.7.0"
+dependencies = [
+ "lattice-proto",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "lattice-net"
 version = "0.7.0"
 dependencies = [
