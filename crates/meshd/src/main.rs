@@ -19,7 +19,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lattice_mesh::charter::{GenesisCharter, InviteTopology, RecipherTrigger};
 use lattice_mesh::crypto::suite;
 use lattice_mesh::dataplane::MeshDataPlane;
-use lattice_mesh::ipc::{MemberView, MeshDetail, MeshSummary, PolicyView, Request, Response};
+use lattice_mesh::ipc::{
+    InviteBlob, MemberView, MeshDetail, MeshSummary, PolicyView, Request, Response,
+};
+use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey};
 use lattice_mesh::Mesh;
 use lattice_meshrun::{seed_links, Link, PeerLinks, SharedExit};
@@ -41,16 +44,18 @@ const OVERLAY_MTU: u16 = 1280;
 /// One mesh plus the real trust state for it.
 struct MeshState {
     mesh: Mesh,
-    /// The mesh's root of trust. We created the mesh, so we hold the master key
-    /// (the creator). Its private half never leaves this node.
-    master: MasterKey,
+    /// The mesh's root of trust. `Some` only on the creator (it holds the master
+    /// key and can issue invites); a joiner installs the mesh with `None`.
+    master: Option<MasterKey>,
     /// This node's own member keypair in this mesh.
     my_key: MemberKey,
+    /// This node's encryption key in this mesh (receives sealed secrets — rekeys).
+    #[allow(dead_code)]
+    my_enc: EncKey,
     /// Every known cert. The roster = those that validly chain to the master.
     certs: Vec<Cert>,
     /// The mesh's shared symmetric secret (epoch 0) — keys the data-plane cipher.
-    /// Held for future rekey / re-bringup / distribution to joiners (keydist).
-    #[allow(dead_code)]
+    /// Held for rekey / re-bringup / sealing to joiners (keydist).
     secret: [u8; 32],
     /// Live peer table, shared with this mesh's data-plane loop (endpoints +
     /// last-seen). Empty until peers are seeded (SetPeer) or heard from.
@@ -87,6 +92,9 @@ struct State {
     current: Option<MeshId>,
     /// Whether to spawn data-plane loops (`DATA_PLANE=1`).
     data_plane: bool,
+    /// Freshly minted identities (member + enc keypair) awaiting an invite, keyed
+    /// by member public key. Drained when `JoinMesh` consumes one.
+    pending: HashMap<PubKey, (MemberKey, EncKey)>,
 }
 
 /// Everything `bringup_dataplane` needs to spawn a mesh's live loop — built inside
@@ -177,7 +185,14 @@ async fn bringup_dataplane(b: Bringup) {
             return;
         }
     };
-    let bind = SocketAddr::from(([0, 0, 0, 0], UDP_BASE_PORT.wrapping_add(b.mesh_id as u16)));
+    // Per-mesh port = base + mesh id, unless MESHD_BIND_PORT pins one explicitly
+    // (single-mesh demos / firewalled hosts that only have one open port, e.g. the
+    // Oracle OCI security list).
+    let port = std::env::var("MESHD_BIND_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| UDP_BASE_PORT.wrapping_add(b.mesh_id as u16));
+    let bind = SocketAddr::from(([0, 0, 0, 0], port));
     let transport = match UdpTransport::bind(bind).await {
         Ok(t) => t,
         Err(e) => {
@@ -241,7 +256,12 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<Bringup>) {
                 None => return (err("no free member id"), None),
             };
             // The master (held by this node) issues the cert binding the member.
-            let cert = ms.master.issue(pubkey, id, &name, now_ms());
+            // Note: this is a local admit only — it does NOT hand the joiner the
+            // mesh secret. Use CreateInvite for a node that will actually connect.
+            let cert = match ms.master.as_ref() {
+                Some(m) => m.issue(pubkey, id, &name, now_ms()),
+                None => return (err("only the mesh creator can admit members"), None),
+            };
             ms.certs.push(cert);
             (Response::Ok, None)
         }
@@ -323,7 +343,115 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<Bringup>) {
             };
             (Response::Policy(PolicyView { default, current_mesh: st.current }), None)
         }
+
+        Request::NewIdentity => {
+            let member = MemberKey::generate();
+            let enc = EncKey::generate();
+            let member_pubkey_hex = hex(&member.pubkey());
+            let enc_pubkey_hex = hex(&enc.public());
+            st.pending.insert(member.pubkey(), (member, enc));
+            (Response::Identity { member_pubkey_hex, enc_pubkey_hex }, None)
+        }
+
+        Request::CreateInvite { mesh, name, member_pubkey_hex, enc_pubkey_hex } => {
+            let member_pk = match parse_hex32(&member_pubkey_hex) {
+                Some(p) => p,
+                None => return (err("member_pubkey must be 64 hex chars"), None),
+            };
+            let enc_pk = match parse_hex32(&enc_pubkey_hex) {
+                Some(p) => p,
+                None => return (err("enc_pubkey must be 64 hex chars"), None),
+            };
+            let ms = match st.meshes.get_mut(&mesh) {
+                Some(m) => m,
+                None => return (no_mesh(mesh), None),
+            };
+            let master = match ms.master.as_ref() {
+                Some(m) => m,
+                None => return (err("only the mesh creator can issue invites"), None),
+            };
+            let roster = ms.roster();
+            if roster.len() >= ms.mesh.charter.max_members as usize {
+                return (err(&format!("mesh is full (max {})", ms.mesh.charter.max_members)), None);
+            }
+            if roster.iter().any(|c| c.member == member_pk) {
+                return (err("already a member"), None);
+            }
+            let used: HashSet<MemberId> = roster.iter().map(|c| c.id).collect();
+            let id = match (1u8..=254).find(|i| !used.contains(i)) {
+                Some(i) => i,
+                None => return (err("no free member id"), None),
+            };
+            // Issue the cert and seal the mesh secret to the joiner's enc key.
+            let cert = master.issue(member_pk, id, &name, now_ms());
+            let sealed_secret = seal_secret(&enc_pk, &ms.secret);
+            ms.certs.push(cert);
+            let blob = InviteBlob {
+                mesh_id: ms.mesh.id,
+                mesh_name: ms.mesh.name.clone(),
+                charter: ms.mesh.charter.clone(),
+                member_id: id,
+                certs: ms.certs.clone(),
+                sealed_secret,
+            };
+            (Response::Invite(blob), None)
+        }
+
+        Request::JoinMesh { invite } => join_mesh(st, invite),
     }
+}
+
+fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<Bringup>) {
+    if st.meshes.contains_key(&invite.mesh_id) {
+        return (err(&format!("already in mesh {}", invite.mesh_id)), None);
+    }
+    // The cert the creator issued to us tells us which pending identity to use.
+    let my_cert = match invite.certs.iter().find(|c| c.id == invite.member_id) {
+        Some(c) => c,
+        None => return (err("invite has no cert for the assigned member id"), None),
+    };
+    let (my_key, my_enc) = match st.pending.remove(&my_cert.member) {
+        Some(pair) => pair,
+        None => return (err("no pending identity for this invite — call NewIdentity first"), None),
+    };
+    // Open the sealed mesh secret with our encryption key.
+    let secret = match my_enc.open(&invite.sealed_secret) {
+        Some(s) => s,
+        None => return (err("could not open the sealed secret (wrong key?)"), None),
+    };
+    // Verify our cert actually chains to the charter's master before adopting.
+    let roster = valid_members(&invite.charter.master_pubkey, &invite.certs, invite.charter.invite);
+    if !roster.iter().any(|c| c.id == invite.member_id && c.member == my_key.pubkey()) {
+        return (err("our cert does not validate against the master — bad invite"), None);
+    }
+    let prefix = invite.charter.overlay_prefix;
+    let cipher = invite.charter.initial_cipher.clone();
+    let links = seed_links(HashMap::new());
+    let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let mesh = Mesh::new(invite.mesh_id, invite.mesh_name.clone(), invite.charter, invite.member_id);
+    let bringup = st.data_plane.then(|| Bringup {
+        mesh_id: invite.mesh_id,
+        my_id: invite.member_id,
+        prefix,
+        secret,
+        cipher,
+        links: Arc::clone(&links),
+        exit_sel: Arc::clone(&exit_sel),
+    });
+    st.meshes.insert(
+        invite.mesh_id,
+        MeshState {
+            mesh,
+            master: None,
+            my_key,
+            my_enc,
+            certs: invite.certs,
+            secret,
+            links,
+            exit_sel,
+        },
+    );
+    (Response::MeshCreated { mesh: invite.mesh_id }, bringup)
 }
 
 fn create_mesh(
@@ -351,6 +479,7 @@ fn create_mesh(
     }
     // The creator is member #1, with a master-signed cert.
     let cert = master.issue(my_key.pubkey(), 1, &my_name, now_ms());
+    let my_enc = EncKey::generate();
     let prefix = charter.overlay_prefix;
     let cipher = charter.initial_cipher.clone();
     let secret: [u8; 32] = rand::random();
@@ -370,7 +499,16 @@ fn create_mesh(
     });
     st.meshes.insert(
         id,
-        MeshState { mesh, master, my_key, certs: vec![cert], secret, links, exit_sel },
+        MeshState {
+            mesh,
+            master: Some(master),
+            my_key,
+            my_enc,
+            certs: vec![cert],
+            secret,
+            links,
+            exit_sel,
+        },
     );
     (Response::MeshCreated { mesh: id }, bringup)
 }
@@ -425,6 +563,10 @@ fn err(message: &str) -> Response {
 
 fn fp(pk: &PubKey) -> String {
     pk[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {

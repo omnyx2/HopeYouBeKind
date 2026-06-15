@@ -11,6 +11,10 @@
 use lattice_proto::wire_v2::{MemberId, MeshId};
 use serde::{Deserialize, Serialize};
 
+use crate::charter::GenesisCharter;
+use crate::keydist::SealedSecret;
+use crate::membership::Cert;
+
 /// A client → daemon request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -54,6 +58,25 @@ pub enum Request {
     RemoveMesh { mesh: MeshId },
     /// The current routing policy.
     GetPolicy,
+
+    // --- join flow (cert + sealed-secret exchange) ---
+    /// (Joiner) Mint a fresh member + encryption keypair to be invited under.
+    /// Returns both public keys; the private halves are held until `JoinMesh`.
+    NewIdentity,
+    /// (Creator) Admit a member by their public keys: issue a cert AND seal the
+    /// mesh secret to their encryption key. Returns an [`InviteBlob`] to hand to
+    /// the joiner out-of-band.
+    CreateInvite {
+        mesh: MeshId,
+        name: String,
+        /// 64 hex — the joiner's member (ed25519) public key from `NewIdentity`.
+        member_pubkey_hex: String,
+        /// 64 hex — the joiner's encryption (x25519) public key from `NewIdentity`.
+        enc_pubkey_hex: String,
+    },
+    /// (Joiner) Install a mesh from an invite: open the sealed secret with the held
+    /// private key, adopt the roster, and (if data-plane) bring up the loop.
+    JoinMesh { invite: InviteBlob },
 }
 
 /// A daemon → client reply.
@@ -63,8 +86,29 @@ pub enum Response {
     Meshes(Vec<MeshSummary>),
     Mesh(MeshDetail),
     Policy(PolicyView),
+    /// A freshly minted identity's public keys (from `NewIdentity`).
+    Identity { member_pubkey_hex: String, enc_pubkey_hex: String },
+    /// An invite to hand to the joiner (from `CreateInvite`).
+    Invite(InviteBlob),
     Ok,
     Error { message: String },
+}
+
+/// A self-contained invite: everything a joiner needs to install the mesh and key
+/// its data plane. Travels out-of-band (the GUI/CLI shuttles the JSON).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InviteBlob {
+    pub mesh_id: MeshId,
+    pub mesh_name: String,
+    /// The immutable governance — carries the master public key (root of trust).
+    pub charter: GenesisCharter,
+    /// The id the creator assigned to the joiner.
+    pub member_id: MemberId,
+    /// The full roster (every cert), so the joiner sees everyone and can verify the
+    /// chain to the master.
+    pub certs: Vec<Cert>,
+    /// The mesh secret, sealed to the joiner's encryption public key.
+    pub sealed_secret: SealedSecret,
 }
 
 /// One row in the global "all meshes on this computer" view (§7).
