@@ -37,8 +37,10 @@ async function meshd(req) {
 // ---- view mode (§1 toggle) ----
 let MODE = "user";        // "user" | "mesh"
 let CURRENT_MESH = null;  // the mesh Mesh-mode operates on (set via `manage ›`)
+let ACTIVE_TAB = null;    // current panel, so the live poll re-renders the right one
 
 function activateTab(name) {
+  ACTIVE_TAB = name;
   document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== name));
 }
@@ -88,24 +90,29 @@ function renderTopology(d) {
     const a = (i / Math.max(1, others.length)) * Math.PI * 2 - Math.PI / 2;
     pos[m.id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) };
   });
-  // edges: me → each member (the exit edge highlighted)
+  // edges: me → each member; exit edge violet, live links green+solid, the rest faint.
   others.forEach((m) => {
     const p = pos[m.id];
     const isExit = d.exit === m.id;
-    g.strokeStyle = isExit ? "#a78bfa" : "rgba(148,163,184,.3)";
-    g.lineWidth = isExit ? 2.5 : 1;
+    const live = m.state === "live";
+    g.setLineDash(live || isExit ? [] : [4, 4]);
+    g.strokeStyle = isExit ? "#a78bfa" : live ? "rgba(34,197,94,.6)" : "rgba(148,163,184,.25)";
+    g.lineWidth = isExit ? 2.5 : live ? 2 : 1;
     g.beginPath(); g.moveTo(cx, cy); g.lineTo(p.x, p.y); g.stroke();
   });
-  const node = (x, y, label, kind) => {
-    const r = kind === "me" ? 16 : 12;
+  g.setLineDash([]);
+  const node = (x, y, label, fill, r) => {
     g.beginPath(); g.arc(x, y, r, 0, 7);
-    g.fillStyle = kind === "me" ? "#3b82f6" : kind === "exit" ? "#a78bfa" : "#475569";
-    g.fill();
+    g.fillStyle = fill; g.fill();
     g.fillStyle = "#cbd5e1"; g.font = "11px ui-monospace, monospace"; g.textAlign = "center";
     g.fillText(label, x, y + r + 14);
   };
-  others.forEach((m) => node(pos[m.id].x, pos[m.id].y, `${m.name} #${m.id}`, d.exit === m.id ? "exit" : "peer"));
-  node(cx, cy, me ? `${me.name} #${me.id}` : "me", "me");
+  // node colour by role/liveness: exit violet, live peer green, otherwise slate.
+  others.forEach((m) => {
+    const fill = d.exit === m.id ? "#a78bfa" : m.state === "live" ? "#22c55e" : "#475569";
+    node(pos[m.id].x, pos[m.id].y, `${m.name} #${m.id}`, fill, 12);
+  });
+  node(cx, cy, me ? `${me.name} #${me.id}` : "me", "#3b82f6", 16);
 }
 
 // ---- Mesh mode: Peers page (§4 — members now, live state later) ----
@@ -115,8 +122,11 @@ async function renderPeersFor(id) {
   catch (e) { toast(String(e)); return; }
   const rows = d.members.map((m) => {
     const role = m.is_me ? "this node" : d.exit === m.id ? "exit" : "member";
+    const st = m.state || "unknown";
+    const badge = `<span class="state-badge state-${st}">${st}</span>`;
+    const ep = m.endpoint ? `<span class="muted small mono"> ${esc(m.endpoint)}</span>` : "";
     return `<tr><td>${m.id}</td><td>${esc(m.name)}${m.is_me ? ' <span class="muted small">(me)</span>' : ""}</td>` +
-      `<td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td class="muted small">— (data plane)</td></tr>`;
+      `<td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}</td></tr>`;
   }).join("");
   el("peers-table").querySelector("tbody").innerHTML = rows;
 }
@@ -305,6 +315,12 @@ el("tb-egress").addEventListener("change", async (e) => {
 
 setMode("user");
 setInterval(refreshTopbar, 3000);
+// Live poll: keep the Peers/Topology connection state fresh while viewing them.
+setInterval(() => {
+  if (MODE !== "mesh" || CURRENT_MESH == null) return;
+  if (ACTIVE_TAB === "mesh-peers") renderPeersFor(CURRENT_MESH);
+  else if (ACTIVE_TAB === "mesh-topology") renderTopologyFor(CURRENT_MESH);
+}, 3000);
 
 // ---- browser demo (no Tauri): meshd is unreachable ----
 function mockInvoke(cmd) {

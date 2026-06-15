@@ -40,6 +40,14 @@ body.mode-mesh .nav-item[data-grp="user"] { display: none; }
 .tdot.me { background: #3b82f6; }
 .tdot.exit { background: #a78bfa; }
 .tdot.peer { background: #475569; }
+.tdot.live { background: #22c55e; }
+
+/* Per-member live connection state (Peers page, P6.3d) */
+.state-badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: capitalize; }
+.state-badge.state-me { background: rgba(59,130,246,.18); color: #93c5fd; }
+.state-badge.state-live { background: rgba(34,197,94,.18); color: #86efac; }
+.state-badge.state-idle { background: rgba(245,158,11,.16); color: #fcd34d; }
+.state-badge.state-unknown { background: rgba(148,163,184,.14); color: #94a3b8; }
 
 /* ---------- sidebar ---------- */
 .sidebar {

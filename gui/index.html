@@ -73,8 +73,8 @@
           <!-- Mesh mode: Peers (docs/GUI_PAGES.md §4 — members now, live state later) -->
           <section data-panel="mesh-peers" class="panel hidden">
             <h1 class="panel-title">Peers</h1>
-            <p class="panel-sub">Members of this mesh.
-              <span class="muted small">(roster now; connection state &amp; endpoints arrive with the data plane)</span></p>
+            <p class="panel-sub">Members of this mesh, with live connection state.
+              <span class="muted small">(live = heard within 30s; idle = known endpoint, quiet)</span></p>
             <div class="card">
               <table class="topo-table" id="peers-table">
                 <thead><tr><th>id</th><th>name</th><th>pubkey</th><th>role</th><th>state</th></tr></thead>
@@ -87,12 +87,13 @@
           <section data-panel="mesh-topology" class="panel hidden">
             <h1 class="panel-title">Topology</h1>
             <p class="panel-sub">This mesh's members and the exit edge.
-              <span class="muted small">(structure now; live links arrive with the data plane)</span></p>
+              <span class="muted small">(green = live link, violet = exit, dashed = idle)</span></p>
             <div class="card"><canvas id="topo-canvas"></canvas></div>
             <div class="topo-legend">
               <span><i class="tdot me"></i> this node</span>
               <span><i class="tdot exit"></i> exit</span>
-              <span><i class="tdot peer"></i> member</span>
+              <span><i class="tdot live"></i> live</span>
+              <span><i class="tdot peer"></i> idle</span>
             </div>
           </section>
         </main>
