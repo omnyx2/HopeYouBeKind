@@ -108,11 +108,26 @@ function renderTopology(d) {
   node(cx, cy, me ? `${me.name} #${me.id}` : "me", "me");
 }
 
+// ---- Mesh mode: Peers page (§4 — members now, live state later) ----
+async function renderPeersFor(id) {
+  let d;
+  try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
+  catch (e) { toast(String(e)); return; }
+  const rows = d.members.map((m) => {
+    const role = m.is_me ? "this node" : d.exit === m.id ? "exit" : "member";
+    return `<tr><td>${m.id}</td><td>${esc(m.name)}${m.is_me ? ' <span class="muted small">(me)</span>' : ""}</td>` +
+      `<td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td class="muted small">— (data plane)</td></tr>`;
+  }).join("");
+  el("peers-table").querySelector("tbody").innerHTML = rows;
+}
+
 document.querySelectorAll(".nav-item").forEach((b) =>
   b.addEventListener("click", () => {
     if (b.dataset.tab === "meshes") return setMode("user");
     activateTab(b.dataset.tab);
-    if (b.dataset.tab === "mesh-topology" && CURRENT_MESH != null) renderTopologyFor(CURRENT_MESH);
+    if (CURRENT_MESH == null) return;
+    if (b.dataset.tab === "mesh-topology") renderTopologyFor(CURRENT_MESH);
+    if (b.dataset.tab === "mesh-peers") renderPeersFor(CURRENT_MESH);
   })
 );
 

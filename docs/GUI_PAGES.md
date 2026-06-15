@@ -163,12 +163,12 @@ contract for when their backend exists.
 / 아래는 **명세만 있고 미구현**. `meshd` 확장이 필요하며 실제 per-mesh 데이터가 생기기
 전엔 **표시하지 않는다.** 백엔드가 생겼을 때의 계약으로 여기 적어둔다.
 
-- **Peers / 피어 (🔭):** live connection state of each member in this mesh
-  (connected / connecting / via-relay), endpoints, latency. *Needs:* `meshd` to
-  expose per-mesh session state (data plane). Until then, member identity lives in
-  Overview's roster.
-  / 이 메쉬 멤버들의 실시간 연결 상태(직결/연결중/릴레이), 엔드포인트, 지연. *필요:*
-  meshd가 per-mesh 세션 상태(데이터 플레인) 노출. 그 전엔 멤버 신원은 Overview 로스터로.
+- **Peers / 피어 (◑ static now, live later):** the mesh's members as a table —
+  `id · name · pubkey · role` (this node / exit / member) renders now from
+  `MeshInfo`; **live** connection state (connected / connecting / via-relay),
+  endpoints, and latency arrive with the data plane (P6.3).
+  / 메쉬 멤버 표 — `id · name · pubkey · 역할`(this node/exit/member)은 지금 `MeshInfo`로
+  렌더; **라이브** 연결상태(직결/연결중/릴레이)·엔드포인트·지연은 데이터플레인(P6.3) 후.
 - **Traffic / 트래픽 (🔭):** per-mesh flows (who↔who, bytes/packets). *Needs:* data
   plane + a `meshd` flows query.
   / per-mesh 플로우(누구↔누구, 바이트/패킷). *필요:* 데이터 플레인 + meshd 플로우 질의.
