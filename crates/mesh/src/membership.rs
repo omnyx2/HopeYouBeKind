@@ -50,8 +50,8 @@ pub struct Cert {
 }
 
 /// serde's built-in array impls stop at length 32, so route the 64-byte signature
-/// through a byte sequence.
-mod sig_serde {
+/// through a byte sequence. Shared by the membership and discovery records.
+pub(crate) mod sig_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
         v.as_slice().serialize(s)
@@ -124,6 +124,10 @@ impl MemberKey {
     }
     pub fn pubkey(&self) -> PubKey {
         self.0.verifying_key().to_bytes()
+    }
+    /// Sign arbitrary bytes with this member's key (used by discovery records).
+    pub(crate) fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        self.0.sign(msg).to_bytes()
     }
     /// Invite a new member (open-chain): this member signs the child cert.
     pub fn invite(
