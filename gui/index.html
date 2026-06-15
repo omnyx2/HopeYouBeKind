@@ -37,6 +37,9 @@
             <button class="nav-item" data-tab="mesh-overview" data-grp="mesh">
               <span class="nav-ico">⬢</span> Overview
             </button>
+            <button class="nav-item" data-tab="mesh-topology" data-grp="mesh">
+              <span class="nav-ico">🕸</span> Topology
+            </button>
           </div>
         </nav>
 
@@ -62,6 +65,19 @@
           <!-- Mesh mode: Overview (docs/GUI_PAGES.md §3) -->
           <section data-panel="mesh-overview" class="panel hidden">
             <div id="mesh-detail" class="card"></div>
+          </section>
+
+          <!-- Mesh mode: Topology (docs/GUI_PAGES.md §4 — static graph now) -->
+          <section data-panel="mesh-topology" class="panel hidden">
+            <h1 class="panel-title">Topology</h1>
+            <p class="panel-sub">This mesh's members and the exit edge.
+              <span class="muted small">(structure now; live links arrive with the data plane)</span></p>
+            <div class="card"><canvas id="topo-canvas"></canvas></div>
+            <div class="topo-legend">
+              <span><i class="tdot me"></i> this node</span>
+              <span><i class="tdot exit"></i> exit</span>
+              <span><i class="tdot peer"></i> member</span>
+            </div>
           </section>
         </main>
       </div>

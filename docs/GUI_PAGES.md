@@ -172,9 +172,12 @@ contract for when their backend exists.
 - **Traffic / 트래픽 (🔭):** per-mesh flows (who↔who, bytes/packets). *Needs:* data
   plane + a `meshd` flows query.
   / per-mesh 플로우(누구↔누구, 바이트/패킷). *필요:* 데이터 플레인 + meshd 플로우 질의.
-- **Topology / 토폴로지 (🔭):** this mesh's graph (members, relays, exit). *Needs:*
-  per-mesh peer/relay state from `meshd`.
-  / 이 메쉬의 그래프(멤버·릴레이·exit). *필요:* meshd의 per-mesh 피어/릴레이 상태.
+- **Topology / 토폴로지 (◑ static now, live later):** this mesh's graph. The
+  **structure** (members + the exit edge) renders now from `MeshInfo` (the cert
+  roster + charter exit); **live** connection state (direct/relay/offline) arrives
+  with the data plane (P6.3).
+  / 이 메쉬의 그래프. **구조**(멤버 + exit 간선)는 지금 `MeshInfo`(cert 로스터 + 헌장
+  exit)로 렌더; **라이브** 연결상태(직결/릴레이/오프라인)는 데이터플레인(P6.3) 후.
 - **Security / 보안 (🔭):** capture-detection status + crypto epoch/table
   (MESH_V2.md §4–§5). *Needs:* `meshd` to surface epoch + capture state.
   / 탈취 감지 상태 + 암호 epoch/테이블. *필요:* meshd가 epoch·탈취 상태 노출.

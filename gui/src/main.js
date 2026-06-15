@@ -64,8 +64,56 @@ async function refreshMode() {
   refreshTopbar();
 }
 
+// ---- Mesh mode: Topology page (§4 — static graph from MeshInfo) ----
+async function renderTopologyFor(id) {
+  let d;
+  try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
+  catch (e) { toast(String(e)); return; }
+  renderTopology(d);
+}
+
+function renderTopology(d) {
+  const c = el("topo-canvas");
+  if (!c) return;
+  const g = c.getContext("2d");
+  const W = (c.width = c.clientWidth || 600);
+  const H = (c.height = 360);
+  g.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2;
+  const me = d.members.find((m) => m.is_me);
+  const others = d.members.filter((m) => !m.is_me);
+  const R = Math.min(W, H) / 2 - 56;
+  const pos = {};
+  others.forEach((m, i) => {
+    const a = (i / Math.max(1, others.length)) * Math.PI * 2 - Math.PI / 2;
+    pos[m.id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) };
+  });
+  // edges: me → each member (the exit edge highlighted)
+  others.forEach((m) => {
+    const p = pos[m.id];
+    const isExit = d.exit === m.id;
+    g.strokeStyle = isExit ? "#a78bfa" : "rgba(148,163,184,.3)";
+    g.lineWidth = isExit ? 2.5 : 1;
+    g.beginPath(); g.moveTo(cx, cy); g.lineTo(p.x, p.y); g.stroke();
+  });
+  const node = (x, y, label, kind) => {
+    const r = kind === "me" ? 16 : 12;
+    g.beginPath(); g.arc(x, y, r, 0, 7);
+    g.fillStyle = kind === "me" ? "#3b82f6" : kind === "exit" ? "#a78bfa" : "#475569";
+    g.fill();
+    g.fillStyle = "#cbd5e1"; g.font = "11px ui-monospace, monospace"; g.textAlign = "center";
+    g.fillText(label, x, y + r + 14);
+  };
+  others.forEach((m) => node(pos[m.id].x, pos[m.id].y, `${m.name} #${m.id}`, d.exit === m.id ? "exit" : "peer"));
+  node(cx, cy, me ? `${me.name} #${me.id}` : "me", "me");
+}
+
 document.querySelectorAll(".nav-item").forEach((b) =>
-  b.addEventListener("click", () => (b.dataset.tab === "meshes" ? setMode("user") : activateTab(b.dataset.tab)))
+  b.addEventListener("click", () => {
+    if (b.dataset.tab === "meshes") return setMode("user");
+    activateTab(b.dataset.tab);
+    if (b.dataset.tab === "mesh-topology" && CURRENT_MESH != null) renderTopologyFor(CURRENT_MESH);
+  })
 );
 
 // ---- User mode: Meshes page (§2) ----
