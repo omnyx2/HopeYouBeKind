@@ -8,7 +8,7 @@
   </head>
   <body class="mode-user">
     <div class="app">
-      <!-- Top widget bar: current-mode summary + global mesh switcher -->
+      <!-- Top widget bar: status (left) + view toggle + egress selector (docs/GUI_PAGES.md §1) -->
       <div class="topbar">
         <div class="tb-state">
           <span id="tb-dot" class="conn-dot off"></span>
@@ -24,327 +24,46 @@
           </label>
         </div>
       </div>
+
       <div class="app-body">
-      <!-- Sidebar / menu -->
-      <nav class="sidebar">
-        <div class="brand"><span class="brand-mark">▦</span> Lattice</div>
-        <div class="nav">
-          <!-- User mode -->
-          <button class="nav-item" data-tab="meshes" data-grp="user">
-            <span class="nav-ico">⬢</span> Meshes
-          </button>
-          <!-- Mesh mode (scoped to the selected mesh) -->
-          <button class="nav-item" data-tab="mesh-overview" data-grp="mesh">
-            <span class="nav-ico">⬢</span> Overview
-          </button>
-          <button class="nav-item" data-tab="status" data-grp="mesh">
-            <span class="nav-ico">◎</span> Status
-          </button>
-          <button class="nav-item" data-tab="peers" data-grp="mesh">
-            <span class="nav-ico">⧉</span> Peers
-            <span id="nav-peer-count" class="nav-badge hidden">0</span>
-          </button>
-          <button class="nav-item" data-tab="traffic" data-grp="mesh">
-            <span class="nav-ico">📊</span> Traffic
-          </button>
-          <button class="nav-item" data-tab="mesh" data-grp="mesh">
-            <span class="nav-ico">⬡</span> Membership
-          </button>
-          <button class="nav-item" data-tab="network" data-grp="mesh">
-            <span class="nav-ico">⇄</span> Network
-          </button>
-          <button class="nav-item" data-tab="topology" data-grp="mesh">
-            <span class="nav-ico">🕸</span> Topology
-          </button>
-        </div>
-        <div class="sidebar-foot">
-          <span id="conn-dot" class="conn-dot off"></span>
-          <span id="conn-text">stopped</span>
-        </div>
-      </nav>
-
-      <!-- Content -->
-      <main class="content">
-        <!-- ===== MESHES (v2 multi-mesh, via meshd) ===== -->
-        <!-- User mode home: manage the SET of meshes -->
-        <section data-panel="meshes" class="panel hidden">
-          <h1 class="panel-title">This computer · meshes</h1>
-          <p class="panel-sub">Every mesh you belong to. Click <b>manage</b> to handle one,
-            or <b>make egress</b> to route your traffic through it.
-            <span class="muted small">(v2 — meshd)</span></p>
-          <div class="card">
-            <div class="card-head"><h2 class="card-title">Create a mesh</h2></div>
-            <div class="add-row">
-              <input id="mesh-name" placeholder="mesh name — e.g. home" />
-              <input id="mesh-myname" placeholder="your name in it — e.g. alice" />
-              <input id="mesh-max" type="number" min="1" max="254" placeholder="max 254" style="max-width:90px" />
-              <button id="mesh-create" class="secondary">Create</button>
-            </div>
+        <nav class="sidebar">
+          <div class="brand"><span class="brand-mark">▦</span> Lattice</div>
+          <div class="nav">
+            <!-- User mode -->
+            <button class="nav-item" data-tab="meshes" data-grp="user">
+              <span class="nav-ico">⬢</span> Meshes
+            </button>
+            <!-- Mesh mode (scoped to the opened mesh) -->
+            <button class="nav-item" data-tab="mesh-overview" data-grp="mesh">
+              <span class="nav-ico">⬢</span> Overview
+            </button>
           </div>
-          <ul id="mesh-list" class="peers"></ul>
-        </section>
+        </nav>
 
-        <!-- Mesh mode home: this mesh's overview (roster / charter / exit) -->
-        <section data-panel="mesh-overview" class="panel hidden">
-          <div id="mesh-detail" class="card"></div>
-        </section>
-
-        <!-- ===== STATUS ===== -->
-        <section data-panel="status" class="panel">
-          <h1 class="panel-title">Status</h1>
-
-          <div id="stopped-card" class="card center">
-            <p class="muted">The node service is not running.</p>
-            <button id="start" class="primary">Start node</button>
-            <p class="hint">You'll be asked for your password — the node needs
-              admin rights to create the virtual network interface.</p>
-          </div>
-
-          <div id="running-card" class="card hidden">
-            <div class="kv">
-              <span class="label">Virtual IP</span>
-              <span id="virtual-ip" class="mono copy" title="Click to copy">—</span>
-            </div>
-            <div class="kv">
-              <span class="label">Node ID</span>
-              <span id="node-id" class="mono copy" title="Click to copy — share so a peer can reach you">—</span>
-            </div>
-            <div class="kv">
-              <span class="label">Public address</span>
-              <span id="public-addr" class="mono muted">—</span>
-            </div>
-            <div class="kv">
-              <span class="label">Fingerprint</span>
-              <span id="fingerprint" class="mono muted">—</span>
-            </div>
-            <div class="kv">
-              <span class="label">Mesh</span>
-              <label class="switch">
-                <input type="checkbox" id="mesh-toggle" />
-                <span class="slider"></span>
-              </label>
-            </div>
-            <button id="stop" class="secondary">Stop node</button>
-          </div>
-        </section>
-
-        <!-- ===== PEERS ===== -->
-        <section data-panel="peers" class="panel hidden">
-          <div class="panel-head">
-            <h1 class="panel-title">Peers <span id="peer-count" class="muted">(0)</span></h1>
-            <button id="refresh-peers" class="icon-btn" title="Refresh now">↻</button>
-          </div>
-          <ul id="peers" class="peers"></ul>
-          <div class="card">
-            <h2>Add a peer</h2>
-            <div class="add-row">
-              <input id="peer-spec" placeholder="direct: nodeID@ip:port" spellcheck="false" />
-              <button id="add-peer" class="secondary">Add</button>
-            </div>
-            <div class="add-row">
-              <input id="relay-peer-id" placeholder="via relay: nodeID" spellcheck="false" />
-              <button id="add-relay-peer" class="secondary">Add</button>
-            </div>
-            <p class="hint">Direct needs a public ip:port (port-forwarded). Via
-              relay needs a relay set in Network.</p>
-          </div>
-        </section>
-
-        <!-- ===== TRAFFIC ===== -->
-        <section data-panel="traffic" class="panel hidden">
-          <div class="panel-head">
-            <h1 class="panel-title">Traffic <span id="flow-count" class="muted">(0)</span></h1>
-            <label class="live-toggle">
-              <input type="checkbox" id="traffic-live" checked />
-              <span>live</span>
-            </label>
-          </div>
-
-          <div class="card totals">
-            <div class="total">
-              <span class="total-label">▲ Sent</span>
-              <span id="total-tx" class="total-val mono">0 B</span>
-            </div>
-            <div class="total">
-              <span class="total-label">▼ Received</span>
-              <span id="total-rx" class="total-val mono">0 B</span>
-            </div>
-            <div class="total">
-              <span class="total-label">Flows</span>
-              <span id="total-flows" class="total-val mono">0</span>
-            </div>
-          </div>
-
-          <table class="flows">
-            <thead>
-              <tr>
-                <th>Proto</th>
-                <th>Local</th>
-                <th>Remote (peer)</th>
-                <th class="num">▲ Tx</th>
-                <th class="num">▼ Rx</th>
-                <th class="num">Last</th>
-              </tr>
-            </thead>
-            <tbody id="flows"></tbody>
-          </table>
-          <p id="flows-empty" class="hint">No traffic seen yet. Once apps talk over
-            the tunnel (ping, ssh, http…), every flow shows up here.</p>
-        </section>
-
-        <!-- ===== MESH (membership) ===== -->
-        <section data-panel="mesh" class="panel hidden">
-          <h1 class="panel-title">Mesh network</h1>
-
-          <div class="card">
-            <h2>Network identity</h2>
-            <div class="kv">
-              <span class="label">Status</span>
-              <span id="mesh-role" class="mono muted">—</span>
-            </div>
-            <div class="kv">
-              <span class="label">Network ID</span>
-              <span id="mesh-id" class="mono copy" title="Click to copy — share so others can be enrolled">—</span>
-            </div>
-            <p class="hint">A network is identified by this id. The admin (whoever
-              holds the network key) enrolls nodes and can evict them. Without a
-              network the node runs <b>open</b> (any peer may join).</p>
-          </div>
-
-          <div class="card">
-            <h2>Join a network</h2>
-            <div class="add-row">
-              <input id="join-token" placeholder="paste join token" spellcheck="false" />
-              <button id="join-net" class="secondary">Join</button>
-            </div>
-            <p class="hint">Ask the network admin to issue a token for your Node ID
-              (shown on the Status tab), then paste it here.</p>
-          </div>
-        </section>
-
-        <!-- ===== NETWORK ===== -->
-        <section data-panel="network" class="panel hidden">
-          <h1 class="panel-title">Network</h1>
-
-          <div class="card">
-            <div class="card-head">
-              <h2>Exit node</h2>
-              <span id="exit-state" class="pill off">direct</span>
-            </div>
-            <div class="kv">
-              <span class="label">Send my internet via</span>
-              <select id="exit-select" class="select"></select>
-            </div>
-            <div class="kv">
-              <span class="label">Tunnel mode</span>
-              <div class="seg" id="exit-mode" role="tablist">
-                <button class="seg-btn active" data-mode="split">Split</button>
-                <button class="seg-btn" data-mode="full">Full</button>
-              </div>
-            </div>
-            <div class="kv">
-              <span class="label">Act as exit for others</span>
-              <label class="switch">
-                <input type="checkbox" id="exit-toggle" />
-                <span class="slider"></span>
-              </label>
-            </div>
-            <p class="hint"><b>Split</b> — only traffic you route into the tunnel
-              egresses via the exit (won't drop your internet). <b>Full</b> — all
-              internet via the exit; auto-reverts if the exit can't carry traffic
-              (kill-switch).</p>
-          </div>
-
-          <div class="card">
-            <div class="card-head">
-              <h2>Relay</h2>
-              <span id="relay-state" class="pill off">auto</span>
-            </div>
-            <div class="kv">
-              <span class="label">Forwarding via</span>
-              <span id="relay-status" class="mono muted">automatic (bridge elected)</span>
-            </div>
-            <details class="advanced">
-              <summary>Set a relay manually</summary>
+        <main class="content">
+          <!-- User mode: Meshes (docs/GUI_PAGES.md §2) -->
+          <section data-panel="meshes" class="panel hidden">
+            <h1 class="panel-title">This computer · meshes</h1>
+            <p class="panel-sub">Every mesh you belong to. <b>manage</b> one, or
+              <b>make egress</b> to route your traffic through it.
+              <span class="muted small">(v2 — meshd)</span></p>
+            <div class="card">
+              <div class="card-head"><h2 class="card-title">Create a mesh</h2></div>
               <div class="add-row">
-                <input id="relay-addr" placeholder="relay ip:port (empty = off)" spellcheck="false" />
-                <button id="set-relay" class="secondary">Set</button>
-              </div>
-              <p class="hint">Peers you can't reach directly are normally bridged
-                <b>automatically</b> through a node both ends can reach. Override
-                here only if you need a specific relay.</p>
-            </details>
-          </div>
-        </section>
-
-        <!-- ===== TOPOLOGY ===== -->
-        <section data-panel="topology" class="panel hidden">
-          <h1 class="panel-title">Topology</h1>
-          <p class="panel-sub">The mesh from this node — direct, relayed, and exit
-            links. Click a node for its routing &amp; flow tables.</p>
-          <div class="topo-wrap">
-            <div class="topo-graph card">
-              <canvas id="topo-canvas"></canvas>
-              <div class="topo-legend">
-                <span><i class="ln direct"></i> direct</span>
-                <span><i class="ln relay"></i> relayed</span>
-                <span><i class="ln connecting"></i> connecting</span>
-                <span><i class="dot-ex"></i> exit</span>
+                <input id="mesh-name" placeholder="mesh name — e.g. home" />
+                <input id="mesh-myname" placeholder="your name in it — e.g. alice" />
+                <input id="mesh-max" type="number" min="1" max="254" placeholder="max 254" style="max-width:90px" />
+                <button id="mesh-create" class="secondary">Create</button>
               </div>
             </div>
-            <aside class="topo-side card">
-              <div id="topo-detail">
-                <h3 class="topo-h">Selected node</h3>
-                <p class="muted small">Click a node in the graph.</p>
-              </div>
-              <h3 class="topo-h">Routing table</h3>
-              <table class="topo-table" id="topo-routes">
-                <thead><tr><th>virtual IP</th><th>via</th><th>state</th></tr></thead>
-                <tbody></tbody>
-              </table>
-              <h3 class="topo-h">Flow table <span class="muted small">(SDN, signed)</span></h3>
-              <table class="topo-table" id="topo-flows">
-                <thead><tr><th>pri</th><th>match</th><th>action</th><th></th></tr></thead>
-                <tbody></tbody>
-              </table>
-              <!-- Admin-only: program the signed flow table. Hidden for member
-                   nodes (the daemon would reject the edit anyway). -->
-              <div id="flow-admin" class="flow-admin hidden">
-                <details class="advanced">
-                  <summary>Add a flow rule</summary>
-                  <div class="flow-form">
-                    <input id="fr-priority" type="number" min="0" max="65535" placeholder="priority (default 50)" />
-                    <select id="fr-scope" class="select">
-                      <option value="">scope: any</option>
-                      <option value="overlay">scope: overlay</option>
-                      <option value="internet">scope: internet</option>
-                    </select>
-                    <input id="fr-dst" placeholder="dst CIDR — e.g. 1.1.1.1/32" />
-                    <select id="fr-proto" class="select">
-                      <option value="">proto: any</option>
-                      <option value="tcp">proto: tcp</option>
-                      <option value="udp">proto: udp</option>
-                      <option value="icmp">proto: icmp</option>
-                    </select>
-                    <input id="fr-dport" type="number" min="0" max="65535" placeholder="dport (optional)" />
-                    <select id="fr-action" class="select">
-                      <option value="overlay">action: overlay-owner</option>
-                      <option value="exit">action: exit (configured)</option>
-                      <option value="drop">action: drop</option>
-                      <option value="local">action: local</option>
-                      <option value="exit:">action: exit → node…</option>
-                      <option value="peer:">action: peer → node…</option>
-                    </select>
-                    <input id="fr-node" class="hidden" placeholder="node id (64 hex chars)" />
-                    <button id="fr-add" class="secondary">Add rule</button>
-                  </div>
-                </details>
-                <button id="fr-clear" class="secondary flow-clear">Clear flow table</button>
-              </div>
-            </aside>
-          </div>
-        </section>
-      </main>
+            <ul id="mesh-list" class="peers"></ul>
+          </section>
+
+          <!-- Mesh mode: Overview (docs/GUI_PAGES.md §3) -->
+          <section data-panel="mesh-overview" class="panel hidden">
+            <div id="mesh-detail" class="card"></div>
+          </section>
+        </main>
       </div>
     </div>
 
