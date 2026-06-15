@@ -19,16 +19,20 @@ isolation, per-node exit, origin-default.
 멤버(또는 exit)로 옮기고, 들어오는 메쉬 트래픽을 TUN으로 되돌린다. 메쉬별 격리, 노드별
 exit, 기본은 origin.
 
-## 0.1 Ephemeral mesh / 휘발성 메쉬 (decided)
+## 0.1 Mesh lifecycle / 메쉬 생애주기 (decided)
 
 The data plane **and** the mesh state live in **RAM (userspace)** — chosen for
 portability (one codebase for macOS/Linux/Windows; no kernel module/eBPF) and
-because a personal mesh is uplink-bound, not TUN-bound. This pairs with an
-ephemerality model:
+because a personal mesh is uplink-bound, not TUN-bound. The node persists only its
+own join material to disk (durability, below).
 
-- **Mesh = ephemeral.** A mesh exists only while ≥1 node holds it; when **all** nodes
-  leave, it is **permanently gone** (no central record). Nothing on disk to recover —
-  reinforces the unrecoverability goal (a powered-off stolen device is barren).
+- **Mesh = durable, not ephemeral.** Once created a mesh is **preserved**. The only
+  removal is an **explicit, LOCAL wipe** (`RemoveMesh`) — each node deletes its own
+  copy; a mesh vanishes globally only when **every** member has wiped (emergent — no
+  central record, no forced global delete).
+- **No garbage collection.** Residue (a departed member's lingering cert, a stale
+  endpoint, an abandoned mesh) is **tolerated** — small (≤254 members), so no
+  tombstones / TTL for now; revisit only if it ever matters.
 - **Node restart ≠ leave.** A node **persists its own join material locally** (its
   keypair + cert + mesh secret), so it rejoins its meshes after a restart. (That
   local material is the node's responsibility and is what capture-detection /
@@ -38,7 +42,8 @@ ephemerality model:
   no admin (existing members coast; no new admits/re-cipher) — "no save = no create."
 
 / 데이터 플레인·메쉬 상태는 **RAM(유저스페이스)**. 이식성 + 개인 VPN은 업링크 바운드라서.
-**메쉬는 휘발**(전원 이탈 시 영구 소멸, 디스크에 안 남음 → 복구불가 강화). **노드 재시작 ≠
+**메쉬는 내구성(durable)** — 한 번 생성되면 보존, 제거는 각 노드 명시적 로컬 wipe(`RemoveMesh`)뿐,
+전원 wipe 시 emergent 소멸. **GC 없음**(찌꺼기 방치). **노드 재시작 ≠
 탈퇴**(노드가 자기 가입자료=키쌍+cert+메쉬시크릿을 로컬 보관해 복귀; 탈취 시 그게 §5
 대상). **마스터 키는 생성자가 별도 저장(opt-in)** — 안 하면 admin 없는 메쉬("저장 안 하면
 생성 안 한 것").
