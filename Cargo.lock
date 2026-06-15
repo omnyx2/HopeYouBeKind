@@ -603,7 +603,9 @@ dependencies = [
 name = "lattice-mesh"
 version = "0.7.0"
 dependencies = [
+ "ed25519-dalek",
  "lattice-proto",
+ "rand",
  "serde",
  "thiserror",
 ]

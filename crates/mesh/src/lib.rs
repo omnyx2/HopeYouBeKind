@@ -21,6 +21,7 @@ use lattice_proto::wire_v2::{MemberId, MeshId};
 
 pub mod charter;
 pub mod ipc;
+pub mod membership;
 pub mod policy;
 pub mod roster;
 

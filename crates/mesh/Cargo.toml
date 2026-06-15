@@ -10,3 +10,5 @@ description = "v2 multi-mesh container: per-mesh roster + immutable charter, the
 lattice-proto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
