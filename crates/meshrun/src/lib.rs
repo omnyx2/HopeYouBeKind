@@ -30,19 +30,21 @@ pub async fn run<X: Transport + 'static>(
     mut tun: Box<dyn TunDevice>,
     transport: X,
     endpoints: HashMap<MemberId, SocketAddr>,
+    exit: Option<MemberId>,
 ) {
     loop {
         tokio::select! {
-            // App traffic out of the TUN → route, seal, send to the member.
+            // App traffic out of the TUN → route to its member, else (internet-bound)
+            // to the exit member, which NATs it out (P4; NAT is OS-side, reuses
+            // exit.rs at the live/meshd integration).
             outbound = tun.read_packet() => {
                 let Ok(p) = outbound else { break };
                 if let Some(dst) = ipv4_dst(&p) {
-                    if let Some(member) = dp.route(dst) {
+                    if let Some(member) = dp.route(dst).or(exit) {
                         if let Some(addr) = endpoints.get(&member) {
                             let _ = transport.send_to(&dp.seal_to(member, &p), *addr).await;
                         }
                     }
-                    // else: internet-bound — policy / exit lands in P4.
                 }
             }
             // A frame from a peer → open, deliver to the TUN (or forward, later).
@@ -89,8 +91,8 @@ mod tests {
         let a_eps: HashMap<MemberId, SocketAddr> = std::iter::once((2u8, b_addr)).collect();
         let b_eps: HashMap<MemberId, SocketAddr> = std::iter::once((1u8, a_addr)).collect();
 
-        tokio::spawn(run(dp(1), Box::new(atun), ta, a_eps)); // Alice (member 1)
-        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps)); // Bob   (member 2)
+        tokio::spawn(run(dp(1), Box::new(atun), ta, a_eps, None)); // Alice (member 1)
+        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps, None)); // Bob   (member 2)
 
         // Inject an IP packet at Alice's TUN, destined for Bob's overlay IP.
         let packet = ipv4_to("100.80.3.2".parse().unwrap()); // mesh 3, member 2
@@ -101,6 +103,33 @@ mod tests {
             .await
             .expect("timed out — packet did not cross the mesh")
             .expect("bob's tun closed");
+        assert_eq!(got, packet);
+    }
+
+    #[tokio::test]
+    async fn internet_bound_packet_is_routed_to_the_exit_member() {
+        // Alice (member 1) sends all internet traffic via exit member 2 (Bob).
+        let a_addr: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b_addr: SocketAddr = "10.0.0.2:2".parse().unwrap();
+        let (ta, tb) = duplex(a_addr, b_addr);
+        let (atun, ahandle) = MemoryTun::new();
+        let (btun, mut bhandle) = MemoryTun::new();
+
+        let a_eps: HashMap<MemberId, SocketAddr> = std::iter::once((2u8, b_addr)).collect();
+        let b_eps: HashMap<MemberId, SocketAddr> = std::iter::once((1u8, a_addr)).collect();
+
+        tokio::spawn(run(dp(1), Box::new(atun), ta, a_eps, Some(2))); // exit = member 2
+        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps, None));
+
+        // A real internet destination (not in the mesh /24) → goes to the exit.
+        let packet = ipv4_to("1.1.1.1".parse().unwrap());
+        ahandle.inject.send(packet.clone()).await.unwrap();
+
+        // The exit member receives the inner packet (it would then NAT it out).
+        let got = tokio::time::timeout(Duration::from_secs(2), bhandle.observe.recv())
+            .await
+            .expect("timed out — internet packet did not reach the exit")
+            .expect("exit tun closed");
         assert_eq!(got, packet);
     }
 }

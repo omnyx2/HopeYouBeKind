@@ -28,6 +28,9 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("SECRET must be 64 hex chars"))?;
     let bind: SocketAddr = env("BIND")?.parse()?;
     let endpoints = parse_peers(&std::env::var("PEERS").unwrap_or_default())?;
+    // Optional: route internet-bound traffic via this member (the exit). The exit
+    // node itself needs OS NAT + forwarding (reuse exit.rs at the live deploy).
+    let exit: Option<MemberId> = std::env::var("EXIT").ok().and_then(|s| s.parse().ok());
 
     let overlay = Ipv4Addr::new(prefix[0], prefix[1], mesh, my);
     let tun = open(TunConfig {
@@ -42,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let transport = UdpTransport::bind(bind).await?;
     let dp = MeshDataPlane::new(mesh, my, prefix, suite("default", &secret, 0));
-    lattice_meshrun::run(dp, tun, transport, endpoints).await;
+    lattice_meshrun::run(dp, tun, transport, endpoints, exit).await;
     Ok(())
 }
 
