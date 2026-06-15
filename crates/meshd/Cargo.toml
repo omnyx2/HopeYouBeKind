@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 lattice-mesh = { path = "../mesh", version = "0.7.0" }
+lattice-meshrun = { path = "../meshrun", version = "0.7.0" }
+lattice-tun.workspace = true
+lattice-net.workspace = true
 lattice-proto.workspace = true
 tokio = { workspace = true }
 serde_json.workspace = true

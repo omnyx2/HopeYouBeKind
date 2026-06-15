@@ -40,6 +40,13 @@ pub enum Request {
         mesh: MeshId,
         exit: Option<MemberId>,
     },
+    /// Seed where to reach a member (bootstrap for the data plane — the run loop
+    /// learns the rest from inbound frames). `endpoint` is `ip:port`.
+    SetPeer {
+        mesh: MeshId,
+        member: MemberId,
+        endpoint: String,
+    },
     /// Select the current mesh for egress (its exit must be set), or `None` for
     /// idle / untouched (the §1 default).
     SetCurrent { mesh: Option<MeshId> },
@@ -79,6 +86,11 @@ pub struct MemberView {
     /// Short hex fingerprint of the member's public key.
     pub pubkey_fp: String,
     pub is_me: bool,
+    /// Where we currently reach this member (`ip:port`), if known. `None` until it
+    /// is seeded or heard from (P6.3c/d).
+    pub endpoint: Option<String>,
+    /// Live connection state for the UI: `me` | `live` | `idle` | `unknown`.
+    pub state: String,
 }
 
 /// The per-mesh detail view (§7).
