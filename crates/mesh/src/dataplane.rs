@@ -127,11 +127,17 @@ impl MeshDataPlane {
         self.seal_frame(dst, FrameType::Control, payload)
     }
 
-    /// Parse + open an inbound frame. `None` if it isn't ours / fails to open. Undo the
-    /// P-C5 scramble (unmask seq, lift the sealed header out of the body), open the
+    /// Parse + open an inbound frame, returning the **authenticated** source member id
+    /// alongside the resolved [`Inbound`]. `None` if it isn't ours / fails to open. Undo
+    /// the P-C5 scramble (unmask seq, lift the sealed header out of the body), open the
     /// header with the time-windowed key (a non-member can't, which also drops foreign
     /// frames), route off it, and only the destination opens the body.
-    pub fn recv(&self, frame: &[u8]) -> Option<Inbound> {
+    ///
+    /// The returned `src` comes from the opened (authenticated) header — the run loop
+    /// uses it for src-learn/roaming. A raw plaintext parse of the wire frame can't
+    /// recover it post-scramble (the header is sealed + floated), so this is the only
+    /// trustworthy source of the sender id.
+    pub fn recv(&self, frame: &[u8]) -> Option<(MemberId, Inbound)> {
         if frame.len() < 8 + SEALED_HEADER_LEN {
             return None;
         }
@@ -151,13 +157,16 @@ impl MeshDataPlane {
         if header.dst != self.my_id {
             // Relay path: we opened only the header to read `dst`; forward the frame
             // (body still sealed) on to the next hop, untouched.
-            return Some(Inbound::Forward { to: header.dst });
+            return Some((header.src, Inbound::Forward { to: header.dst }));
         }
         let pt = self.suite.open(seq, &body_ct, &hdr_bytes)?;
-        Some(match header.frame_type {
-            FrameType::Control => Inbound::Control(pt),
-            _ => Inbound::Deliver(pt),
-        })
+        Some((
+            header.src,
+            match header.frame_type {
+                FrameType::Control => Inbound::Control(pt),
+                _ => Inbound::Deliver(pt),
+            },
+        ))
     }
 }
 
@@ -180,7 +189,7 @@ mod tests {
         let bob = node(2);
         let packet = b"an inner IP packet (pretend)";
         let frame = alice.seal_to(2, packet);
-        assert_eq!(bob.recv(&frame), Some(Inbound::Deliver(packet.to_vec())));
+        assert_eq!(bob.recv(&frame), Some((1, Inbound::Deliver(packet.to_vec()))));
     }
 
     #[test]
@@ -189,7 +198,7 @@ mod tests {
         let bob = node(2);
         let frame = alice.seal_to(7, b"for member 7");
         // bob (id 2) is not the dst → forward, no decrypt.
-        assert_eq!(bob.recv(&frame), Some(Inbound::Forward { to: 7 }));
+        assert_eq!(bob.recv(&frame), Some((1, Inbound::Forward { to: 7 })));
     }
 
     #[test]
@@ -230,7 +239,7 @@ mod tests {
         let old = alice.seal_to(2, b"old-epoch");
         assert_eq!(
             bob.recv(&old),
-            Some(Inbound::Deliver(b"old-epoch".to_vec()))
+            Some((1, Inbound::Deliver(b"old-epoch".to_vec())))
         );
 
         // Alice re-ciphers to a fresh secret/epoch; Bob (still on the old key) can't
@@ -244,7 +253,7 @@ mod tests {
         bob2.recipher(suite("default", &new_secret, 1), &new_secret);
         assert_eq!(
             bob2.recv(&neu),
-            Some(Inbound::Deliver(b"new-epoch".to_vec()))
+            Some((1, Inbound::Deliver(b"new-epoch".to_vec())))
         );
     }
 

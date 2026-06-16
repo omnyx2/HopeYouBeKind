@@ -242,23 +242,27 @@ pub async fn run<X: Transport + 'static>(
             // A frame from a peer → deliver / relay / merge gossip.
             inbound = transport.recv_from() => {
                 let Ok((frame, from)) = inbound else { break };
-                // Roaming + liveness: re-learn the sender's endpoint from the frame's
-                // source on the spot, so a peer that moved is reachable again (§6).
-                // Never learn our OWN id (a relayed/looped frame can carry src==us);
-                // a self-entry pollutes the table and shows up as our endpoint.
-                if let Some((hdr, _)) = lattice_proto::wire_v2::decode(&frame) {
-                    if hdr.src != my_id {
-                        links
-                            .lock()
-                            .unwrap()
-                            .insert(hdr.src, Link { endpoint: from, last_seen_ms: now_ms() });
-                    }
+                // Open the frame first: post-P-C5 the wire header is sealed + floated, so
+                // the only trustworthy sender id is the AUTHENTICATED one `recv` returns
+                // (a raw plaintext parse recovers nothing). `None` ⇒ not ours / unopenable.
+                let Some((src, msg)) = dp.recv(&frame) else { continue };
+                // Roaming + liveness: re-learn the sender's endpoint from the UDP source
+                // on the spot, so a NAT'd / moved peer is reachable again (§6) — this is
+                // what lets the exit reply to a client's real public address instead of a
+                // stale advertised LAN one. Never learn our OWN id (a relayed/looped frame
+                // can carry src==us); a self-entry pollutes the table and shows up as our
+                // endpoint.
+                if src != my_id {
+                    links
+                        .lock()
+                        .unwrap()
+                        .insert(src, Link { endpoint: from, last_seen_ms: now_ms() });
                 }
-                match dp.recv(&frame) {
-                    Some(Inbound::Deliver(inner)) => { let _ = tun.write_packet(&inner).await; }
+                match msg {
+                    Inbound::Deliver(inner) => { let _ = tun.write_packet(&inner).await; }
                     // Control frame: gossip (endpoint table) or a re-cipher announce,
                     // told apart by the first payload byte.
-                    Some(Inbound::Control(payload)) => match payload.first().copied() {
+                    Inbound::Control(payload) => match payload.first().copied() {
                         Some(CTRL_GOSSIP) => {
                             let (table, reflect) = decode_gossip(&payload[1..]);
                             {
@@ -307,13 +311,12 @@ pub async fn run<X: Transport + 'static>(
                     },
                     // P5 relay: we're a hop, not the destination — pass the frame on
                     // unchanged (we don't need to decrypt to forward).
-                    Some(Inbound::Forward { to }) => {
+                    Inbound::Forward { to } => {
                         let endpoint = links.lock().unwrap().get(&to).map(|l| l.endpoint);
                         if let Some(addr) = endpoint {
                             let _ = transport.send_to(&frame, addr).await;
                         }
                     }
-                    None => {}
                 }
             }
             // Every ~20s: gossip our endpoint table to each known peer (also the NAT
