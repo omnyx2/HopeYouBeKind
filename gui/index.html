@@ -63,6 +63,13 @@
             <button class="nav-item" data-tab="mesh-topology" data-grp="mesh">
               <span class="nav-ico">🕸</span> Topology
             </button>
+            <button class="nav-item" data-tab="mesh-warnings" data-grp="mesh">
+              <span class="nav-ico">⚠</span> Warnings
+              <span id="warn-badge" class="warn-badge hidden">0</span>
+            </button>
+            <button class="nav-item" data-tab="mesh-configs" data-grp="mesh">
+              <span class="nav-ico">⚙</span> Configs
+            </button>
           </div>
         </nav>
 
@@ -183,6 +190,22 @@
               <span><i class="tdot live"></i> live</span>
               <span><i class="tdot peer"></i> idle</span>
             </div>
+          </section>
+
+          <!-- Mesh mode: Warnings — attack detection + health alerts -->
+          <section data-panel="mesh-warnings" class="panel hidden">
+            <h1 class="panel-title">Warnings</h1>
+            <p class="panel-sub">Active alerts for this mesh — attack detection and
+              liveness/health. The red badge counts open warnings.</p>
+            <div id="mesh-warn-body"></div>
+          </section>
+
+          <!-- Mesh mode: Configs — this mesh's settings + controls -->
+          <section data-panel="mesh-configs" class="panel hidden">
+            <h1 class="panel-title">Configs</h1>
+            <p class="panel-sub">Exit, peers, invites, key rotation, and the danger zone
+              for this mesh.</p>
+            <div id="mesh-config-body"></div>
           </section>
         </main>
       </div>

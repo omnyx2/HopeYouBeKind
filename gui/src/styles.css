@@ -170,6 +170,24 @@ button.secondary:hover { border-color: var(--off); background: #1f2430; }
 .toggle-row + .toggle-row { border-top: 1px solid var(--line); }
 .toggle-row input { width: auto; margin: 2px 0 0; flex-shrink: 0; }
 
+/* mesh-mode "Warnings" — red count badge on the nav item + alert cards */
+.warn-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 5px; margin-left: auto;
+  background: #e4334a; color: #fff; border-radius: 999px;
+  font-size: 11px; font-weight: 700; line-height: 1;
+}
+.nav-item { display: flex; align-items: center; }
+.warn-card {
+  border: 1px solid #a3324a; background: #2a121a; border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 12px;
+}
+.warn-card.amber { border-color: #8a6a20; background: #29230f; }
+.warn-card h3 { margin: 0 0 6px; font-size: 14px; }
+.warn-card .when { font-size: 12px; color: var(--muted); }
+.warn-ok { color: var(--muted); padding: 16px; text-align: center; }
+.warn-countdown { font-variant-numeric: tabular-nums; color: #ff6477; font-weight: 700; }
+
 /* peers */
 .peers { list-style: none; padding: 0; margin: 0 0 16px; }
 .peers li {

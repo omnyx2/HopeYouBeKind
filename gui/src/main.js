@@ -159,6 +159,8 @@ document.querySelectorAll(".nav-item").forEach((b) =>
     if (CURRENT_MESH == null) return;
     if (tab === "mesh-topology") renderTopologyFor(CURRENT_MESH);
     if (tab === "mesh-peers") renderPeersFor(CURRENT_MESH);
+    if (tab === "mesh-configs") renderConfigs(CURRENT_MESH);
+    if (tab === "mesh-warnings") renderWarnings(CURRENT_MESH);
   })
 );
 
@@ -275,19 +277,13 @@ async function renderOverview(id) {
   const rows = d.members.map((mb) =>
     `<tr><td>${mb.id}</td><td>${esc(mb.name)}${mb.is_me ? ' <span class="muted small">(me)</span>' : ""}</td><td class="mono small">${mb.pubkey_fp}</td></tr>`
   ).join("");
-  const exitOpts = [`<option value="">— none —</option>`].concat(
-    d.members.map((mb) => `<option value="${mb.id}" ${d.exit === mb.id ? "selected" : ""}>#${mb.id} ${esc(mb.name)}</option>`)
-  ).join("");
-  const peerOpts = d.members.filter((mb) => !mb.is_me)
-    .map((mb) => `<option value="${mb.id}">#${mb.id} ${esc(mb.name)}</option>`).join("");
+  const warn = meshWarnings(d);
   el("mesh-detail").innerHTML = `
     <div class="card-head">
       <h2 class="card-title">⬢ ${esc(d.name)} <span class="muted small">#${d.id}</span></h2>
-      <div>
-        <button class="small-btn" id="ov-egress">make egress</button>
-        <button class="small-btn" id="ov-wipe">wipe mesh</button>
-      </div>
+      <div><button class="small-btn" id="ov-egress">make egress</button></div>
     </div>
+    ${warn.length ? `<div class="kv"><span>warnings</span><b><a href="#" id="ov-goto-warn" style="color:#ff6477">⚠ ${warn.length} active — open Warnings</a></b></div>` : ""}
     <div class="kv"><span>charter</span><b class="small">${d.invite} · ${esc(d.trigger)} · max ${d.max_members} · ${d.self_destruct ? "ephemeral (self-destruct)" : "persistent"}</b></div>
     <div class="kv"><span>cipher</span><b class="mono small">${esc(d.cipher)}</b></div>
     <div class="kv"><span>epoch</span><b>${d.epoch}</b></div>
@@ -295,60 +291,87 @@ async function renderOverview(id) {
     <div class="kv"><span>my exit</span><b>${d.exit != null ? "#" + d.exit : "none"}</b></div>
     <h3 class="topo-h">Roster <span class="muted small">(${d.members.length})</span></h3>
     <table class="topo-table"><thead><tr><th>id</th><th>name</th><th>pubkey</th></tr></thead><tbody>${rows}</tbody></table>
-    <h3 class="topo-h">Set my exit</h3>
-    <div class="add-row">
-      <select id="ov-exit" class="select">${exitOpts}</select>
-      <button class="small-btn" id="ov-exit-set">set exit</button>
-    </div>
-    <h3 class="topo-h">Peer address <span class="muted small">(manual — until auto-discovery)</span></h3>
-    <p class="muted small">Tell this node where to reach a member, so traffic can flow.
-      For the public Oracle exit: <code>203.0.113.10:41000</code>. A node learns the
-      rest once a peer has spoken.</p>
-    <div class="add-row">
-      <select id="ov-peer-id" class="select">${peerOpts}</select>
-      <input id="ov-peer-ep" placeholder="ip:port — e.g. 203.0.113.10:41000" />
-      <button class="small-btn" id="ov-peer-set">set address</button>
-    </div>
-    <h3 class="topo-h">Invite a member</h3>
-    <p class="muted small">Paste the joiner's <b>join code</b> + a name → get an
-      <b>invite code</b> to send back. (docs/GUI_PAGES.md §2b)</p>
-    <div class="add-row">
-      <input id="ov-inv-name" placeholder="their name in this mesh" />
-      <label class="muted small" style="display:flex;align-items:center;gap:6px">algorithm
-        <select id="ov-inv-algo" class="select">${optList(INVITE_ALGOS, INVITE_ALGOS[0])}</select>
-      </label>
-    </div>
-    <textarea id="ov-inv-code" class="code" rows="2" placeholder="paste their join code" style="margin-top:8px"></textarea>
-    <div class="add-row" style="margin-top:8px"><button class="small-btn" id="ov-invite">create invite</button></div>
-    <div id="ov-inv-out" class="hidden" style="margin-top:10px">
-      <p class="muted small">Invite code — send it back to them:</p>
-      <textarea id="ov-inv-result" class="code" readonly rows="3"></textarea>
-      <button class="small-btn" id="ov-inv-copy">Copy</button>
-      <p class="small" style="color:#e0a020;margin-top:8px">Tell them the algorithm <b id="ov-inv-algo-out" class="mono"></b> — over a <i>different</i> channel than the code.</p>
-    </div>
-    <h3 class="topo-h">Security <span class="muted small">(re-cipher — P-C3)</span></h3>
-    <div class="add-row">
-      <select id="ov-recipher-cipher" class="select">${optList(CIPHERS, d.cipher)}</select>
-      <button class="small-btn" id="ov-recipher">re-cipher</button>
-    </div>
-    <p class="muted small">Rotates this mesh's key (and the cipher, if changed). Needs ≥60% of members online; anyone offline now is evicted and must be re-invited.</p>
-    <h3 class="topo-h" style="color:#e44">Danger zone</h3>
-    <div class="add-row"><button class="small-btn" id="ov-report-attack" style="background:#7a1020;color:#fff;border-color:#a33">Report attack</button></div>
-    <p class="muted small">Alerts every member and <b>self-destructs the mesh in 30s</b> unless ${d.is_creator ? "you" : "the creator"} call(s) it off. Keys are wiped everywhere.</p>`;
+    <p class="muted small" style="margin-top:10px">Manage exit, peers, invites and key rotation in <b>Configs</b>; see alerts in <b>Warnings</b>.</p>`;
   el("ov-egress").onclick = async () => {
     try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); }
     refreshMode();
   };
+  el("ov-goto-warn")?.addEventListener("click", (e) => { e.preventDefault(); activateTab("mesh-warnings"); renderWarnings(id); });
+}
+
+// ---- Mesh mode: Configs — this mesh's settings + controls ----
+async function renderConfigs(id) {
+  let d;
+  try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
+  catch (e) { toast(String(e)); return setMode("user"); }
+  const exitOpts = [`<option value="">— none —</option>`].concat(
+    d.members.map((mb) => `<option value="${mb.id}" ${d.exit === mb.id ? "selected" : ""}>#${mb.id} ${esc(mb.name)}</option>`)
+  ).join("");
+  const peerOpts = d.members.filter((mb) => !mb.is_me)
+    .map((mb) => `<option value="${mb.id}">#${mb.id} ${esc(mb.name)}</option>`).join("");
+  el("mesh-config-body").innerHTML = `
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">Egress &amp; routing</h2></div>
+      <div class="kv"><span>my exit</span><b>${d.exit != null ? "#" + d.exit : "none"}</b></div>
+      <div class="add-row">
+        <select id="ov-exit" class="select">${exitOpts}</select>
+        <button class="small-btn" id="ov-exit-set">set exit</button>
+        <button class="small-btn" id="ov-egress">make egress</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">Peer address <span class="muted small">(manual)</span></h2></div>
+      <p class="muted small">Tell this node where to reach a member. Public Oracle exit: <code>203.0.113.10:41000</code>. The rest is learned once a peer speaks.</p>
+      <div class="add-row">
+        <select id="ov-peer-id" class="select">${peerOpts}</select>
+        <input id="ov-peer-ep" placeholder="ip:port — e.g. 203.0.113.10:41000" />
+        <button class="small-btn" id="ov-peer-set">set address</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">Invite a member</h2></div>
+      <p class="muted small">Paste the joiner's <b>join code</b> + a name → get an <b>invite code</b> to send back.</p>
+      <div class="add-row">
+        <input id="ov-inv-name" placeholder="their name in this mesh" />
+        <label class="muted small" style="display:flex;align-items:center;gap:6px">algorithm
+          <select id="ov-inv-algo" class="select">${optList(INVITE_ALGOS, INVITE_ALGOS[0])}</select>
+        </label>
+      </div>
+      <textarea id="ov-inv-code" class="code" rows="2" placeholder="paste their join code" style="margin-top:8px"></textarea>
+      <div class="add-row" style="margin-top:8px"><button class="small-btn" id="ov-invite">create invite</button></div>
+      <div id="ov-inv-out" class="hidden" style="margin-top:10px">
+        <p class="muted small">Invite code — send it back to them:</p>
+        <textarea id="ov-inv-result" class="code" readonly rows="3"></textarea>
+        <button class="small-btn" id="ov-inv-copy">Copy</button>
+        <p class="small" style="color:#e0a020;margin-top:8px">Tell them the algorithm <b id="ov-inv-algo-out" class="mono"></b> — over a <i>different</i> channel than the code.</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">Security <span class="muted small">(re-cipher — P-C3)</span></h2></div>
+      <div class="add-row">
+        <select id="ov-recipher-cipher" class="select">${optList(CIPHERS, d.cipher)}</select>
+        <button class="small-btn" id="ov-recipher">re-cipher</button>
+      </div>
+      <p class="muted small">Rotates this mesh's key (and the cipher, if changed). Needs ≥60% of members online; anyone offline now is evicted and must be re-invited.</p>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2 class="card-title" style="color:#e44">Danger zone</h2></div>
+      <div class="add-row">
+        <button class="small-btn" id="ov-report-attack" style="background:#7a1020;color:#fff;border-color:#a33">Report attack</button>
+        <button class="small-btn" id="ov-wipe">wipe mesh</button>
+      </div>
+      <p class="muted small"><b>Report attack</b> alerts every member and self-destructs the mesh in 30s unless ${d.is_creator ? "you" : "the creator"} call(s) it off — keys wiped everywhere. <b>Wipe</b> removes this mesh from this computer only.</p>
+    </div>`;
+  el("ov-egress").onclick = async () => { try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); } refreshMode(); };
   el("ov-wipe").onclick = async () => {
     if (!confirm(`Wipe mesh "${d.name}" locally? (the §5 compromise response)`)) return;
     try { await meshd({ RemoveMesh: { mesh: id } }); toast("mesh wiped"); } catch (e) { toast(String(e)); }
-    CURRENT_MESH = null;
-    setMode("user");
+    CURRENT_MESH = null; setMode("user");
   };
   el("ov-exit-set").onclick = async () => {
     const v = el("ov-exit").value;
     try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("exit set"); } catch (e) { toast(String(e)); }
-    refreshMode();
+    renderConfigs(id);
   };
   el("ov-peer-set").onclick = async () => {
     const m = parseInt(el("ov-peer-id").value, 10);
@@ -372,22 +395,59 @@ async function renderOverview(id) {
     } catch (e) { toast(String(e)); }
   };
   el("ov-inv-copy").onclick = () => { navigator.clipboard.writeText(el("ov-inv-result").value); toast("copied"); };
-  // G-1: re-cipher (rotate key / change cipher).
   el("ov-recipher").onclick = async () => {
     const cipher = el("ov-recipher-cipher").value;
     const changed = cipher !== d.cipher;
     if (!confirm(`Re-cipher "${d.name}"?\n\nRotates the key${changed ? ` and switches the cipher to "${cipher}"` : ""}. Needs ≥60% of members online; anyone offline now is evicted and must be re-invited.`)) return;
-    try { await meshd({ Recipher: { mesh: id, cipher: changed ? cipher : null } }); toast("re-ciphered"); }
-    catch (e) { toast(String(e)); }
-    refreshMode();
+    try { await meshd({ Recipher: { mesh: id, cipher: changed ? cipher : null } }); toast("re-ciphered"); } catch (e) { toast(String(e)); }
+    renderConfigs(id);
   };
-  // G-3: report attack (fail-deadly, strong confirm).
   el("ov-report-attack").onclick = async () => {
     const typed = prompt(`⚠ This ALERTS every member and DESTROYS mesh "${d.name}" in 30s unless ${d.is_creator ? "you" : "the creator"} call(s) it off — keys wiped everywhere.\n\nType the mesh name to confirm:`);
     if (typed !== d.name) return toast("cancelled");
     try { await meshd({ ReportAttack: { mesh: id } }); toast("attack reported — mesh armed"); } catch (e) { toast(String(e)); }
     refreshAttackBanner();
   };
+}
+
+// ---- Derive the active warnings for a mesh (attack detection + liveness/health) ----
+function meshWarnings(d) {
+  const w = [];
+  if (d.attack_armed_secs_left != null) {
+    w.push({ kind: "attack", secs: d.attack_armed_secs_left, is_creator: d.is_creator });
+  }
+  if (d.live < d.threshold) {
+    w.push({ kind: "quorum",
+      detail: `Only ${d.live}/${d.members.length} members are live; the live floor is ${d.threshold}.`
+        + (d.self_destruct ? " This mesh is ephemeral — if it stays below the floor the keys self-destruct." : "") });
+  }
+  return w;
+}
+
+// ---- Mesh mode: Warnings page (attack detection detail + health) ----
+async function renderWarnings(id) {
+  let d;
+  try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
+  catch (e) { toast(String(e)); return setMode("user"); }
+  const w = meshWarnings(d);
+  const body = el("mesh-warn-body");
+  if (!w.length) { body.innerHTML = `<div class="card"><p class="warn-ok">✓ No warnings — this mesh is healthy.</p></div>`; return; }
+  body.innerHTML = w.map((x) => {
+    if (x.kind === "attack") {
+      return `<div class="warn-card">
+        <h3>⚠ Attack reported — mesh self-destructing</h3>
+        <p>An attack alert is armed on this mesh. When the grace ends every member's keys
+          are wiped — the one-veto, fail-deadly response (P-C7). A single member can raise
+          this; only the creator can call it off.</p>
+        <p class="when">Self-destruct in <span class="warn-countdown">${x.secs}s</span>.
+          ${x.is_creator ? "You are the creator — call it off if this is a false alarm." : "Waiting for the creator to call it off."}</p>
+        ${x.is_creator ? `<div class="add-row" style="margin-top:8px"><button class="small-btn" id="warn-allclear">All clear (cancel self-destruct)</button></div>` : ""}
+      </div>`;
+    }
+    return `<div class="warn-card amber"><h3>⚠ Below live quorum</h3><p>${x.detail}</p></div>`;
+  }).join("");
+  const ac = el("warn-allclear");
+  if (ac) ac.onclick = async () => { try { await meshd({ AllClear: { mesh: id } }); toast("all-clear sent"); } catch (e) { toast(String(e)); } renderWarnings(id); };
 }
 
 // ---- top widget bar (§1): status (left) + view toggle + egress dropdown ----
@@ -488,6 +548,30 @@ async function refreshAttackBanner() {
   };
 }
 setInterval(refreshAttackBanner, 3000);
+
+// ---- Mesh-mode Warnings: red badge count + desktop notification on attack ----
+let ATTACK_NOTIFIED = {}; // mesh id → notified-this-episode, so we alert once
+async function notify(title, body) {
+  if (!window.__TAURI__) return;
+  try { await invoke("notify", { title, body }); } catch (_) {}
+}
+async function updateMeshWarnings() {
+  const badge = el("warn-badge");
+  if (MODE !== "mesh" || CURRENT_MESH == null) { if (badge) badge.classList.add("hidden"); return; }
+  let d;
+  try { d = (await meshd({ MeshInfo: { mesh: CURRENT_MESH } })).Mesh; } catch (_) { return; }
+  const w = meshWarnings(d);
+  if (badge) { badge.textContent = String(w.length); badge.classList.toggle("hidden", w.length === 0); }
+  // Notify once per attack episode (when an alert first appears for this mesh).
+  const attacked = d.attack_armed_secs_left != null;
+  if (attacked && !ATTACK_NOTIFIED[d.id]) {
+    ATTACK_NOTIFIED[d.id] = true;
+    notify("⚠ Lattice — attack detected", `Mesh "${d.name}" self-destructs in ~${d.attack_armed_secs_left}s. Open Warnings.`);
+  }
+  if (!attacked) ATTACK_NOTIFIED[d.id] = false;
+  if (ACTIVE_TAB === "mesh-warnings") renderWarnings(CURRENT_MESH);
+}
+setInterval(updateMeshWarnings, 3000);
 
 // ---- Update check (Feature 1): on launch, ask GitHub Releases for a newer build.
 // If one exists, show a banner. "Update" backs up mesh state (Feature 2) then opens

@@ -98,7 +98,10 @@ fn version_gt(a: &str, b: &str) -> bool {
     };
     let (va, vb) = (parse(a), parse(b));
     for i in 0..va.len().max(vb.len()) {
-        let (x, y) = (va.get(i).copied().unwrap_or(0), vb.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            va.get(i).copied().unwrap_or(0),
+            vb.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x > y;
         }
@@ -121,7 +124,10 @@ fn check_update(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         .map_err(|e| format!("update check failed: {e}"))?
         .into_json()
         .map_err(|e| e.to_string())?;
-    let latest = body["tag_name"].as_str().unwrap_or("").trim_start_matches('v');
+    let latest = body["tag_name"]
+        .as_str()
+        .unwrap_or("")
+        .trim_start_matches('v');
     let page = body["html_url"]
         .as_str()
         .map(str::to_string)
@@ -154,13 +160,29 @@ fn open_url(url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Raise a native desktop notification (used for attack detection). Done in Rust so
+/// it works without opening up the webview's notification permission/CSP.
+#[tauri::command]
+fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+    tauri::api::notification::Notification::new(&app.config().tauri.bundle.identifier)
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
             ensure_meshd(app);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![meshd, check_update, open_url])
+        .invoke_handler(tauri::generate_handler![
+            meshd,
+            check_update,
+            open_url,
+            notify
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");
 }
