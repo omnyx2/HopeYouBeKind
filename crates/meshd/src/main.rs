@@ -50,6 +50,17 @@ const LIVE_WINDOW_MS: u64 = 30_000;
 const UDP_BASE_PORT: u16 = 42000;
 /// Overlay MTU for meshd-run data planes (matches meshrun's conservative default).
 const OVERLAY_MTU: u16 = 1280;
+/// Live-paired self-destruct (P-C4): how often to check liveness, and how long the
+/// mesh may sit below the live threshold before it wipes itself.
+const SELF_DESTRUCT_TICK_SECS: u64 = 15;
+const SELF_DESTRUCT_GRACE_SECS: u64 = 180;
+
+/// ⌈0.6·n⌉ — the shared threshold: the re-cipher quorum (§5-4) and the live-paired
+/// self-destruct floor (§5-2). Below this many live members the mesh secret is (by
+/// the threshold-sharing model) unrecoverable, so the mesh self-destructs.
+fn quorum_threshold(n: usize) -> usize {
+    (3 * n + 4) / 5
+}
 
 /// One mesh plus the real trust state for it.
 struct MeshState {
@@ -387,6 +398,71 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
             }
         }
     });
+    // P-C4 live-paired self-destruct watchdog.
+    spawn_self_destruct_watchdog(b.mesh_id, Arc::clone(&state));
+}
+
+/// Live-paired self-destruct (P-C4, docs/PROTOCOL_DESIGN.md §5-2): once a mesh has
+/// been healthy (≥ the live threshold), if it then sits **below** the threshold for
+/// `SELF_DESTRUCT_GRACE_SECS`, the secret is (by the threshold-sharing model)
+/// unrecoverable — so we wipe it and drop the mesh. A still-forming mesh (never yet
+/// at quorum) is exempt, so onboarding doesn't trip it. `MESHD_NO_SELF_DESTRUCT=1`
+/// disables it. (v1 = cooperative wipe; true never-hold-the-secret Shamir sharing is
+/// P-C4b.)
+fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<State>>) {
+    if std::env::var("MESHD_NO_SELF_DESTRUCT").is_ok() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut established = false;
+        let mut below_since: Option<u64> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(SELF_DESTRUCT_TICK_SECS)).await;
+            let now = now_ms();
+            let mut st = state.lock().unwrap();
+            let Some(ms) = st.meshes.get(&mesh_id) else {
+                return; // mesh already gone (RemoveMesh / earlier self-destruct)
+            };
+            let n = ms.roster().len().max(1);
+            let live = 1 + ms
+                .links
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|l| {
+                    l.last_seen_ms != 0 && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS
+                })
+                .count();
+            let threshold = quorum_threshold(n);
+            if live >= threshold {
+                established = true;
+                below_since = None;
+                continue;
+            }
+            if !established {
+                continue; // still forming — never reached quorum, don't self-destruct
+            }
+            let since = *below_since.get_or_insert(now);
+            if now.saturating_sub(since) < SELF_DESTRUCT_GRACE_SECS * 1000 {
+                continue; // within the grace window — wait for recovery
+            }
+            eprintln!(
+                "meshd: mesh {mesh_id} SELF-DESTRUCT — live {live}/{n} below threshold {threshold} for {SELF_DESTRUCT_GRACE_SECS}s (live-paired, P-C4)"
+            );
+            if let Some(mut gone) = st.meshes.remove(&mesh_id) {
+                gone.secret.iter_mut().for_each(|byte| *byte = 0); // wipe the secret
+                if let Some(t) = &gone.dp_task {
+                    t.abort();
+                }
+                if st.current == Some(mesh_id) {
+                    st.current = None;
+                    exit::restore_routes();
+                    exit::restore_dns();
+                }
+            }
+            return;
+        }
+    });
 }
 
 /// Best-effort primary local IP — the source address the OS picks to reach the
@@ -468,7 +544,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 .values()
                 .filter(|l| now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS)
                 .count();
-            let threshold = (3 * n + 4) / 5; // ⌈0.6·N⌉
+            let threshold = quorum_threshold(n);
             if online < threshold {
                 return (
                     err(&format!(
@@ -1065,4 +1141,20 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
         *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quorum_threshold;
+
+    #[test]
+    fn quorum_threshold_is_ceil_60pct() {
+        // ⌈0.6·n⌉ — the re-cipher quorum + self-destruct floor.
+        assert_eq!(quorum_threshold(1), 1);
+        assert_eq!(quorum_threshold(2), 2);
+        assert_eq!(quorum_threshold(3), 2); // ceil(1.8)
+        assert_eq!(quorum_threshold(4), 3); // ceil(2.4)
+        assert_eq!(quorum_threshold(5), 3); // ceil(3.0)
+        assert_eq!(quorum_threshold(10), 6);
+    }
 }
