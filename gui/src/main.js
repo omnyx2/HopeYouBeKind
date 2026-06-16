@@ -151,7 +151,7 @@ document.querySelectorAll(".nav-item").forEach((b) =>
   b.addEventListener("click", () => {
     const tab = b.dataset.tab;
     if (tab === "meshes") return setMode("user");
-    if (tab === "new-mesh") return activateTab("new-mesh"); // user-mode sibling page
+    if (tab === "new-mesh") { populateCiphers(); return activateTab("new-mesh"); } // user-mode sibling page
     activateTab(tab);
     if (tab === "mesh-overview") return CURRENT_MESH != null ? renderOverview(CURRENT_MESH) : renderMeshPlain();
     if (CURRENT_MESH == null) return;
@@ -161,7 +161,7 @@ document.querySelectorAll(".nav-item").forEach((b) =>
 );
 
 // "＋ New mesh" button on the Meshes list → the New mesh page.
-el("goto-new-mesh")?.addEventListener("click", () => activateTab("new-mesh"));
+el("goto-new-mesh")?.addEventListener("click", () => { populateCiphers(); activateTab("new-mesh"); });
 
 // ---- New mesh page: join flow (§2b) ----
 el("join-getcode")?.addEventListener("click", async () => {
@@ -404,7 +404,7 @@ function updateCipherWarn() {
 }
 async function populateCiphers() {
   const sel = el("mesh-cipher");
-  if (!sel) return;
+  if (!sel || sel.options.length) return; // once populated, keep the user's choice
   let list = [];
   try { list = (await meshd("Ciphers")).Ciphers || []; } catch (_) { return; }
   if (!list.length) return;
