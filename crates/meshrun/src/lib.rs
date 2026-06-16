@@ -148,12 +148,30 @@ pub struct Recipher {
     pub secret: [u8; 32],
 }
 
-/// meshd→loop: re-cipher now, announcing to `peers` (with the *old* cipher) then
-/// swapping locally.
-pub type RecipherCmdRx = tokio::sync::mpsc::UnboundedReceiver<(Recipher, Vec<MemberId>)>;
-/// loop→meshd: a re-cipher was applied (we initiated it, or received an announce) —
-/// the supervisor updates its stored secret/epoch/cipher.
-pub type RecipherAppliedTx = tokio::sync::mpsc::UnboundedSender<Recipher>;
+/// A command from the supervisor (meshd) into the data-plane loop.
+pub enum LoopCmd {
+    /// Re-cipher: announce to `peers` (old cipher) then swap locally (P-C3).
+    Recipher(Recipher, Vec<MemberId>),
+    /// Seal a tagged `Control` payload and send it to `peers` (P-C7 attack signals).
+    SendControl(u8, Vec<u8>, Vec<MemberId>),
+}
+
+/// An event from the data-plane loop up to the supervisor.
+pub enum LoopEvent {
+    /// A re-cipher landed (update the stored secret/epoch/cipher).
+    Recipher(Recipher),
+    /// A control signal arrived (P-C7): the sub-tag (0x03 attack alert / 0x04 all-clear).
+    Control(u8),
+}
+
+/// meshd→loop command channel (re-cipher, attack signals).
+pub type LoopCmdRx = tokio::sync::mpsc::UnboundedReceiver<LoopCmd>;
+/// loop→meshd event channel (re-cipher applied, attack signal received).
+pub type LoopEventTx = tokio::sync::mpsc::UnboundedSender<LoopEvent>;
+
+/// Control-frame sub-tags for the attack-response control plane (P-C7).
+pub const CTRL_ATTACK: u8 = 0x03;
+pub const CTRL_ALLCLEAR: u8 = 0x04;
 
 /// Encode a re-cipher announce: `[epoch(8 BE)][cipher_len(1)][cipher][secret(32)]`.
 fn encode_recipher(r: &Recipher) -> Vec<u8> {
@@ -201,8 +219,8 @@ pub async fn run<X: Transport + 'static>(
     my_id: MemberId,
     my_endpoint: SharedEndpoint,
     endpoint_pinned: bool,
-    mut recipher_cmd: RecipherCmdRx,
-    recipher_applied: RecipherAppliedTx,
+    mut loop_cmd: LoopCmdRx,
+    loop_event: LoopEventTx,
 ) {
     let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
     loop {
@@ -277,8 +295,13 @@ pub async fn run<X: Transport + 'static>(
                                     lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
                                     &r.secret,
                                 );
-                                let _ = recipher_applied.send(r);
+                                let _ = loop_event.send(LoopEvent::Recipher(r));
                             }
+                        }
+                        // P-C7: an attack alert or the creator's all-clear — hand it
+                        // up so the supervisor arms / cancels the destroy grace.
+                        Some(tag @ (CTRL_ATTACK | CTRL_ALLCLEAR)) => {
+                            let _ = loop_event.send(LoopEvent::Control(tag));
                         }
                         _ => {}
                     },
@@ -318,24 +341,37 @@ pub async fn run<X: Transport + 'static>(
                     let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
                 }
             }
-            // P-C3 initiator: meshd asked us to re-cipher. Announce to `peers` with the
-            // CURRENT (old) cipher — so present members can read it — then swap our own
-            // data plane to the new epoch and report it back up.
-            Some((r, peers)) = recipher_cmd.recv() => {
-                let mut payload = vec![CTRL_RECIPHER];
-                payload.extend_from_slice(&encode_recipher(&r));
-                for m in peers {
-                    let endpoint = links.lock().unwrap().get(&m).map(|l| l.endpoint);
-                    if let Some(addr) = endpoint {
-                        let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
+            // A command from the supervisor: re-cipher (P-C3) or send a tagged Control
+            // signal to peers (P-C7 attack alert / all-clear).
+            Some(cmd) = loop_cmd.recv() => match cmd {
+                LoopCmd::Recipher(r, peers) => {
+                    // Announce with the CURRENT (old) cipher so present members read it,
+                    // then swap our own data plane and report back up.
+                    let mut payload = vec![CTRL_RECIPHER];
+                    payload.extend_from_slice(&encode_recipher(&r));
+                    for m in peers {
+                        let endpoint = links.lock().unwrap().get(&m).map(|l| l.endpoint);
+                        if let Some(addr) = endpoint {
+                            let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
+                        }
+                    }
+                    eprintln!("meshrun: re-ciphered (initiator) → epoch {} cipher {}", r.epoch, r.cipher);
+                    dp.recipher(
+                        lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
+                        &r.secret,
+                    );
+                    let _ = loop_event.send(LoopEvent::Recipher(r));
+                }
+                LoopCmd::SendControl(tag, body, peers) => {
+                    let mut payload = vec![tag];
+                    payload.extend_from_slice(&body);
+                    for m in peers {
+                        let endpoint = links.lock().unwrap().get(&m).map(|l| l.endpoint);
+                        if let Some(addr) = endpoint {
+                            let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
+                        }
                     }
                 }
-                eprintln!("meshrun: re-ciphered (initiator) → epoch {} cipher {}", r.epoch, r.cipher);
-                dp.recipher(
-                    lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
-                    &r.secret,
-                );
-                let _ = recipher_applied.send(r);
             }
         }
     }
@@ -372,10 +408,10 @@ mod tests {
     // Dummy re-cipher channels for tests that don't exercise P-C3: the cmd receiver's
     // sender is dropped (recv → None → branch disabled); the applied sender's receiver
     // is dropped (send is a harmless error).
-    fn dummy_cmd() -> RecipherCmdRx {
+    fn dummy_cmd() -> LoopCmdRx {
         tokio::sync::mpsc::unbounded_channel().1
     }
-    fn dummy_applied() -> RecipherAppliedTx {
+    fn dummy_applied() -> LoopEventTx {
         tokio::sync::mpsc::unbounded_channel().0
     }
 
@@ -826,7 +862,7 @@ mod tests {
 
         // A re-ciphers to a fresh secret; wait for B to report it applied.
         a_cmd_tx
-            .send((
+            .send(LoopCmd::Recipher(
                 Recipher {
                     epoch: 1,
                     cipher: "default".into(),
@@ -835,10 +871,13 @@ mod tests {
                 vec![2],
             ))
             .unwrap();
-        let applied = tokio::time::timeout(Duration::from_secs(2), b_applied_rx.recv())
+        let ev = tokio::time::timeout(Duration::from_secs(2), b_applied_rx.recv())
             .await
             .expect("B never applied the re-cipher")
             .unwrap();
+        let LoopEvent::Recipher(applied) = ev else {
+            panic!("expected a Recipher event");
+        };
         assert_eq!(applied.epoch, 1);
 
         // Traffic still flows — now on the new key.

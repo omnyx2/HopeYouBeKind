@@ -99,6 +99,12 @@ pub enum Request {
     },
     /// List the invite-wrap transform algorithms (P-C6) — the secret the joiner needs.
     InviteAlgorithms,
+    /// Flag an attack on a mesh (P-C7 §7): broadcast an alert and arm the destroy
+    /// grace. **One-veto, fail-deadly** — unless the creator all-clears within the
+    /// grace, every member self-destructs.
+    ReportAttack { mesh: MeshId },
+    /// (Creator only) Call off an attack alert before the grace destroys the mesh.
+    AllClear { mesh: MeshId },
     /// (Joiner) Install a mesh from a wrapped invite: unwrap it with `algo` (learned
     /// out-of-band), open the sealed secret, adopt the roster, bring up the loop.
     JoinMesh {

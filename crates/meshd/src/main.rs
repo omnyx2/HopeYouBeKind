@@ -25,7 +25,10 @@ use lattice_mesh::ipc::{
 use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey};
 use lattice_mesh::Mesh;
-use lattice_meshrun::{seed_links, Link, PeerLinks, Recipher, SharedEndpoint, SharedExit};
+use lattice_meshrun::{
+    seed_links, Link, LoopCmd, LoopEvent, PeerLinks, Recipher, SharedEndpoint, SharedExit,
+    CTRL_ALLCLEAR, CTRL_ATTACK,
+};
 use lattice_net::udp::UdpTransport;
 use lattice_proto::wire_v2::{MemberId, MeshId};
 use lattice_proto::VirtualIp;
@@ -54,6 +57,9 @@ const OVERLAY_MTU: u16 = 1280;
 /// mesh may sit below the live threshold before it wipes itself.
 const SELF_DESTRUCT_TICK_SECS: u64 = 15;
 const SELF_DESTRUCT_GRACE_SECS: u64 = 180;
+/// Attack-response grace (P-C7): after an attack alert, how long the creator has to
+/// send an all-clear before every member self-destructs (one-veto, fail-deadly).
+const ATTACK_GRACE_SECS: u64 = 30;
 
 /// ⌈0.6·n⌉ — the shared threshold: the re-cipher quorum (§5-4) and the live-paired
 /// self-destruct floor (§5-2). Below this many live members the mesh secret is (by
@@ -101,8 +107,13 @@ struct MeshState {
     /// charter; a re-cipher rotates `secret`, bumps `epoch`, and may change `cipher`.
     cipher: String,
     epoch: u64,
-    /// Sender into this mesh's data-plane loop to trigger a re-cipher (set at bringup).
-    recipher_cmd: Option<UnboundedSender<(Recipher, Vec<MemberId>)>>,
+    /// Sender into this mesh's data-plane loop (re-cipher trigger / attack signals,
+    /// set at bringup).
+    loop_cmd: Option<UnboundedSender<LoopCmd>>,
+    /// When an attack alert armed the destroy grace (P-C7); `None` = not armed. Set on
+    /// `ReportAttack` / a received alert, cleared by the creator's all-clear; the
+    /// self-destruct watchdog wipes the mesh once the grace elapses.
+    attack_armed_at: Option<u64>,
 }
 
 impl MeshState {
@@ -365,8 +376,8 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     // P-C3 re-cipher channels: cmd (meshd→loop, trigger) + applied (loop→meshd, so we
     // update our stored secret/epoch/cipher when a re-cipher lands — initiated or
     // received).
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (applied_tx, mut applied_rx) = tokio::sync::mpsc::unbounded_channel::<Recipher>();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<LoopCmd>();
+    let (applied_tx, mut applied_rx) = tokio::sync::mpsc::unbounded_channel::<LoopEvent>();
     let task = tokio::spawn(lattice_meshrun::run(
         dp,
         tun,
@@ -379,22 +390,40 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         cmd_rx,
         applied_tx,
     ));
-    // Record the loop's abort handle (RemoveMesh stops it) + the re-cipher trigger.
+    // Record the loop's abort handle (RemoveMesh stops it) + the command sender.
     if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
         ms.dp_task = Some(task.abort_handle());
-        ms.recipher_cmd = Some(cmd_tx);
+        ms.loop_cmd = Some(cmd_tx);
     }
-    // Keep MeshState's secret/epoch/cipher in step with the live data plane after a
-    // re-cipher (the joiner-sealing secret + the displayed state must follow).
+    // Drain loop events: a re-cipher landing (sync secret/epoch/cipher) or a P-C7
+    // attack signal (arm / cancel the destroy grace).
     let st = Arc::clone(&state);
     let mid = b.mesh_id;
     tokio::spawn(async move {
-        while let Some(r) = applied_rx.recv().await {
-            if let Some(ms) = st.lock().unwrap().meshes.get_mut(&mid) {
-                ms.secret = r.secret;
-                ms.epoch = r.epoch;
-                ms.mesh.epoch = r.epoch;
-                ms.cipher = r.cipher;
+        while let Some(ev) = applied_rx.recv().await {
+            let mut state = st.lock().unwrap();
+            let Some(ms) = state.meshes.get_mut(&mid) else {
+                continue;
+            };
+            match ev {
+                LoopEvent::Recipher(r) => {
+                    ms.secret = r.secret;
+                    ms.epoch = r.epoch;
+                    ms.mesh.epoch = r.epoch;
+                    ms.cipher = r.cipher;
+                }
+                LoopEvent::Control(CTRL_ATTACK) => {
+                    if ms.attack_armed_at.is_none() {
+                        eprintln!("meshd: mesh {mid} ATTACK ALERT received — destroy grace armed ({ATTACK_GRACE_SECS}s; creator can all-clear)");
+                        ms.attack_armed_at = Some(now_ms());
+                    }
+                }
+                LoopEvent::Control(CTRL_ALLCLEAR) => {
+                    if ms.attack_armed_at.take().is_some() {
+                        eprintln!("meshd: mesh {mid} ALL-CLEAR received — destroy grace cancelled");
+                    }
+                }
+                LoopEvent::Control(_) => {}
             }
         }
     });
@@ -423,6 +452,7 @@ fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<State>>) {
             let Some(ms) = st.meshes.get(&mesh_id) else {
                 return; // mesh already gone (RemoveMesh / earlier self-destruct)
             };
+            let armed = ms.attack_armed_at;
             let n = ms.roster().len().max(1);
             let live = 1 + ms
                 .links
@@ -434,21 +464,30 @@ fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<State>>) {
                 })
                 .count();
             let threshold = quorum_threshold(n);
+
+            // P-C7: an attack alert that the creator never cleared ⇒ fail-deadly.
+            let attack =
+                matches!(armed, Some(t) if now.saturating_sub(t) >= ATTACK_GRACE_SECS * 1000);
+
+            // P-C4: an established mesh that has sat below the live threshold past grace.
+            let mut starved = false;
             if live >= threshold {
                 established = true;
                 below_since = None;
+            } else if established {
+                let since = *below_since.get_or_insert(now);
+                starved = now.saturating_sub(since) >= SELF_DESTRUCT_GRACE_SECS * 1000;
+            }
+
+            if !attack && !starved {
                 continue;
             }
-            if !established {
-                continue; // still forming — never reached quorum, don't self-destruct
-            }
-            let since = *below_since.get_or_insert(now);
-            if now.saturating_sub(since) < SELF_DESTRUCT_GRACE_SECS * 1000 {
-                continue; // within the grace window — wait for recovery
-            }
-            eprintln!(
-                "meshd: mesh {mesh_id} SELF-DESTRUCT — live {live}/{n} below threshold {threshold} for {SELF_DESTRUCT_GRACE_SECS}s (live-paired, P-C4)"
-            );
+            let reason = if attack {
+                format!("attack alert un-cleared after {ATTACK_GRACE_SECS}s (one-veto, P-C7)")
+            } else {
+                format!("live {live}/{n} below threshold {threshold} for {SELF_DESTRUCT_GRACE_SECS}s (live-paired, P-C4)")
+            };
+            eprintln!("meshd: mesh {mesh_id} SELF-DESTRUCT — {reason}");
             if let Some(mut gone) = st.meshes.remove(&mesh_id) {
                 gone.secret.iter_mut().for_each(|byte| *byte = 0); // wipe the secret
                 if let Some(t) = &gone.dp_task {
@@ -564,13 +603,50 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 cipher: new_cipher,
                 secret: rand::random(),
             };
-            match &ms.recipher_cmd {
+            match &ms.loop_cmd {
                 Some(tx) => {
-                    let _ = tx.send((r, peers));
+                    let _ = tx.send(LoopCmd::Recipher(r, peers));
                     (Response::Ok, None)
                 }
                 None => (err("data plane is not running; can't re-cipher"), None),
             }
+        }
+
+        Request::ReportAttack { mesh } => {
+            // One-veto, fail-deadly (P-C7 §7): any member flagging an attack broadcasts
+            // an alert and arms the destroy grace locally. Unless the creator sends an
+            // all-clear within the grace, every member self-destructs.
+            let Some(ms) = st.meshes.get_mut(&mesh) else {
+                return (no_mesh(mesh), None);
+            };
+            let peers: Vec<MemberId> = ms.links.lock().unwrap().keys().copied().collect();
+            if let Some(tx) = &ms.loop_cmd {
+                let _ = tx.send(LoopCmd::SendControl(CTRL_ATTACK, Vec::new(), peers));
+            }
+            if ms.attack_armed_at.is_none() {
+                ms.attack_armed_at = Some(now_ms());
+            }
+            eprintln!(
+                "meshd: mesh {mesh} ATTACK reported — alert broadcast, destroy grace armed ({ATTACK_GRACE_SECS}s)"
+            );
+            (Response::Ok, None)
+        }
+
+        Request::AllClear { mesh } => {
+            // Only the creator (holds the master key) can call off an attack (§7).
+            let Some(ms) = st.meshes.get_mut(&mesh) else {
+                return (no_mesh(mesh), None);
+            };
+            if ms.master.is_none() {
+                return (err("only the mesh creator can issue an all-clear"), None);
+            }
+            let peers: Vec<MemberId> = ms.links.lock().unwrap().keys().copied().collect();
+            if let Some(tx) = &ms.loop_cmd {
+                let _ = tx.send(LoopCmd::SendControl(CTRL_ALLCLEAR, Vec::new(), peers));
+            }
+            ms.attack_armed_at = None;
+            eprintln!("meshd: mesh {mesh} ALL-CLEAR issued by creator — destroy grace cancelled");
+            (Response::Ok, None)
         }
 
         Request::ListMeshes => {
@@ -1021,7 +1097,8 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             dp_task: None,
             cipher,
             epoch,
-            recipher_cmd: None,
+            loop_cmd: None,
+            attack_armed_at: None,
         },
     );
     (
@@ -1108,7 +1185,8 @@ fn create_mesh(
             dp_task: None,
             cipher,
             epoch: 0,
-            recipher_cmd: None,
+            loop_cmd: None,
+            attack_armed_at: None,
         },
     );
     (
