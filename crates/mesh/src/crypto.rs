@@ -10,6 +10,8 @@
 //! new traffic. Replay protection and the nonce counter live in the data plane; the
 //! header is passed here as AEAD associated data so tampering is detected.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use blake2::{Blake2s256, Digest};
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
@@ -189,6 +191,73 @@ impl MeshSuite for TimeWindowSuite {
     }
 }
 
+/// Header-cipher window length (seconds). The header key rotates each window; on
+/// decrypt we also try the adjacent windows (the §5-3 *overlapping slide*) so a frame
+/// that crosses a window boundary — or arrives under ±1 window of clock skew — still
+/// opens.
+const HEADER_WINDOW_SECS: u64 = 60;
+
+/// Encrypts the 5-byte wire header (P-C2) under a key derived from **(mesh secret,
+/// mesh id, time window)** — so the routing metadata (version/src/dst/type) is hidden
+/// from non-members and the frame carries **no constant cleartext bytes** to
+/// fingerprint Lattice by (docs/PROTOCOL_DESIGN.md §5-3, §6). Deliberately separate
+/// from the body cipher: the header is time-windowed, the body is the per-mesh dropbox
+/// [`MeshSuite`]. A relay (a member) can still open just the header to read `dst` and
+/// forward without touching the body.
+pub struct HeaderCrypto {
+    secret: [u8; 32],
+    mesh_id: u8,
+}
+
+impl HeaderCrypto {
+    pub fn new(secret: &[u8; 32], mesh_id: u8) -> Self {
+        Self {
+            secret: *secret,
+            mesh_id,
+        }
+    }
+
+    fn current_window() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / HEADER_WINDOW_SECS)
+            .unwrap_or(0)
+    }
+
+    fn cipher_for(&self, window: u64) -> ChaCha20Poly1305 {
+        let mut h = Blake2s256::new();
+        h.update(b"lattice-mesh-header-v1");
+        h.update(self.secret);
+        h.update([self.mesh_id]);
+        h.update(window.to_be_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h.finalize());
+        ChaCha20Poly1305::new(Key::from_slice(&key))
+    }
+
+    /// Seal the header bytes under the current window; `seq` is the AEAD nonce.
+    pub fn seal(&self, seq: u64, header: &[u8]) -> Vec<u8> {
+        self.cipher_for(Self::current_window())
+            .encrypt(Nonce::from_slice(&nonce_bytes(seq)), header)
+            .expect("header seal")
+    }
+
+    /// Open header bytes, trying the current and adjacent windows (overlapping slide,
+    /// tolerant of ±1 window of skew). `None` if none open (wrong key / not a member).
+    pub fn open(&self, seq: u64, sealed: &[u8]) -> Option<Vec<u8>> {
+        let w = Self::current_window();
+        for win in [w, w.wrapping_sub(1), w.wrapping_add(1)] {
+            if let Ok(pt) = self
+                .cipher_for(win)
+                .decrypt(Nonce::from_slice(&nonce_bytes(seq)), sealed)
+            {
+                return Some(pt);
+            }
+        }
+        None
+    }
+}
+
 /// An opaque per-mesh LAN-discovery tag (docs/DISCOVERY.md P-D4): a domain-separated
 /// hash of the mesh secret, truncated to 8 bytes. Broadcast in the LAN beacon so
 /// same-mesh peers recognise each other without revealing the mesh id or any pubkey;
@@ -312,5 +381,18 @@ mod tests {
         assert_eq!(tw.open(1, &ct, AAD).unwrap(), b"window payload");
         // ...but the default suite can't open it (distinct KDF domain ⇒ distinct key).
         assert!(def.open(1, &ct, AAD).is_none());
+    }
+
+    #[test]
+    fn header_crypto_round_trips_and_gates() {
+        let hc = HeaderCrypto::new(&SECRET, 3);
+        let header: &[u8] = b"\x02\x03\x01\x09\x03"; // a 5-byte v2 header
+        let sealed = hc.seal(7, header);
+        assert_ne!(&sealed[..], header); // encrypted
+        assert_eq!(sealed.len(), 5 + TAG_LEN); // header + tag
+        assert_eq!(hc.open(7, &sealed).unwrap(), header);
+        assert!(hc.open(8, &sealed).is_none()); // wrong seq (nonce)
+        assert!(HeaderCrypto::new(&SECRET, 4).open(7, &sealed).is_none()); // wrong mesh id
+        assert!(HeaderCrypto::new(&[1u8; 32], 3).open(7, &sealed).is_none()); // non-member
     }
 }

@@ -6,10 +6,12 @@
 //! leading byte distinguishes them: v1's first byte is a `MessageType`
 //! `0x01..=0x05`, v2's is the version [`VERSION`]).
 //!
-//! Every header byte is **cleartext**. Per the §6 decision, `src`/`dst` sit
-//! *outside* the per-mesh AEAD so a relay — itself a mesh member — can forward a
-//! frame to its next hop **without decrypting** it; the header is still
-//! authenticated, covered as associated data by the payload's AEAD.
+//! This module is the header **codec** (the 5 logical bytes below). As of P-C2 the
+//! data plane no longer puts these bytes on the wire in the clear: it **seals the
+//! header** with a time-windowed key (`crypto::HeaderCrypto`, docs/PROTOCOL_DESIGN.md
+//! §5-3) so nothing constant/fingerprintable is exposed. A relay — itself a member —
+//! opens just the header to read `dst` and forwards the (still-sealed) body; the
+//! header is also authenticated as the body AEAD's associated data.
 //!
 //! ```text
 //!   0       1        2       3       4        5 .. N

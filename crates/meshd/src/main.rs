@@ -310,7 +310,13 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
             return;
         }
     };
-    let dp = MeshDataPlane::new(b.mesh_id, b.my_id, b.prefix, suite(&b.cipher, &b.secret, 0));
+    let dp = MeshDataPlane::new(
+        b.mesh_id,
+        b.my_id,
+        b.prefix,
+        suite(&b.cipher, &b.secret, 0),
+        &b.secret,
+    );
     // Record the TUN name (needed to divert the default route for full-tunnel) and
     // make this node able to serve as an exit for others — ip_forward + NAT, which
     // is idempotent and unused unless a peer routes through us (reuses v1 exit.rs).

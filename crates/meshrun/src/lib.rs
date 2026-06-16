@@ -263,7 +263,13 @@ mod tests {
 
     fn dp(my_id: MemberId) -> MeshDataPlane {
         // Mesh 3, overlay prefix 100.80, shared secret ⇒ same key for both nodes.
-        MeshDataPlane::new(3, my_id, [100, 80], suite("default", &[42u8; 32], 0))
+        MeshDataPlane::new(
+            3,
+            my_id,
+            [100, 80],
+            suite("default", &[42u8; 32], 0),
+            &[42u8; 32],
+        )
     }
 
     fn exit(member: Option<MemberId>) -> SharedExit {
