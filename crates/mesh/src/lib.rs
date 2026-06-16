@@ -23,6 +23,7 @@ pub mod charter;
 pub mod crypto;
 pub mod dataplane;
 pub mod discovery;
+pub mod invitewrap;
 pub mod ipc;
 pub mod keydist;
 pub mod membership;

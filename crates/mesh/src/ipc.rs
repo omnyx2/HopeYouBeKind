@@ -79,8 +79,8 @@ pub enum Request {
     /// Returns both public keys; the private halves are held until `JoinMesh`.
     NewIdentity,
     /// (Creator) Admit a member by their public keys: issue a cert AND seal the
-    /// mesh secret to their encryption key. Returns an [`InviteBlob`] to hand to
-    /// the joiner out-of-band.
+    /// mesh secret to their encryption key. Returns a [`WrappedInvite`] (P-C6) to
+    /// hand to the joiner out-of-band.
     CreateInvite {
         mesh: MeshId,
         name: String,
@@ -88,10 +88,33 @@ pub enum Request {
         member_pubkey_hex: String,
         /// 64 hex — the joiner's encryption (x25519) public key from `NewIdentity`.
         enc_pubkey_hex: String,
+        /// When the joiner's identity code was minted (from `NewIdentity`); rejected
+        /// if older than `invitewrap::IDENTITY_TTL_SECS` (P-C6 time-expire).
+        #[serde(default)]
+        issued_at: u64,
+        /// The invite-wrap transform to use (P-C6); `None` ⇒ the default. The joiner
+        /// must be told this out-of-band to open the invite.
+        #[serde(default)]
+        algo: Option<String>,
     },
-    /// (Joiner) Install a mesh from an invite: open the sealed secret with the held
-    /// private key, adopt the roster, and (if data-plane) bring up the loop.
-    JoinMesh { invite: InviteBlob },
+    /// List the invite-wrap transform algorithms (P-C6) — the secret the joiner needs.
+    InviteAlgorithms,
+    /// (Joiner) Install a mesh from a wrapped invite: unwrap it with `algo` (learned
+    /// out-of-band), open the sealed secret, adopt the roster, bring up the loop.
+    JoinMesh {
+        invite: WrappedInvite,
+        #[serde(default)]
+        algo: Option<String>,
+    },
+}
+
+/// A P-C6 wrapped invite: the serialized [`InviteBlob`] sealed under (algo, salt, n).
+/// The `algo` is **not** here — the joiner supplies it out-of-band.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WrappedInvite {
+    pub salt: [u8; 32],
+    pub n: u32,
+    pub ct: Vec<u8>,
 }
 
 /// A daemon → client reply.
@@ -103,14 +126,19 @@ pub enum Response {
     Meshes(Vec<MeshSummary>),
     Mesh(MeshDetail),
     Policy(PolicyView),
-    /// A freshly minted identity's public keys (from `NewIdentity`).
+    /// A freshly minted identity's public keys + mint time (from `NewIdentity`).
     Identity {
         member_pubkey_hex: String,
         enc_pubkey_hex: String,
+        /// Unix-ms the identity was minted — carried in the identity code so the
+        /// inviter can enforce the TTL (P-C6).
+        #[serde(default)]
+        issued_at: u64,
     },
-    /// An invite to hand to the joiner (from `CreateInvite`).
-    Invite(InviteBlob),
-    /// Available data-plane cipher names (from `Ciphers`).
+    /// A **wrapped** invite to hand to the joiner (from `CreateInvite`, P-C6).
+    Invite(WrappedInvite),
+    /// Available names (from `Ciphers` = data-plane ciphers / `InviteAlgorithms` =
+    /// invite-wrap transforms).
     Ciphers(Vec<String>),
     Ok,
     Error {

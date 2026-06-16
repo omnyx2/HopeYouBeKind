@@ -28,10 +28,11 @@ function toast(msg) {
 // ---- join-flow codes (§2b): base64(JSON) so each is one copy-pasteable string ----
 function b64encode(obj) { return btoa(unescape(encodeURIComponent(JSON.stringify(obj)))); }
 function b64decode(s) { try { return JSON.parse(decodeURIComponent(escape(atob((s || "").trim())))); } catch { return null; } }
-function encodeIdentity(id) { return b64encode({ m: id.member_pubkey_hex, e: id.enc_pubkey_hex }); }
+function encodeIdentity(id) { return b64encode({ m: id.member_pubkey_hex, e: id.enc_pubkey_hex, t: id.issued_at || 0 }); }
 function decodeIdentity(code) { const o = b64decode(code); return o && o.m && o.e ? o : null; }
-function encodeInvite(blob) { return b64encode(blob); }
-function decodeInvite(code) { const o = b64decode(code); return o && o.mesh_id != null ? o : null; }
+function encodeInvite(w) { return b64encode(w); }
+// P-C6: the invite is now a WrappedInvite {salt, n, ct}.
+function decodeInvite(code) { const o = b64decode(code); return o && o.ct != null && o.salt != null ? o : null; }
 
 // ---- meshd bridge (the only daemon channel) ----
 async function meshd(req) {
@@ -179,7 +180,7 @@ el("join-do")?.addEventListener("click", async () => {
   const blob = decodeInvite(el("join-invite").value);
   if (!blob) return toast("invalid invite code");
   try {
-    const r = await meshd({ JoinMesh: { invite: blob } });
+    const r = await meshd({ JoinMesh: { invite: blob, algo: null } });
     el("join-invite").value = "";
     toast(`joined mesh #${r.MeshCreated.mesh}`);
     CURRENT_MESH = r.MeshCreated.mesh;
@@ -343,7 +344,7 @@ async function renderOverview(id) {
     if (!name) return toast("name required");
     if (!ident) return toast("invalid join code");
     try {
-      const r = await meshd({ CreateInvite: { mesh: id, name, member_pubkey_hex: ident.m, enc_pubkey_hex: ident.e } });
+      const r = await meshd({ CreateInvite: { mesh: id, name, member_pubkey_hex: ident.m, enc_pubkey_hex: ident.e, issued_at: ident.t || 0, algo: null } });
       el("ov-inv-result").value = encodeInvite(r.Invite);
       el("ov-inv-out").classList.remove("hidden");
       toast("invite created — copy + send it back");

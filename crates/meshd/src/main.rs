@@ -791,17 +791,44 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 Response::Identity {
                     member_pubkey_hex,
                     enc_pubkey_hex,
+                    issued_at: now_ms(), // P-C6 time-expire
                 },
                 None,
             )
         }
+
+        Request::InviteAlgorithms => (
+            Response::Ciphers(
+                lattice_mesh::invitewrap::invite_algorithms()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            None,
+        ),
 
         Request::CreateInvite {
             mesh,
             name,
             member_pubkey_hex,
             enc_pubkey_hex,
+            issued_at,
+            algo,
         } => {
+            // P-C6: reject a stale identity code.
+            if issued_at != 0
+                && now_ms().saturating_sub(issued_at)
+                    > lattice_mesh::invitewrap::IDENTITY_TTL_SECS * 1000
+            {
+                return (
+                    err("identity code expired — ask the joiner for a fresh one"),
+                    None,
+                );
+            }
+            let algo = algo.unwrap_or_else(|| lattice_mesh::invitewrap::DEFAULT_ALGO.to_string());
+            if !lattice_mesh::invitewrap::is_known_algo(&algo) {
+                return (err(&format!("unknown invite algorithm '{algo}'")), None);
+            }
             let member_pk = match parse_hex32(&member_pubkey_hex) {
                 Some(p) => p,
                 None => return (err("member_pubkey must be 64 hex chars"), None),
@@ -862,10 +889,39 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 epoch: ms.epoch, // bring the joiner up at the live epoch (P-C3)
                 cipher: ms.cipher.clone(), // ...and the live cipher (may differ post-re-cipher)
             };
-            (Response::Invite(blob), None)
+            // P-C6: wrap the blob under (algo, fresh salt, n). The joiner needs `algo`
+            // (out-of-band) to open it.
+            let plain = match serde_json::to_vec(&blob) {
+                Ok(b) => b,
+                Err(e) => return (err(&format!("serialize invite: {e}")), None),
+            };
+            let salt: [u8; 32] = rand::random();
+            let n: u32 = rand::random();
+            let ct = lattice_mesh::invitewrap::wrap(&algo, &salt, n, &plain);
+            (
+                Response::Invite(lattice_mesh::ipc::WrappedInvite { salt, n, ct }),
+                None,
+            )
         }
 
-        Request::JoinMesh { invite } => join_mesh(st, invite),
+        Request::JoinMesh { invite, algo } => {
+            // P-C6: unwrap with the out-of-band algorithm before installing.
+            let algo = algo.unwrap_or_else(|| lattice_mesh::invitewrap::DEFAULT_ALGO.to_string());
+            let plain =
+                match lattice_mesh::invitewrap::unwrap(&algo, &invite.salt, invite.n, &invite.ct) {
+                    Some(p) => p,
+                    None => {
+                        return (
+                            err("could not open the invite — wrong algorithm or corrupt code"),
+                            None,
+                        )
+                    }
+                };
+            match serde_json::from_slice::<InviteBlob>(&plain) {
+                Ok(blob) => join_mesh(st, blob),
+                Err(e) => (err(&format!("bad invite contents: {e}")), None),
+            }
+        }
     }
 }
 
