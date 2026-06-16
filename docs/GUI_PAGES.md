@@ -84,48 +84,92 @@ reverts on the next poll. `meshd offline` → dot grey, dropdown disabled.
 
 ---
 
-## 2. User mode — Meshes page / User 모드 — Meshes 페이지
+User mode has **two pages** (sidebar): **Meshes** (the list you belong to) and **New
+mesh** (create one, or join one by invite). Create/join is split out of the list so
+the list stays a clean "what am I in / where does my traffic exit" view.
+/ User 모드는 사이드바에 **두 페이지**: **Meshes**(속한 목록)와 **New mesh**(생성 또는 초대로
+합류). 생성/합류를 목록에서 분리해, 목록은 "내가 뭐에 속했나 / 출구는 어디냐"만 깔끔히 보여준다.
 
-**Purpose / 목적.** The computer's view of **all the meshes it belongs to**. Create,
-inspect, route through (egress), or enter a mesh to manage it. This is the only User
-page. / 이 컴퓨터가 속한 **모든 메쉬**의 관점. 생성·확인·egress 지정·관리 진입.
-User 모드의 유일한 페이지.
+## 2. User mode — Meshes page (the list) / User 모드 — Meshes 페이지(목록)
+
+**Purpose / 목적.** Every mesh this computer belongs to: route through one (egress) or
+enter it to manage. No create/join here — that's the New mesh page.
+/ 이 컴퓨터가 속한 모든 메쉬: egress 지정 또는 관리 진입. 생성/합류는 여기 없음(New mesh 페이지).
 
 **Elements / 구성요소.**
-- **Create-a-mesh form / 메쉬 생성 폼:** inputs `name`, `your name in it` (the §2
-  in-mesh name), `max members` (1–254, default 254); **Create** button. On success,
-  jumps into the new mesh (Mesh mode, Overview).
-  / 입력 `name`, `메쉬 내 내 이름`, `최대 인원(1–254, 기본 254)` + **Create**. 성공 시
-  새 메쉬로 진입(Mesh 모드 Overview).
-- **Default network row / Default network 행 (top of list / 목록 맨 위):** "your
-  computer's normal internet — no mesh." Wears an **in use** badge when no mesh
-  routes traffic; its **use this** button returns traffic to the default network.
-  / "원래 인터넷 — 메쉬 없음". 메쉬 라우팅이 없을 때 **in use** 뱃지, **use this**로 원래
-  인터넷 복귀.
-- **Mesh rows / 메쉬 행:** each shows `name`, `#id`, member count, epoch, exit, and an
-  `egress` badge if it routes traffic. **`manage ›`** enters Mesh mode for it; the
-  egress button **toggles** — **`make egress`** when idle, **`stop egress`** when it
-  is the current egress (→ `SetCurrent{null}`).
-  / 각 행: `name`, `#id`, 인원수, epoch, exit, (라우팅 중이면) `egress` 뱃지. **`manage ›`**
-  로 관리 진입; egress 버튼은 **토글** — 평소 **`make egress`**, 현재 egress면 **`stop
-  egress`**(→ `SetCurrent{null}`).
+- **Default network row / Default network 행 (top / 맨 위):** "your computer's normal
+  internet — no mesh." **in use** badge when no mesh routes traffic; **use this**
+  returns to it. / "원래 인터넷 — 메쉬 없음". 라우팅 없을 때 **in use** 뱃지, **use this**로 복귀.
+- **Mesh rows / 메쉬 행:** `name`, `#id`, member count, epoch, exit, `egress` badge if
+  routing. **`manage ›`** enters Mesh mode; the egress button **toggles** —
+  **`make egress`** ⇄ **`stop egress`** (→ `SetCurrent{null}`).
+  / `name`, `#id`, 인원수, epoch, exit, (라우팅 중) `egress` 뱃지. **`manage ›`** 관리 진입;
+  egress 버튼 **토글** — **`make egress`** ⇄ **`stop egress`**.
+- **`＋ New mesh` button / `＋ New mesh` 버튼:** goes to the New mesh page (§2b).
+  / New mesh 페이지(§2b)로 이동.
 
 **Daemon connection / 데몬 연결.**
-- List render → `ListMeshes` → `Meshes(MeshSummary{id,name,members,epoch,exit,is_current}[])`.
-- Create → `CreateMesh { name, my_name, max_members }` → `MeshCreated { mesh }`.
-- `make egress` (mesh row) → `SetCurrent { mesh: id }`; `stop egress` /
-  Default-network row → `SetCurrent { mesh: null }`.
-- `manage ›` → front-end: set the viewed mesh and switch to Mesh mode (no call yet;
-  Overview then loads via `MeshInfo`).
-  / `manage ›` → 프론트: 보는 메쉬 설정 후 Mesh 모드 전환(이 시점 호출 없음, Overview가
-  `MeshInfo`로 로드).
+- List → `ListMeshes` → `Meshes(MeshSummary[])`.
+- `make egress` → `SetCurrent { mesh: id }`; `stop egress` / Default-network →
+  `SetCurrent { mesh: null }`.
+- `manage ›` → front-end: set the viewed mesh + switch to Mesh mode.
 
-**States & errors / 상태·오류.** Empty list → "no meshes yet — create one above"
-(Default network row still shown). `make egress` on a mesh without an exit → toast
-the meshd error. / 빈 목록 → 안내 문구(Default network 행은 유지). exit 없는 메쉬에
-`make egress` → meshd 오류 토스트.
+**States / 상태.** Empty list → "no meshes yet — create or join one" (Default network
+row still shown). / 빈 목록 → 안내 문구(Default network 행 유지).
 
 **Status:** ✅
+
+---
+
+## 2b. User mode — New mesh page (Create / Join) / User 모드 — New mesh 페이지(생성/합류)
+
+**Purpose / 목적.** Get into a mesh: **create** a fresh one (you become member #1 and
+the owner), or **join** an existing one with an invite. Two sections on one page.
+/ 메쉬에 들어가기: **생성**(내가 member #1 = 소유자) 또는 초대로 **합류**. 한 페이지에 두 섹션.
+
+### A. Create a mesh / 메쉬 생성
+- Inputs `name`, `your name in it`, `max members` (1–254, default 254) + **Create** →
+  `CreateMesh { name, my_name, max_members }` → `MeshCreated { mesh }` → jump into the
+  new mesh (Mesh mode, Overview). / 입력 후 **Create** → 새 메쉬로 진입.
+
+### B. Join a mesh (3-message invite exchange) / 메쉬 합류 (3-메시지 초대 교환)
+A **3-message** out-of-band exchange between the **joiner (B)** and the mesh **owner
+(A)** — each message is a copy-paste code: / **합류자(B)**와 **소유자(A)** 간 **3-메시지**
+대역외 교환 — 각 메시지는 복붙 코드:
+
+1. **B → A: identity code.** B clicks **"Get my join code"** → `NewIdentity` →
+   `Identity { member_pubkey_hex, enc_pubkey_hex }`. Front-end encodes
+   **`identity code` = base64(JSON{ m, e })**, shown with **Copy**. B sends it to A.
+   / B가 **"Get my join code"** → `NewIdentity` → 두 공개키 → **`identity code`=base64(JSON{m,e})**
+   를 **Copy**와 함께 표시 → A에게 전달.
+2. **A → B: invite code.** A (in that mesh's Overview §3) pastes B's identity code →
+   decode → `CreateInvite { mesh, name, member_pubkey_hex, enc_pubkey_hex }` →
+   `Invite(InviteBlob)` → **`invite code` = base64(JSON(InviteBlob))** + **Copy** →
+   sends it to B. / A가 메쉬 Overview(§3)에서 B의 identity code 붙여넣기 → `CreateInvite` →
+   `Invite` → **`invite code`=base64(JSON(InviteBlob))** + **Copy** → B에게 전달.
+3. **B joins.** B pastes the invite code into **"Paste invite"** → decode →
+   `JoinMesh { invite }` → `MeshCreated { mesh }` → jump into the mesh.
+   / B가 invite code를 **"Paste invite"**에 붙여넣기 → `JoinMesh` → 메쉬로 진입.
+
+**Elements / 구성요소.** **"Get my join code"** button → read-only **identity code**
+box + **Copy**; **"Paste invite"** textarea + **Join**. (The owner's "create invite"
+UI lives on the per-mesh Overview §3 — it needs the master key, which only the owner's
+mesh holds.) / **"Get my join code"** → identity code 박스 + **Copy**; **"Paste invite"**
++ **Join**. (소유자의 "초대 만들기"는 per-mesh Overview §3 — master 키 보유 메쉬만 가능.)
+
+**Codes / 코드 형식.** `identity code` / `invite code` are **base64 of compact JSON** —
+one copy-pasteable string each (identity short; invite ≈ 1–2 KB: it carries the roster
++ sealed secret). Encode/decode is front-end only; meshd sees raw hex / `InviteBlob`.
+/ 둘 다 **compact JSON의 base64** — 한 줄 복붙. invite는 로스터+sealed secret으로 1–2KB.
+인코딩/디코딩은 프론트에서만.
+
+**States & errors / 상태·오류.** Bad code → toast "invalid code". Join when already in
+that mesh → `Error("already in mesh N")`. `NewIdentity` runs on **B's** machine (private
+keys stay there); the identity code carries only public keys.
+/ 잘못된 코드 → 토스트. 이미 속한 메쉬 합류 → `Error`. `NewIdentity`는 **B 머신**에서(개인키
+보관), identity code엔 공개키만.
+
+**Status:** ⏳ to build / 구현 예정
 
 ---
 
@@ -155,21 +199,28 @@ network — no mesh selected") — 메쉬를 자동으로 열지 않는다.
 - **Set my exit / 내 exit 설정:** a select of members → **set exit**. Chooses which
   member this node egresses through *inside this mesh* (per-node exit).
   / 멤버 셀렉트 + **set exit**. 이 메쉬 안에서 이 노드가 어느 멤버로 나갈지(노드별 exit).
-- **Admit a member (demo) / 멤버 초대(데모):** `name` + `pubkey (64 hex)` → **admit**.
-  Placeholder until the real cert-based invite lands (MESH_V2.md §3).
-  / `name` + `pubkey(64 hex)` → **admit**. 실제 cert 기반 초대 전까지의 임시.
+- **Invite a member (owner) / 멤버 초대(소유자):** paste the joiner's **identity code**
+  (from their "Get my join code", §2b) + a `name` → **Create invite** → shows the
+  **invite code** to **Copy** and send back to the joiner. Only on a mesh you own (it
+  holds the master key); for non-owned meshes this section is hidden/disabled. This
+  is step 2 of the §2b exchange. / 합류자의 **identity code**(그쪽 "Get my join code", §2b)
+  + `name` 붙여넣기 → **Create invite** → 복사할 **invite code** 표시 → 합류자에게 회신.
+  소유 메쉬(master 키)에서만; 그 외엔 숨김/비활성. §2b 교환의 2단계.
 
 **Daemon connection / 데몬 연결.**
 - Load → `MeshInfo { mesh }` → `Mesh(MeshDetail{id,name,epoch,me,exit,invite,trigger,
   max_members,cipher,members[]})`.
 - set exit → `SetExit { mesh, exit: <id|null> }`.
-- admit → `AdmitMember { mesh, name, pubkey_hex }`.
+- create invite → decode the pasted identity code → `CreateInvite { mesh, name,
+  member_pubkey_hex, enc_pubkey_hex }` → `Invite(InviteBlob)` → front-end base64-encodes
+  the blob into the **invite code**.
 - make egress → `SetCurrent { mesh }`. wipe → `RemoveMesh { mesh }`.
 
-**States & errors / 상태·오류.** `set exit` to a non-member, `admit` with a non-hex
-key, or `make egress` without an exit → meshd `Error` shown as a toast. After
-**wipe**, return to User mode. / 비멤버 exit 설정, 비-hex 키 admit, exit 없이 make
-egress → meshd `Error` 토스트. **wipe** 후 User 모드 복귀.
+**States & errors / 상태·오류.** `set exit` to a non-member, an invalid identity code,
+a full/duplicate-member invite, or `make egress` without an exit → meshd/decode
+`Error` shown as a toast. After **wipe**, return to User mode. / 비멤버 exit, 잘못된
+identity code, 가득 찼거나 중복 멤버 초대, exit 없이 make egress → 오류 토스트. **wipe** 후
+User 모드 복귀.
 
 **Status:** ✅
 
