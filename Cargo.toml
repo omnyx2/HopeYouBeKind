@@ -33,10 +33,12 @@ exclude = ["gui", "gui-admin", "fuzz"]
 version = "0.7.0"
 edition = "2021"
 rust-version = "1.79"
-license = "MIT"
-authors = ["Lattice contributors"]
-repository = "https://github.com/your-org/lattice"
-homepage = "https://github.com/your-org/lattice"
+# Source-available & noncommercial. Commercial use OR academic publication →
+# contact omnyx2@gmail.com (see LICENSE). The SPDX LicenseRef points at that file.
+license = "LicenseRef-Lattice-Noncommercial"
+authors = ["omnyx2 <omnyx2@gmail.com>"]
+repository = "https://github.com/omnyx2/HopeYouBeKind"
+homepage = "https://github.com/omnyx2/HopeYouBeKind"
 description = "A serverless mesh VPN that fuses every installed node into one overlay SDN."
 keywords = ["vpn", "mesh", "overlay", "sdn", "p2p"]
 categories = ["network-programming"]

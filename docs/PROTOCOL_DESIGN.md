@@ -187,7 +187,7 @@
 | ✅ **P-C4 live-paired 자폭** | meshd 워치독: established mesh가 grace(180s) 동안 live < ⌈0.6N⌉ → secret zeroize + mesh 폐기. 형성중 mesh는 면제, `MESHD_NO_SELF_DESTRUCT=1`로 끔. **v1=협력적 wipe**; 진짜 never-hold-secret **Shamir threshold 공유 = P-C4b**. *(commit 6149459)* | keydist + share 분배 |
 | ✅ **P-C5 헤더 순열** | `crypto::Scramble`(per-mesh, secret 유도): seq 8B XOR 마스킹 + 21B sealed_header를 body 내 **per-frame 오프셋**(`Blake2s(secret,seq)%(body_len+1)`)에 삽입. 고정 위치 상수 0 → 지문화 불가. *(commit cfdf74d, §6)* | wire_v2 |
 | ✅ **P-C6 초대코드 + 알고리즘 비공개** | 신원코드 issued_at TTL(600s) + InviteBlob를 `invitewrap`(algo+salt+n 키)로 래핑 → WrappedInvite{salt,n,ct}. **algo는 와이어에 없음 → 대역외로 알아야 풀림**(틀리면 실패). 내부엔 x25519-sealed secret(진짜 보안). seed_a/seed_b 래칫 교환은 follow-on. *(commit 0396e84, §2)* | 가입 플로우 재작업 |
-| **P-C7 공격 대응** | 3-strike 잠금/경보, one-veto 자폭, 생성자 override. | P-C6 |
+| ✅ **P-C7 공격 대응 (v1)** | IPC `ReportAttack`(any member, =veto) → CTRL_ATTACK 경보 브로드캐스트 + grace(30s) 무장 → 미해제 시 전원 자폭(fail-deadly). `AllClear`(생성자만) → CTRL_ALLCLEAR로 취소. LoopCmd/LoopEvent 채널 일반화. **자동 3-strike(§2 B→A 핸드셰이크 결합)는 P-C7b.** *(commit debea0a, §7)* | P-C6 |
 
 권장 시작 = **P-C1** (가장 작고, 이미 절반 구현됐고, 연구 cipher의 집).
 

@@ -100,6 +100,12 @@ then the per-feature guides indexed in **[`docs/README.md`](docs/README.md)**:
 
 ## License
 
-MIT — see [`LICENSE-MIT`](LICENSE-MIT). Uses the WireGuard-style Noise protocol
-design via the MIT-licensed `snow` crate; "WireGuard" is a trademark of Jason A.
-Donenfeld and this project is not affiliated with or endorsed by it.
+**Source-available, noncommercial** — see [`LICENSE`](LICENSE). Free for personal
+and research use. Two things require contacting the author (**omnyx2@gmail.com**)
+first: **commercial use** (needs a separate license) and **publishing an academic
+paper** based on this software (needs permission; the author must be credited if
+requested).
+
+Uses the WireGuard-style Noise protocol design via the MIT-licensed `snow` crate;
+"WireGuard" is a trademark of Jason A. Donenfeld and this project is not affiliated
+with or endorsed by it.

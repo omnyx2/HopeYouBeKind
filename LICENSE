@@ -1,0 +1,65 @@
+Lattice License — Source-Available, Noncommercial
+Copyright (c) 2026 omnyx2 <omnyx2@gmail.com>
+
+This software is source-available. You may use it freely for noncommercial and
+research purposes under the terms below. Two things require contacting the author
+(omnyx2@gmail.com): (1) any commercial use, and (2) publishing an academic paper
+or other scholarly work based on this software.
+
+1. Definitions
+   "Software" means the contents of this repository (source code, documentation,
+   and accompanying files) and any portion of it.
+   "Noncommercial use" means use for personal, research, academic, educational, or
+   evaluation purposes by an individual, a nonprofit organization, or an academic
+   institution, where the use is not primarily intended for or directed toward
+   commercial advantage or monetary compensation.
+   "Commercial use" means any use that is not Noncommercial use — including use in
+   or for a product or service that is sold, licensed, hosted for a fee, used to
+   generate revenue, or used in the operations of a for-profit entity.
+
+2. Grant for Noncommercial Use
+   Subject to these terms, you are granted a worldwide, royalty-free, non-exclusive
+   license to use, copy, modify, and distribute the Software, and to create and
+   distribute derivative works, for Noncommercial use only — provided that you:
+   (a) retain this LICENSE file and the above copyright notice in all copies and
+       substantial portions of the Software; and
+   (b) distribute any derivative works under these same terms.
+
+3. Commercial Use
+   Commercial use of the Software is NOT permitted under this license. To use the
+   Software for any commercial purpose, you must obtain a separate commercial
+   license. Contact: omnyx2@gmail.com.
+
+4. Research and Academic Publication
+   Research use is permitted as Noncommercial use under Section 2. However, BEFORE
+   publishing any academic paper, thesis, preprint, or other scholarly work that is
+   based on, evaluates, or substantially uses the Software, you must contact the
+   author (omnyx2@gmail.com) and obtain the author's permission. If the author
+   requests it, the author (omnyx2) must be credited as an author of, or otherwise
+   named in, that publication.
+
+5. Third-Party Components
+   The Software depends on third-party libraries distributed under their own
+   licenses (e.g. the MIT-licensed `snow` crate). Those components remain governed
+   by their respective licenses; this LICENSE applies only to the Lattice code.
+
+6. No Trademark or Patent Grant
+   This license does not grant any rights to use the names, logos, or trademarks of
+   the author, and grants no patent rights.
+
+7. Disclaimer of Warranty
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+   FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+8. Limitation of Liability
+   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+   OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+9. Termination
+   Any use of the Software outside the scope of this license (including any
+   Commercial use without a separate commercial license, or academic publication
+   without the author's permission) automatically terminates the rights granted
+   here.
