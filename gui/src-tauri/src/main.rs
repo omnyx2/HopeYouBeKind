@@ -9,8 +9,12 @@
     windows_subsystem = "windows"
 )]
 
-/// Where the v2 mesh control-plane daemon (`meshd`) listens.
+/// Where the v2 mesh control-plane daemon (`meshd`) listens: a unix domain socket
+/// on macOS/Linux, a named pipe on Windows.
+#[cfg(unix)]
 const MESHD_SOCKET: &str = "/tmp/lattice-meshd.sock";
+#[cfg(windows)]
+const MESHD_SOCKET: &str = r"\\.\pipe\lattice-meshd";
 
 /// Proxy one newline-JSON request to `meshd` and hand back its response line.
 /// Browsers/JS can't open a unix socket, so this thin bridge is the GUI's only
@@ -46,10 +50,38 @@ async fn meshd(request: String) -> Result<String, String> {
     .map_err(|e| format!("meshd bridge task failed: {e}"))?
 }
 
-#[cfg(not(unix))]
+/// Windows: a named pipe client is just the pipe path opened as a file. Same
+/// newline-JSON protocol; run on a blocking thread so the UI never stalls.
+#[cfg(windows)]
+#[tauri::command]
+async fn meshd(request: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        use std::fs::OpenOptions;
+        use std::io::{BufRead, BufReader, Write};
+        let pipe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(MESHD_SOCKET)
+            .map_err(|e| format!("meshd not running ({MESHD_SOCKET}): {e}"))?;
+        let mut line = request;
+        line.push('\n');
+        (&pipe)
+            .write_all(line.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let mut resp = String::new();
+        BufReader::new(&pipe)
+            .read_line(&mut resp)
+            .map_err(|e| e.to_string())?;
+        Ok(resp.trim_end().to_string())
+    })
+    .await
+    .map_err(|e| format!("meshd bridge task failed: {e}"))?
+}
+
+#[cfg(not(any(unix, windows)))]
 #[tauri::command]
 fn meshd(_request: String) -> Result<String, String> {
-    Err("meshd is available on macOS/Linux".into())
+    Err("meshd is available on macOS/Linux/Windows".into())
 }
 
 fn main() {
@@ -72,7 +104,11 @@ fn ensure_meshd(app: &tauri::App) {
     if meshd_running() {
         return;
     }
-    let meshd = match app.path_resolver().resolve_resource("resources/meshd") {
+    #[cfg(windows)]
+    let resource = "resources/meshd.exe";
+    #[cfg(not(windows))]
+    let resource = "resources/meshd";
+    let meshd = match app.path_resolver().resolve_resource(resource) {
         Some(p) if p.exists() => p.to_string_lossy().to_string(),
         _ => {
             eprintln!("Lattice: bundled meshd not found (dev build?) — start meshd manually");
@@ -88,7 +124,15 @@ fn ensure_meshd(app: &tauri::App) {
 fn meshd_running() -> bool {
     std::os::unix::net::UnixStream::connect(MESHD_SOCKET).is_ok()
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn meshd_running() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(MESHD_SOCKET)
+        .is_ok()
+}
+#[cfg(not(any(unix, windows)))]
 fn meshd_running() -> bool {
     false
 }

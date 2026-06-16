@@ -37,20 +37,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.79.0
       - uses: Swatinem/rust-cache@v2
-      - name: build + test (unix — full workspace)
-        if: runner.os != 'Windows'
+      - name: build + test (full workspace, all platforms)
         run: |
           cargo build --workspace --all-targets
           cargo test --workspace
-      - name: build + test (windows — meshd excluded)
-        if: runner.os == 'Windows'
-        run: |
-          cargo build --workspace --all-targets --exclude lattice-meshd
-          cargo test --workspace --exclude lattice-meshd
 
-  # The Tauri desktop app (auto-launches the bundled meshd via a native auth dialog).
-  # Built + bundled on macOS/Linux with stable (the webview deps need a newer edition
-  # than the workspace MSRV); the Windows app crate is compiled to verify it builds.
+  # The Tauri desktop app (auto-launches the bundled meshd via a native auth dialog),
+  # built + bundled on all three platforms with stable (the webview deps need a newer
+  # edition than the workspace MSRV).
   desktop:
     name: desktop app (${{ matrix.os }})
     needs: lint
@@ -80,20 +74,22 @@ jobs:
         working-directory: gui
         run: npm ci || npm install
 
-      # unix: build the bundled meshd, stage it, and bundle the full desktop app.
-      # The resources dir holds only build artifacts (gitignored), so create it.
-      - name: Build + stage meshd (unix)
-        if: runner.os != 'Windows'
+      # Build the bundled meshd and stage it under the platform binary name (the
+      # resources dir holds only build artifacts — gitignored — so create it).
+      - name: Build + stage meshd
+        shell: bash
         run: |
           cargo build --release -p lattice-meshd
           mkdir -p gui/src-tauri/resources
-          cp target/release/meshd gui/src-tauri/resources/meshd
-      - name: Bundle desktop app (unix)
-        if: runner.os != 'Windows'
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/meshd.exe gui/src-tauri/resources/meshd.exe
+          else
+            cp target/release/meshd gui/src-tauri/resources/meshd
+          fi
+      - name: Bundle desktop app
         working-directory: gui
         run: npm run tauri build
-      - name: Upload bundle (unix)
-        if: runner.os != 'Windows'
+      - name: Upload bundle
         uses: actions/upload-artifact@v4
         with:
           name: lattice-${{ matrix.os }}
@@ -101,13 +97,9 @@ jobs:
             gui/src-tauri/target/release/bundle/**/*.dmg
             gui/src-tauri/target/release/bundle/**/*.AppImage
             gui/src-tauri/target/release/bundle/**/*.deb
+            gui/src-tauri/target/release/bundle/**/*.msi
+            gui/src-tauri/target/release/bundle/**/*-setup.exe
           if-no-files-found: ignore
-
-      # windows: meshd isn't bundled yet, so just verify the GUI crate compiles.
-      # gui/ is excluded from the workspace, so build it via its own manifest.
-      - name: Build GUI crate (windows)
-        if: runner.os == 'Windows'
-        run: cargo build --release --manifest-path gui/src-tauri/Cargo.toml
 
   deny:
     name: licenses + advisories

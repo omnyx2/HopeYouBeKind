@@ -30,13 +30,17 @@ use lattice_net::udp::UdpTransport;
 use lattice_proto::wire_v2::{MemberId, MeshId};
 use lattice_proto::VirtualIp;
 use lattice_tun::{open as tun_open, TunConfig};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 #[allow(dead_code)] // ported from v1: some restore/disable paths aren't wired yet.
 mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1.
 
+/// Where meshd listens for the GUI/CLI. A unix domain socket on macOS/Linux; a
+/// named pipe on Windows — same newline-JSON protocol either way.
+#[cfg(unix)]
 const DEFAULT_SOCKET: &str = "/tmp/lattice-meshd.sock";
+#[cfg(windows)]
+const DEFAULT_SOCKET: &str = r"\\.\pipe\lattice-meshd";
 /// Public resolver used for full-tunnel DNS (routed through the exit).
 const FULL_TUNNEL_DNS: &str = "1.1.1.1";
 /// A member is "live" if heard from within this window.
@@ -144,9 +148,6 @@ async fn main() -> anyhow::Result<()> {
     let socket = std::env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_SOCKET.to_string());
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
-    eprintln!("meshd: listening on {socket}");
 
     let state = Arc::new(Mutex::new(State::default()));
     let data_plane = matches!(std::env::var("DATA_PLANE").as_deref(), Ok("1"));
@@ -159,47 +160,76 @@ async fn main() -> anyhow::Result<()> {
             "off"
         }
     );
+    eprintln!("meshd: listening on {socket}");
+    accept_loop(&socket, state).await
+}
+
+/// Accept IPC connections forever. The transport is platform-specific (unix socket
+/// vs named pipe) but the per-connection protocol ([`serve_conn`]) is shared.
+#[cfg(unix)]
+async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(socket);
+    let listener = tokio::net::UnixListener::bind(socket)?;
     loop {
         let (stream, _) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let (rd, mut wr) = stream.into_split();
-            let mut lines = BufReader::new(rd).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let resp = match serde_json::from_str::<Request>(&line) {
-                    Ok(req) => {
-                        // Handle under the lock; do any async data-plane bringup AFTER
-                        // releasing it (TUN/UDP open is async and must not block IPC).
-                        let (resp, action) = {
-                            let mut st = state.lock().unwrap();
-                            handle(req, &mut st)
-                        };
-                        match action {
-                            Some(PostAction::Bringup(b)) => {
-                                bringup_dataplane(b, Arc::clone(&state)).await
-                            }
-                            Some(PostAction::ArmKillSwitch(mesh)) => {
-                                arm_kill_switch(mesh, Arc::clone(&state))
-                            }
-                            None => {}
-                        }
-                        resp
-                    }
-                    Err(e) => Response::Error {
-                        message: format!("bad request: {e}"),
-                    },
+        tokio::spawn(serve_conn(stream, Arc::clone(&state)));
+    }
+}
+
+#[cfg(windows)]
+async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    // Named pipes are connection-instanced: create an instance, wait for a client,
+    // hand it off, then create the next instance for the following client.
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(pipe)?;
+    loop {
+        server.connect().await?;
+        let connected = server;
+        server = ServerOptions::new().create(pipe)?;
+        tokio::spawn(serve_conn(connected, Arc::clone(&state)));
+    }
+}
+
+/// One IPC connection: newline-JSON [`Request`] in, [`Response`] out, until close.
+async fn serve_conn<S>(stream: S, state: Arc<Mutex<State>>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let resp = match serde_json::from_str::<Request>(&line) {
+            Ok(req) => {
+                // Handle under the lock; do any async data-plane bringup AFTER
+                // releasing it (TUN/UDP open is async and must not block IPC).
+                let (resp, action) = {
+                    let mut st = state.lock().unwrap();
+                    handle(req, &mut st)
                 };
-                let mut out = serde_json::to_string(&resp)
-                    .unwrap_or_else(|_| "{\"Error\":{\"message\":\"encode failed\"}}".to_string());
-                out.push('\n');
-                if wr.write_all(out.as_bytes()).await.is_err() {
-                    break;
+                match action {
+                    Some(PostAction::Bringup(b)) => bringup_dataplane(b, Arc::clone(&state)).await,
+                    Some(PostAction::ArmKillSwitch(mesh)) => {
+                        arm_kill_switch(mesh, Arc::clone(&state))
+                    }
+                    None => {}
                 }
+                resp
             }
-        });
+            Err(e) => Response::Error {
+                message: format!("bad request: {e}"),
+            },
+        };
+        let mut out = serde_json::to_string(&resp)
+            .unwrap_or_else(|_| "{\"Error\":{\"message\":\"encode failed\"}}".to_string());
+        out.push('\n');
+        if wr.write_all(out.as_bytes()).await.is_err() {
+            break;
+        }
     }
 }
 
