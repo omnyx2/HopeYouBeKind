@@ -273,6 +273,8 @@ async function renderOverview(id) {
   const exitOpts = [`<option value="">— none —</option>`].concat(
     d.members.map((mb) => `<option value="${mb.id}" ${d.exit === mb.id ? "selected" : ""}>#${mb.id} ${esc(mb.name)}</option>`)
   ).join("");
+  const peerOpts = d.members.filter((mb) => !mb.is_me)
+    .map((mb) => `<option value="${mb.id}">#${mb.id} ${esc(mb.name)}</option>`).join("");
   el("mesh-detail").innerHTML = `
     <div class="card-head">
       <h2 class="card-title">⬢ ${esc(d.name)} <span class="muted small">#${d.id}</span></h2>
@@ -291,6 +293,15 @@ async function renderOverview(id) {
     <div class="add-row">
       <select id="ov-exit" class="select">${exitOpts}</select>
       <button class="small-btn" id="ov-exit-set">set exit</button>
+    </div>
+    <h3 class="topo-h">Peer address <span class="muted small">(manual — until auto-discovery)</span></h3>
+    <p class="muted small">Tell this node where to reach a member, so traffic can flow.
+      For the public Oracle exit: <code>203.0.113.10:41000</code>. A node learns the
+      rest once a peer has spoken.</p>
+    <div class="add-row">
+      <select id="ov-peer-id" class="select">${peerOpts}</select>
+      <input id="ov-peer-ep" placeholder="ip:port — e.g. 203.0.113.10:41000" />
+      <button class="small-btn" id="ov-peer-set">set address</button>
     </div>
     <h3 class="topo-h">Invite a member</h3>
     <p class="muted small">Paste the joiner's <b>join code</b> + a name → get an
@@ -317,6 +328,13 @@ async function renderOverview(id) {
     const v = el("ov-exit").value;
     try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("exit set"); } catch (e) { toast(String(e)); }
     refreshMode();
+  };
+  el("ov-peer-set").onclick = async () => {
+    const m = parseInt(el("ov-peer-id").value, 10);
+    const ep = el("ov-peer-ep").value.trim();
+    if (!ep || !/^.+:\d+$/.test(ep)) return toast("enter ip:port");
+    try { await meshd({ SetPeer: { mesh: id, member: m, endpoint: ep } }); toast("peer address set"); } catch (e) { toast(String(e)); }
+    el("ov-peer-ep").value = "";
   };
   el("ov-invite").onclick = async () => {
     const name = el("ov-inv-name").value.trim();
