@@ -73,8 +73,13 @@
                 <input id="mesh-name" placeholder="mesh name — e.g. home" />
                 <input id="mesh-myname" placeholder="your name in it — e.g. alice" />
                 <input id="mesh-max" type="number" min="1" max="254" placeholder="max 254" style="max-width:90px" />
+                <select id="mesh-cipher" title="data-plane cipher — fixed at creation"></select>
                 <button id="mesh-create" class="secondary">Create</button>
               </div>
+              <p id="mesh-cipher-warn" class="muted small hidden" style="margin:8px 0 0;color:#e0a020">
+                ⚠ Experimental research cipher. The cipher is <b>permanent</b> — changing it later
+                needs ≥60% of nodes online. Pick the default unless you're testing the time-window cipher.
+              </p>
             </div>
 
             <div class="card">

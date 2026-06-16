@@ -251,8 +251,9 @@ el("mesh-create").addEventListener("click", async () => {
   const max = maxRaw === "" ? 254 : parseInt(maxRaw, 10);
   if (!name) return toast("mesh name required");
   if (Number.isNaN(max) || max < 1 || max > 254) return toast("max must be 1–254");
+  const cipher = el("mesh-cipher").value || null;
   try {
-    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max } });
+    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher } });
     el("mesh-name").value = "";
     el("mesh-myname").value = "";
     toast(`mesh created (#${r.MeshCreated.mesh})`);
@@ -392,6 +393,29 @@ el("tb-egress").addEventListener("change", async (e) => {
   CURRENT_MESH = v === "origin" ? null : parseInt(v, 10);
   refreshMode();
 });
+
+// ---- Cipher dropbox (P-C1): the data-plane cipher, fixed at mesh creation ----
+let CIPHER_DEFAULT = "chachapoly-epoch";
+function updateCipherWarn() {
+  const sel = el("mesh-cipher"), warn = el("mesh-cipher-warn");
+  if (!sel || !warn) return;
+  // Warn whenever a non-default (experimental/permanent) cipher is chosen.
+  warn.classList.toggle("hidden", sel.value === CIPHER_DEFAULT);
+}
+async function populateCiphers() {
+  const sel = el("mesh-cipher");
+  if (!sel) return;
+  let list = [];
+  try { list = (await meshd("Ciphers")).Ciphers || []; } catch (_) { return; }
+  if (!list.length) return;
+  CIPHER_DEFAULT = list[0]; // meshd lists the default first
+  sel.innerHTML = list
+    .map((c, i) => `<option value="${esc(c)}"${i === 0 ? " selected" : ""}>${esc(c)}${i === 0 ? " (default)" : ""}</option>`)
+    .join("");
+  updateCipherWarn();
+}
+el("mesh-cipher").addEventListener("change", updateCipherWarn);
+populateCiphers();
 
 setMode("user");
 setInterval(refreshTopbar, 3000);
