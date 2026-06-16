@@ -93,12 +93,17 @@ G-3's banner + G-4's health need state the GUI can't see today. Add to `MeshDeta
 
 ---
 
-## 4. Build order / 단계
-1. **G-0 IPC status** — add the §3 fields to `MeshDetail` + `mesh_detail`. (unblocks G-3/G-4)
-2. **G-1 Re-cipher** — Overview Security card + confirm + `Recipher`.
-3. **G-2 Invite algorithm** — algo selects on invite + join + the "tell them the algorithm" UX.
-4. **G-3 Attack response** — danger-zone report + global armed banner + creator all-clear.
-5. **G-4 Health surface** — cipher/epoch/live-threshold pill (uses G-0).
+## 4. Build order / 단계  — ✅ ALL SHIPPED (commit 1adc8d7)
+1. ✅ **G-0 IPC status** — `MeshDetail` + `MeshSummary` gained live/threshold/
+   attack_armed_secs_left/is_creator.
+2. ✅ **G-1 Re-cipher** — Overview Security card (cipher select + Re-cipher + confirm).
+3. ✅ **G-2 Invite algorithm** — algo `<select>` on invite + join + the "tell them" UX.
+4. ✅ **G-3 Attack response** — Danger-zone report (type-name confirm) + global armed
+   banner polling ListMeshes + creator all-clear.
+5. ✅ **G-4 Health surface** — cipher/epoch + live N/total · floor T + ARMED badge.
+
+IPC backing live-verified via the CLI harness. GUI visual ships in the production
+bundle. / IPC 백킹 CLI 검증 완료, GUI 시각은 프로덕션 빌드로.
 
 Then: implement (per phase, `node --check` + verify via the CLI IPC harness), and a 2-node
 **live test** (re-cipher rotates both; an attack report on one arms the other; creator all-clear
