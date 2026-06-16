@@ -487,6 +487,30 @@ async function refreshAttackBanner() {
 }
 setInterval(refreshAttackBanner, 3000);
 
+// ---- Update check (Feature 1): on launch, ask GitHub Releases for a newer build.
+// If one exists, show a banner. "Update" backs up mesh state (Feature 2) then opens
+// the download page so the user reinstalls; the new meshd re-imports the backup.
+async function checkForUpdate() {
+  if (!window.__TAURI__) return;
+  let info;
+  try { info = await invoke("check_update"); } catch { return; } // offline / rate-limited
+  if (!info || !info.available) return;
+  const banner = el("update-banner");
+  el("update-banner-text").textContent =
+    `New version ${info.latest} available (you have ${info.current}).`;
+  banner.classList.remove("hidden");
+  el("update-dismiss").onclick = () => banner.classList.add("hidden");
+  el("update-now").onclick = async () => {
+    el("update-now").disabled = true;
+    // Back up every mesh so a reinstall (even one that wipes state) can't drop us.
+    try { await meshd({ ExportState: { path: null } }); } catch (e) { /* best-effort */ }
+    try { await invoke("open_url", { url: info.url }); }
+    catch (e) { toast("could not open the download page: " + e); }
+    toast("Mesh state backed up. Install the new version, then reopen Lattice.");
+  };
+}
+checkForUpdate();
+
 setMode("user");
 setInterval(refreshTopbar, 3000);
 // Live poll: keep the Peers/Topology connection state fresh while viewing them.

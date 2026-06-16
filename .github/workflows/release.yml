@@ -1,55 +1,73 @@
 name: Release
 
-# Tag-driven: push a tag like v0.2.0 to cut a release.
+# Tag-driven: push a tag like v0.2.0 to cut a desktop release. The Update banner in
+# the app reads the latest release's tag_name and compares it to the running version,
+# so tags MUST be plain semver (`vMAJOR.MINOR.PATCH`).
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: build ${{ matrix.target }}
+  # Build + bundle the Tauri desktop app (with the meshd sidecar) on each platform,
+  # exactly like the CI `desktop` job, then attach the installers to the release.
+  desktop:
+    name: desktop ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+        os: [ubuntu-22.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.79.0
-        with:
-          targets: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} -p lattice-daemon -p lattice-cli
-      - name: Package
+      - name: Linux WebKitGTK deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.0-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Front-end deps
+        working-directory: gui
+        run: npm ci || npm install
+      - name: Build + stage meshd sidecar
         shell: bash
         run: |
-          mkdir -p dist
-          bin_dir="target/${{ matrix.target }}/release"
-          ext=""
-          [[ "${{ matrix.os }}" == "windows-latest" ]] && ext=".exe"
-          for b in lattice-daemon lattice-cli; do
-            cp "$bin_dir/$b$ext" "dist/" || true
-          done
-          tar -czf "lattice-${{ matrix.target }}.tar.gz" -C dist .
+          cargo build --release -p lattice-meshd
+          mkdir -p gui/src-tauri/resources
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/meshd.exe gui/src-tauri/resources/meshd.exe
+          else
+            cp target/release/meshd gui/src-tauri/resources/meshd
+          fi
+      - name: Bundle desktop app
+        working-directory: gui
+        run: npm run tauri build
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p out
+          cd gui/src-tauri/target/release/bundle
+          find . -type f \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \
+            -o -name '*.msi' -o -name '*-setup.exe' \) -exec cp {} "$GITHUB_WORKSPACE/out/" \;
       - uses: actions/upload-artifact@v4
         with:
-          name: lattice-${{ matrix.target }}
-          path: lattice-${{ matrix.target }}.tar.gz
+          name: lattice-${{ matrix.os }}
+          path: out/*
+          if-no-files-found: ignore
 
-  release:
-    needs: build
+  publish:
+    name: publish release
+    needs: desktop
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -58,5 +76,6 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.tar.gz
+          files: artifacts/**/*
           generate_release_notes: true
+          fail_on_unmatched_files: false

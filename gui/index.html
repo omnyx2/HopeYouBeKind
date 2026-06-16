@@ -26,6 +26,14 @@
       </div>
 
       <!-- P-C7 attack alert banner (G-3): shown while a mesh is armed for self-destruct. -->
+      <div id="update-banner" class="hidden" style="background:#10406a;color:#fff;padding:10px 16px;font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:12px">
+        <span id="update-banner-text">A new version of Lattice is available.</span>
+        <span style="display:flex;gap:8px">
+          <button id="update-now" class="small-btn">Update</button>
+          <button id="update-dismiss" class="small-btn" style="opacity:.8">Later</button>
+        </span>
+      </div>
+
       <div id="attack-banner" class="hidden" style="background:#7a1020;color:#fff;padding:10px 16px;font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:12px">
         <span id="attack-banner-text">⚠ ATTACK ALERT</span>
         <button id="attack-allclear" class="hidden small-btn">All clear</button>

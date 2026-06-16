@@ -84,13 +84,83 @@ fn meshd(_request: String) -> Result<String, String> {
     Err("meshd is available on macOS/Linux/Windows".into())
 }
 
+/// The repo whose GitHub Releases hold the desktop installers.
+const RELEASES_REPO: &str = "omnyx2/HopeYouBeKind";
+
+/// Is dotted version `a` strictly newer than `b`? Compares numeric components
+/// (`1.2.0` vs `1.10.0`); a non-numeric or missing component sorts as 0.
+fn version_gt(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.trim_start_matches('v')
+            .split(['.', '-', '+'])
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    let (va, vb) = (parse(a), parse(b));
+    for i in 0..va.len().max(vb.len()) {
+        let (x, y) = (va.get(i).copied().unwrap_or(0), vb.get(i).copied().unwrap_or(0));
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+/// Check GitHub Releases for a newer desktop build. Done here in Rust (off the
+/// webview) so the CSP/allowlist stays locked down. Returns the current + latest
+/// versions, whether an update is available, and the release page URL.
+#[tauri::command]
+fn check_update(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let current = app.package_info().version.to_string();
+    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest");
+    let body: serde_json::Value = ureq::get(&url)
+        .set("User-Agent", "Lattice-Updater")
+        .set("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(8))
+        .call()
+        .map_err(|e| format!("update check failed: {e}"))?
+        .into_json()
+        .map_err(|e| e.to_string())?;
+    let latest = body["tag_name"].as_str().unwrap_or("").trim_start_matches('v');
+    let page = body["html_url"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://github.com/{RELEASES_REPO}/releases/latest"));
+    Ok(serde_json::json!({
+        "current": current,
+        "latest": latest,
+        "available": !latest.is_empty() && version_gt(latest, &current),
+        "url": page,
+    }))
+}
+
+/// Open a URL in the user's default browser (the release/download page). Uses the OS
+/// opener directly so it works regardless of the locked-down Tauri shell scope.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("refusing to open a non-http(s) URL".into());
+    }
+    #[cfg(target_os = "macos")]
+    let (cmd, args) = ("open", vec![url.as_str()]);
+    #[cfg(target_os = "windows")]
+    let (cmd, args) = ("cmd", vec!["/C", "start", "", url.as_str()]);
+    #[cfg(target_os = "linux")]
+    let (cmd, args) = ("xdg-open", vec![url.as_str()]);
+    std::process::Command::new(cmd)
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
             ensure_meshd(app);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![meshd])
+        .invoke_handler(tauri::generate_handler![meshd, check_update, open_url])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");
 }
