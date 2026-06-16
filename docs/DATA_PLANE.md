@@ -9,6 +9,33 @@
 > 역방향. 지금까지 만든 조각이 여기서 합쳐진다. 코드 전에 이 문서를 먼저 고친다. 크므로
 > **단계화**(§9).
 
+## Status — LIVE / 현황 — 라이브 (2026-06)
+
+P1–P6 are **built and live-verified** Mac ↔ Oracle over the real internet: an SSH
+session runs over the overlay, and a Mac full-tunnels its internet through the
+Oracle exit (egress IP becomes Oracle's Japan IP). The data plane is
+`lattice_meshrun::run` — one async loop per mesh tying a real TUN, a UDP transport,
+and the mesh's `MeshDataPlane` (seal/open). meshd spawns one loop per mesh when
+`DATA_PLANE=1`. Two field-proven details beyond the original design:
+
+- **Endpoint learning.** A node learns a peer's endpoint from the **`src` of each
+  inbound frame** (`PeerLinks`: member → endpoint + last-seen), so replies route
+  back and the exit can answer a NAT'd client it was never told about. Only the
+  first hop needs seeding (`SetPeer`).
+- **Conservative MTU 1280.** The TUN MTU is set to **1280** (Tailscale's value) on
+  both macOS (`ifconfig … mtu`) and Linux (`ip link set … mtu`) so a full-size
+  sealed datagram never needs IP fragmentation on a reduced-PMTU underlay (campus
+  firewalls drop fragments → large packets like a TLS/SSH handshake silently die).
+
+/ P1–P6 **구현 + 라이브 검증 완료**(Mac ↔ Oracle, 실제 인터넷): overlay로 SSH 세션이
+돌고, Mac이 Oracle exit로 풀터널(출구 IP가 Oracle 일본 IP로 바뀜). 데이터 플레인은
+`lattice_meshrun::run` — 메쉬마다 TUN+UDP+`MeshDataPlane`를 묶는 async 루프 하나, meshd가
+`DATA_PLANE=1`이면 메쉬별로 spawn. 설계 대비 현장에서 굳어진 두 가지: **(1) 엔드포인트
+학습** — 들어온 프레임의 `src`로 피어 주소를 학습(`PeerLinks`: 멤버→주소+last-seen)해
+회신 경로 확보(첫 홉만 `SetPeer`로 시드). **(2) 보수적 MTU 1280** — 양 플랫폼에서 TUN
+MTU를 1280으로 설정해 sealed 데이터그램이 PMTU 작은 언더레이에서 IP 단편화를 안 하게
+(캠퍼스 방화벽이 fragment를 버려 큰 패킷이 조용히 죽는 문제 회피).
+
 ## 0. Goal / 목표
 
 A computer's normal apps use the network unchanged; a TUN captures the traffic the
@@ -193,8 +220,17 @@ overlay-IP ↔ member mapping, the X25519 key-seal at join, the meshd data-plane
    pattern).
 6. **P6 — meshd integration + GUI:** data plane in meshd; expose per-mesh
    connection/endpoint state over IPC → **Peers + Topology pages go live**.
+
+**All phases DONE / LIVE.** P1–P5 verified in-sandbox (MemoryTun/MemoryTransport)
+and then live (Mac↔Oracle UDP); P6 = meshd spawns a real per-mesh loop and the
+`MemberView` carries `endpoint` + `state` (me|live|idle|unknown) so Peers/Topology
+render live. The membership **join flow** (P3 key-seal) shipped — see
+[MEMBERSHIP.md](MEMBERSHIP.md); the exit + kill-switch (P4) — see
+[EXIT_NODE.md](EXIT_NODE.md).
 / P1 루프백 → P2 두 노드 in-mesh ping → P3 키 배포 → P4 exit → P5 릴레이 → P6 meshd 통합 +
-GUI(Peers/Topology 라이브).
+GUI(Peers/Topology 라이브). **전 단계 완료/라이브.** P1–P5는 샌드박스+라이브 검증, P6는
+meshd가 메쉬별 실루프를 spawn하고 `MemberView`가 `endpoint`+`state`를 실어 GUI가 라이브
+렌더. 가입 플로우(P3 키 봉인)는 [MEMBERSHIP.md], exit+kill-switch(P4)는 [EXIT_NODE.md].
 
 ## 10. Open decisions / 열린 결정
 
@@ -208,15 +244,23 @@ GUI(Peers/Topology 라이브).
   5-byte header**; it **is** the AEAD nonce (wrong seq → auth fail), and the 5-byte
   header is the AEAD `aad`. Frame = `header(5) ‖ seq(8) ‖ ciphertext`. [§5/§6]
 
+**Resolved since:**
+- **[§5] X25519 key-seal** — DONE. The join flow seals the mesh secret to the
+  joiner's X25519 key (`keydist::seal_secret`/`EncKey::open`); members carry an
+  enc key beside their ed25519 identity. See [MEMBERSHIP.md](MEMBERSHIP.md).
+- **[§5/§6] seq/nonce** — DONE. Frame = `header(5) ‖ seq(8, BE counter = AEAD
+  nonce) ‖ ciphertext`; the 5-byte header is the AEAD `aad`.
+/ **이후 해결:** §5 X25519 키 봉인(가입 플로우, [MEMBERSHIP.md]); §5/§6 seq/nonce(프레임
+= 헤더(5)‖seq(8, AEAD nonce)‖ciphertext, 헤더는 aad).
+
 **Still open:**
-1. **[§1]** data plane in meshd vs separate privileged daemon. *(decided: meshd)*
-2. **[§5]** X25519 key-seal scheme for mesh-secret distribution at join.
-3. **[§8]** in-mesh origin auth: accept shared-key limitation vs per-frame member
-   signature.
-4. **[§8]** replay/nonce scheme (per-(epoch,member) counter + window size).
-5. **[§2]** overlay prefix sizing + the coexistence pre-flight that picks it.
-6. **[§5]** seq/nonce source in the header (the wire-v2 frame has no counter field
-   yet — add one, or carry it in the sealed body).
+1. **[§8]** in-mesh origin auth: accept shared-key limitation vs per-frame member
+   signature. *(accepted for now)*
+2. **[§8]** replay window size (the seq counter exists; the accept-window does not).
+3. **[§2]** overlay prefix sizing + the coexistence pre-flight (meshd hardcodes
+   `[100,80]` today).
+/ **남은 것:** §8 출발지 인증(현재 공유키 한계 수용), §8 재생 윈도우 크기(seq는 있고 수용
+윈도우는 없음), §2 오버레이 prefix(현재 meshd는 `[100,80]` 하드코딩).
 
 > Confirm §10.1, .3, .6 before P1 (they shape the wire/loop); the rest can follow
 > per phase. / P1 전에 §10.1·.3·.6 확정(와이어/루프에 영향), 나머지는 단계별로.

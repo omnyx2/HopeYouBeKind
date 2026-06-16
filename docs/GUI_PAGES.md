@@ -19,7 +19,13 @@
   Tauri Rust는 얇은 프록시 명령 `meshd(request)→json` 하나뿐이고 로직은 전부
   프론트+meshd에 있다. v1 데몬은 **v2 페이지에서 쓰지 않는다.**
 - **meshd requests / 요청:** `CreateMesh`, `ListMeshes`, `MeshInfo`, `AdmitMember`,
-  `SetExit`, `SetCurrent`, `RemoveMesh`, `GetPolicy`.
+  `SetExit`, `SetCurrent`, `RemoveMesh`, `GetPolicy`, **`SetPeer`** (seed a member's
+  endpoint), and the join flow **`NewIdentity` / `CreateInvite` / `JoinMesh`**
+  (MEMBERSHIP.md §A). The Tauri `meshd` proxy is **async with a 5 s timeout** on a
+  blocking thread, so a slow/unresponsive meshd can never freeze the webview.
+  / `SetPeer`(멤버 엔드포인트 시드)와 가입 플로우 `NewIdentity`/`CreateInvite`/`JoinMesh`
+  추가. Tauri `meshd` 프록시는 별도 블로킹 스레드에서 **async + 5초 타임아웃**이라 meshd가
+  느려도 웹뷰가 멈추지 않는다.
 - **Status legend / 상태 표기:** ✅ implementable now (meshd-backed) · 🔭 planned
   (needs a backend extension named in the page) · ❌ removed.
 
@@ -35,29 +41,36 @@ on every page.
 
 **Elements / 구성요소.**
 - **Status, far left / 상태(맨 왼쪽):** a colored dot + the current egress summary —
-  `egress: <mesh> · exit #<id>`, or `egress: origin` when no mesh routes traffic, or
-  `meshd offline` when the socket is unreachable. Read-only.
-  / 색 점 + 현재 egress 요약. 메쉬 라우팅이면 `egress: <mesh> · exit #<id>`, 없으면
-  `egress: origin`, 소켓 불통이면 `meshd offline`. 읽기 전용.
+  `Routing via <mesh> · exit #<id>` when a mesh routes traffic, `Using default
+  network` when none does, or `meshd offline` when the socket is unreachable.
+  Read-only.
+  / 색 점 + 현재 egress 요약. 메쉬 라우팅이면 `Routing via <mesh> · exit #<id>`, 없으면
+  `Using default network`, 소켓 불통이면 `meshd offline`. 읽기 전용.
 - **View toggle `User | Mesh` / 뷰 토글:** switches the content perspective. `User`
-  = the Meshes page (§2). `Mesh` = the opened mesh's pages (§3), the mesh chosen via
-  `manage ›`. Defaults to the first mesh if none opened yet.
-  / 콘텐츠 관점 전환. `User`=Meshes 페이지, `Mesh`=`manage ›`로 연 메쉬의 페이지들.
-  연 메쉬가 없으면 첫 메쉬로.
-- **Egress dropdown `[Origin · mesh …]` / egress 드롭다운:** picks where this
-  computer's traffic exits. `Origin` = your normal internet. Selecting a mesh routes
-  through it. **Independent of the view toggle.** The selected option mirrors the
+  = the Meshes page (§2). `Mesh` = the current mesh's pages (§3). The current mesh is
+  whatever the egress dropdown / `manage ›` selected; on **Default network** (no
+  mesh) the Mesh page is **plain** (§3) — it does **not** auto-pick a mesh.
+  / 콘텐츠 관점 전환. `User`=Meshes 페이지, `Mesh`=현재 메쉬의 페이지들. 현재 메쉬는 egress
+  드롭다운/`manage ›`가 고른 것이고, **Default network**(메쉬 없음)면 Mesh 페이지는
+  **플레인**(§3) — 첫 메쉬를 자동 선택하지 않는다.
+- **Egress dropdown `[Default network · mesh …]` / egress 드롭다운:** picks where
+  this computer's traffic exits. **`Default network`** = your normal internet (no
+  mesh). Selecting a mesh routes through it (and makes it the current mesh for the
+  Mesh view). **Independent of the view toggle.** The selected option mirrors the
   current egress.
-  / 이 컴퓨터 트래픽의 출구를 고른다. `Origin`=원래 인터넷, 메쉬 선택=그 메쉬로 라우팅.
-  **뷰 토글과 독립.** 선택값은 현재 egress를 반영.
+  / 이 컴퓨터 트래픽의 출구를 고른다. **`Default network`**=원래 인터넷(메쉬 없음), 메쉬
+  선택=그 메쉬로 라우팅(+그 메쉬가 Mesh 뷰의 현재 메쉬). **뷰 토글과 독립.** 선택값은 현재
+  egress를 반영.
 
 **Daemon connection / 데몬 연결.**
 - Refresh (poll ~3s) → `ListMeshes` → `Meshes(MeshSummary[])`; the summary with
   `is_current = true` is the egress; its `exit` fills the status text.
   / 갱신(약 3초 폴링) → `ListMeshes`. `is_current=true`인 항목이 egress이고 그 `exit`가
   상태 텍스트에 들어간다.
-- Egress dropdown change → `SetCurrent { mesh: <id|null> }` (`Origin` = `null`).
-  / egress 드롭다운 변경 → `SetCurrent { mesh: <id|null> }` (`Origin`=`null`).
+- Egress dropdown change → `SetCurrent { mesh: <id|null> }` (`Default network` =
+  `null`); the front-end also sets the current mesh to that id (or none).
+  / egress 드롭다운 변경 → `SetCurrent { mesh: <id|null> }` (`Default network`=`null`);
+  프론트는 현재 메쉬도 그 id(또는 없음)로 설정.
 - View toggle → **no daemon call** (front-end view state only).
   / 뷰 토글 → **데몬 호출 없음** (프론트 뷰 상태만).
 
@@ -84,30 +97,33 @@ User 모드의 유일한 페이지.
   jumps into the new mesh (Mesh mode, Overview).
   / 입력 `name`, `메쉬 내 내 이름`, `최대 인원(1–254, 기본 254)` + **Create**. 성공 시
   새 메쉬로 진입(Mesh 모드 Overview).
-- **Origin row / Origin 행 (top of list / 목록 맨 위):** "your computer's normal
-  internet — no mesh." Wears the `egress` badge when no mesh routes traffic. Its
-  **make egress** button returns traffic to origin.
-  / "원래 인터넷 — 메쉬 없음". 메쉬 라우팅이 없을 때 `egress` 뱃지. **make egress**로
-  원래 인터넷 복귀.
+- **Default network row / Default network 행 (top of list / 목록 맨 위):** "your
+  computer's normal internet — no mesh." Wears an **in use** badge when no mesh
+  routes traffic; its **use this** button returns traffic to the default network.
+  / "원래 인터넷 — 메쉬 없음". 메쉬 라우팅이 없을 때 **in use** 뱃지, **use this**로 원래
+  인터넷 복귀.
 - **Mesh rows / 메쉬 행:** each shows `name`, `#id`, member count, epoch, exit, and an
-  `egress` badge if it routes traffic. Two buttons: **`manage ›`** (enter Mesh mode
-  for it) and **`make egress`** (route traffic through it).
-  / 각 행: `name`, `#id`, 인원수, epoch, exit, (라우팅 중이면) `egress` 뱃지. 버튼:
-  **`manage ›`**(그 메쉬 관리로 진입), **`make egress`**(그 메쉬로 라우팅).
+  `egress` badge if it routes traffic. **`manage ›`** enters Mesh mode for it; the
+  egress button **toggles** — **`make egress`** when idle, **`stop egress`** when it
+  is the current egress (→ `SetCurrent{null}`).
+  / 각 행: `name`, `#id`, 인원수, epoch, exit, (라우팅 중이면) `egress` 뱃지. **`manage ›`**
+  로 관리 진입; egress 버튼은 **토글** — 평소 **`make egress`**, 현재 egress면 **`stop
+  egress`**(→ `SetCurrent{null}`).
 
 **Daemon connection / 데몬 연결.**
 - List render → `ListMeshes` → `Meshes(MeshSummary{id,name,members,epoch,exit,is_current}[])`.
 - Create → `CreateMesh { name, my_name, max_members }` → `MeshCreated { mesh }`.
-- `make egress` (mesh row) → `SetCurrent { mesh: id }`; (Origin row) → `SetCurrent { mesh: null }`.
+- `make egress` (mesh row) → `SetCurrent { mesh: id }`; `stop egress` /
+  Default-network row → `SetCurrent { mesh: null }`.
 - `manage ›` → front-end: set the viewed mesh and switch to Mesh mode (no call yet;
   Overview then loads via `MeshInfo`).
   / `manage ›` → 프론트: 보는 메쉬 설정 후 Mesh 모드 전환(이 시점 호출 없음, Overview가
   `MeshInfo`로 로드).
 
 **States & errors / 상태·오류.** Empty list → "no meshes yet — create one above"
-(Origin row still shown). `make egress` on a mesh without an exit → toast the meshd
-error. / 빈 목록 → 안내 문구(Origin 행은 유지). exit 없는 메쉬에 `make egress` →
-meshd 오류 토스트.
+(Default network row still shown). `make egress` on a mesh without an exit → toast
+the meshd error. / 빈 목록 → 안내 문구(Default network 행은 유지). exit 없는 메쉬에
+`make egress` → meshd 오류 토스트.
 
 **Status:** ✅
 
@@ -116,8 +132,12 @@ meshd 오류 토스트.
 ## 3. Mesh mode — Overview page / Mesh 모드 — Overview 페이지
 
 **Purpose / 목적.** The home of a single mesh: see and change everything `meshd`
-knows about it. Default page when entering Mesh mode.
+knows about it. Default page when entering Mesh mode. When there is **no current
+mesh** (egress = Default network), this page is **plain** — "On the default network
+— no mesh selected" — it does not auto-open a mesh.
 / 단일 메쉬의 홈. `meshd`가 아는 그 메쉬의 모든 것을 보고 바꾼다. Mesh 모드 기본 페이지.
+**현재 메쉬가 없으면**(egress=Default network) 이 페이지는 **플레인**("On the default
+network — no mesh selected") — 메쉬를 자동으로 열지 않는다.
 
 **Elements / 구성요소.**
 - **Header / 헤더:** `⬢ <name> #<id>` + actions **make egress** (route traffic
@@ -155,29 +175,26 @@ egress → meshd `Error` 토스트. **wipe** 후 User 모드 복귀.
 
 ---
 
-## 4. Mesh mode — planned pages / Mesh 모드 — 계획 페이지
+## 4. Mesh mode — Peers, Topology (live), Traffic/Security (planned) / Mesh 모드
 
-These pages are **specified but not implemented**; they need `meshd` extensions and
-must **not** be shown until backed by real per-mesh data. Listing them here is the
-contract for when their backend exists.
-/ 아래는 **명세만 있고 미구현**. `meshd` 확장이 필요하며 실제 per-mesh 데이터가 생기기
-전엔 **표시하지 않는다.** 백엔드가 생겼을 때의 계약으로 여기 적어둔다.
+Peers and Topology are **live** (P6.3 done): `MeshInfo`'s `MemberView` now carries
+`endpoint` + `state` (`me` | `live` | `idle` | `unknown`; `live` = heard within
+30 s). Both poll every **3 s** while open. Traffic and Security remain planned.
+/ Peers·Topology는 **라이브**(P6.3 완료): `MeshInfo`의 `MemberView`가 `endpoint`+`state`
+(`me`|`live`|`idle`|`unknown`; `live`=30초 내 수신)를 실어 보낸다. 둘 다 열려 있는 동안
+**3초** 폴링. Traffic·Security는 계획.
 
-- **Peers / 피어 (◑ static now, live later):** the mesh's members as a table —
-  `id · name · pubkey · role` (this node / exit / member) renders now from
-  `MeshInfo`; **live** connection state (connected / connecting / via-relay),
-  endpoints, and latency arrive with the data plane (P6.3).
-  / 메쉬 멤버 표 — `id · name · pubkey · 역할`(this node/exit/member)은 지금 `MeshInfo`로
-  렌더; **라이브** 연결상태(직결/연결중/릴레이)·엔드포인트·지연은 데이터플레인(P6.3) 후.
-- **Traffic / 트래픽 (🔭):** per-mesh flows (who↔who, bytes/packets). *Needs:* data
-  plane + a `meshd` flows query.
-  / per-mesh 플로우(누구↔누구, 바이트/패킷). *필요:* 데이터 플레인 + meshd 플로우 질의.
-- **Topology / 토폴로지 (◑ static now, live later):** this mesh's graph. The
-  **structure** (members + the exit edge) renders now from `MeshInfo` (the cert
-  roster + charter exit); **live** connection state (direct/relay/offline) arrives
-  with the data plane (P6.3).
-  / 이 메쉬의 그래프. **구조**(멤버 + exit 간선)는 지금 `MeshInfo`(cert 로스터 + 헌장
-  exit)로 렌더; **라이브** 연결상태(직결/릴레이/오프라인)는 데이터플레인(P6.3) 후.
+- **Peers / 피어 (✅ live):** a member table — `id · name · pubkey · role` plus a
+  coloured **state badge** (`me`/`live`/`idle`/`unknown`) and the member's endpoint.
+  / 멤버 표 — `id · name · pubkey · 역할` + 색 **state 뱃지** + 엔드포인트.
+- **Topology / 토폴로지 (✅ live):** a radial graph from `MeshInfo`. Node + edge
+  colour by liveness: **green = live link**, **violet = exit**, **dashed slate =
+  idle**, blue = this node.
+  / `MeshInfo` 기반 방사형 그래프. 노드·간선 색으로 상태 표현: **초록=라이브**, **보라=exit**,
+  **점선 회색=idle**, 파랑=본 노드.
+- **Traffic / 트래픽 (🔭):** per-mesh flows (who↔who, bytes/packets). *Needs:* a
+  `meshd` flows query.
+  / per-mesh 플로우. *필요:* meshd 플로우 질의.
 - **Security / 보안 (🔭):** capture-detection status + crypto epoch/table
   (MESH_V2.md §4–§5). *Needs:* `meshd` to surface epoch + capture state.
   / 탈취 감지 상태 + 암호 epoch/테이블. *필요:* meshd가 epoch·탈취 상태 노출.
@@ -207,6 +224,7 @@ The v1 GUI carried these; v2 has no use for them, so the code must drop them:
   + v2 가입은 추후 별도 표면.)
 
 > Result: v2 GUI = the **widget bar** (§1) + **Meshes** (§2) + **Mesh:Overview**
-> (§3). Planned pages (§4) appear only when their backend exists.
-> / 결과: v2 GUI = **위젯바**(§1) + **Meshes**(§2) + **Mesh:Overview**(§3). 계획
-> 페이지(§4)는 백엔드가 생길 때만 등장.
+> (§3) + the live **Peers** and **Topology** (§4). Traffic/Security (§4) appear only
+> when their backend exists.
+> / 결과: v2 GUI = **위젯바**(§1) + **Meshes**(§2) + **Mesh:Overview**(§3) + 라이브
+> **Peers·Topology**(§4). Traffic·Security(§4)는 백엔드가 생길 때만 등장.
