@@ -194,6 +194,13 @@ pub struct MeshSummary {
     pub epoch: u64,
     pub exit: Option<MemberId>,
     pub is_current: bool,
+    /// `Some(secs)` while an attack alert has armed this mesh's destroy grace (P-C7) —
+    /// drives the global alert banner; `None` = not armed.
+    #[serde(default)]
+    pub attack_armed_secs_left: Option<u64>,
+    /// True if this node created the mesh (shows the banner's `All clear` button).
+    #[serde(default)]
+    pub is_creator: bool,
 }
 
 /// One member in a mesh's roster.
@@ -225,6 +232,20 @@ pub struct MeshDetail {
     pub max_members: u8,
     pub cipher: String,
     pub members: Vec<MemberView>,
+    /// Live members incl. self (within the liveness window) — for the health pill (G-4).
+    #[serde(default)]
+    pub live: usize,
+    /// `⌈0.6·roster⌉` — the live-paired self-destruct / re-cipher floor (P-C4/§5-4).
+    #[serde(default)]
+    pub threshold: usize,
+    /// `Some(secs)` if an attack alert has armed the destroy grace (P-C7) — seconds
+    /// until self-destruct, for the countdown banner; `None` = not armed.
+    #[serde(default)]
+    pub attack_armed_secs_left: Option<u64>,
+    /// True if this node is the mesh creator (holds the master key) — shows the
+    /// `All clear` control only to the creator (G-3).
+    #[serde(default)]
+    pub is_creator: bool,
 }
 
 /// The routing policy summary (§1).

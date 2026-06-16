@@ -651,6 +651,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
 
         Request::ListMeshes => {
             let cur = st.current;
+            let now = now_ms();
             let mut meshes: Vec<MeshSummary> = st
                 .meshes
                 .values()
@@ -658,9 +659,13 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     id: ms.mesh.id,
                     name: ms.mesh.name.clone(),
                     members: ms.roster().len(),
-                    epoch: ms.mesh.epoch,
+                    epoch: ms.epoch,
                     exit: ms.mesh.exit,
                     is_current: cur == Some(ms.mesh.id),
+                    attack_armed_secs_left: ms.attack_armed_at.map(|armed| {
+                        ATTACK_GRACE_SECS.saturating_sub(now.saturating_sub(armed) / 1000)
+                    }),
+                    is_creator: ms.master.is_some(),
                 })
                 .collect();
             meshes.sort_by_key(|s| s.id);
@@ -1230,6 +1235,18 @@ fn detail(ms: &MeshState) -> MeshDetail {
             }
         })
         .collect();
+    // Health + attack state for the GUI (G-0): live count, the self-destruct floor,
+    // and the attack countdown.
+    let live = 1 + links
+        .values()
+        .filter(|l| l.last_seen_ms != 0 && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS)
+        .count();
+    drop(links);
+    let threshold = quorum_threshold(ms.roster().len().max(1));
+    let attack_armed_secs_left = ms.attack_armed_at.map(|armed| {
+        let elapsed = now.saturating_sub(armed) / 1000;
+        ATTACK_GRACE_SECS.saturating_sub(elapsed)
+    });
     let ch = &ms.mesh.charter;
     MeshDetail {
         id: ms.mesh.id,
@@ -1242,6 +1259,10 @@ fn detail(ms: &MeshState) -> MeshDetail {
         max_members: ch.max_members,
         cipher: ms.cipher.clone(), // current cipher (may differ from charter post-re-cipher)
         members,
+        live,
+        threshold,
+        attack_armed_secs_left,
+        is_creator: ms.master.is_some(),
     }
 }
 
