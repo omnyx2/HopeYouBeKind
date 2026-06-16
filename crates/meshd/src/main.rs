@@ -1178,11 +1178,25 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 Some(m) => m,
                 None => return (no_mesh(mesh), None),
             };
-            let master = match ms.master.as_ref() {
-                Some(m) => m,
-                None => return (err("only the mesh creator can issue invites"), None),
-            };
+            // Who may invite? In an OpenChain mesh (the default) ANY verified member can —
+            // they sign the joiner's cert with their own member key and it chains back to
+            // the master through the inviter's own cert (membership::valid_members). Only a
+            // MasterGated mesh restricts invites to the creator (the master-key holder).
             let roster = ms.roster();
+            if ms.master.is_none() {
+                if ms.mesh.charter.invite != InviteTopology::OpenChain {
+                    return (
+                        err("only the mesh creator can invite in a master-gated mesh"),
+                        None,
+                    );
+                }
+                if !roster.iter().any(|c| c.member == ms.my_key.pubkey()) {
+                    return (
+                        err("you must be a verified member of this mesh to invite"),
+                        None,
+                    );
+                }
+            }
             if roster.len() >= ms.mesh.charter.max_members as usize {
                 return (
                     err(&format!(
@@ -1200,8 +1214,19 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 Some(i) => i,
                 None => return (err("no free member id"), None),
             };
-            // Issue the cert and seal the mesh secret to the joiner's enc key.
-            let cert = master.issue(member_pk, id, &name, now_ms());
+            // Issue the cert: the master signs it if we're the creator; otherwise we (a
+            // member) sign an open-chain invite cert with our own key — either way it
+            // chains to the master. Then seal the mesh secret to the joiner's enc key.
+            let cert = match ms.master.as_ref() {
+                Some(m) => m.issue(member_pk, id, &name, now_ms()),
+                None => ms.my_key.invite(
+                    ms.mesh.charter.master_pubkey,
+                    member_pk,
+                    id,
+                    &name,
+                    now_ms(),
+                ),
+            };
             let sealed_secret = seal_secret(&enc_pk, &ms.secret);
             // Bootstrap endpoints for the joiner (P-D1): our own advertised address
             // first, then every peer we already reach. The joiner seeds its data
