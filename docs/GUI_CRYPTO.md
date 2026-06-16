@@ -73,7 +73,7 @@ desktop notification).
   - **Non-creator** sees *"waiting for the creator"*.
 - **Warnings page (Mesh ▸ Warnings):** a detailed **attack** card — the one-veto/fail-deadly
   explanation, a live **"Self-destruct in Ns"** countdown, and the creator-only **All clear**
-  button (`AllClear`). See `docs/GUI_PAGES.md` §7.
+  button (`AllClear`). See `docs/GUI_PAGES.md` §6.
 - **Sidebar badge + notification:** the **red count badge** on the Warnings tab includes the
   attack while armed (refreshed every 3s by `updateMeshWarnings()`); a **desktop notification**
   (`notify`) fires **once** when the attack is first detected for a mesh.
@@ -83,7 +83,7 @@ desktop notification).
 - **Where:** the **Overview** summary — current **cipher** + **epoch**, and the **health**
   line **live N/total · floor T** so the user understands the P-C4 self-destruct floor, plus an
   `⚠ ARMED Ns` flag inline when armed. The below-quorum / armed states also drive the
-  **Warnings** page (§7) and the sidebar badge.
+  **Warnings** page (§6) and the sidebar badge.
 - **IPC:** `MeshDetail` carries `live`, `threshold`, `attack_armed_secs_left`, `is_creator`
   (built — see §3).
 
