@@ -33,6 +33,9 @@
             <button class="nav-item" data-tab="meshes" data-grp="user">
               <span class="nav-ico">⬢</span> Meshes
             </button>
+            <button class="nav-item" data-tab="new-mesh" data-grp="user">
+              <span class="nav-ico">＋</span> New mesh
+            </button>
             <!-- Mesh mode (scoped to the opened mesh) -->
             <button class="nav-item" data-tab="mesh-overview" data-grp="mesh">
               <span class="nav-ico">⬢</span> Overview
@@ -47,12 +50,23 @@
         </nav>
 
         <main class="content">
-          <!-- User mode: Meshes (docs/GUI_PAGES.md §2) -->
+          <!-- User mode: Meshes — the list (docs/GUI_PAGES.md §2) -->
           <section data-panel="meshes" class="panel hidden">
             <h1 class="panel-title">This computer · meshes</h1>
             <p class="panel-sub">Every mesh you belong to. <b>manage</b> one, or
               <b>make egress</b> to route your traffic through it.
               <span class="muted small">(v2 — meshd)</span></p>
+            <div class="add-row" style="margin-bottom:14px">
+              <button id="goto-new-mesh" class="secondary">＋ New mesh</button>
+            </div>
+            <ul id="mesh-list" class="peers"></ul>
+          </section>
+
+          <!-- User mode: New mesh — create or join (docs/GUI_PAGES.md §2b) -->
+          <section data-panel="new-mesh" class="panel hidden">
+            <h1 class="panel-title">New mesh</h1>
+            <p class="panel-sub">Create a new mesh, or join an existing one by invite.</p>
+
             <div class="card">
               <div class="card-head"><h2 class="card-title">Create a mesh</h2></div>
               <div class="add-row">
@@ -62,7 +76,23 @@
                 <button id="mesh-create" class="secondary">Create</button>
               </div>
             </div>
-            <ul id="mesh-list" class="peers"></ul>
+
+            <div class="card">
+              <div class="card-head"><h2 class="card-title">Join a mesh</h2></div>
+              <p class="panel-sub small">① get your join code → send it to the mesh owner.
+                ② paste the invite they send back → Join.</p>
+              <div class="add-row">
+                <button id="join-getcode" class="secondary">Get my join code</button>
+              </div>
+              <div id="join-code-box" class="hidden" style="margin:10px 0">
+                <p class="muted small">Your join code — send it to the mesh owner:</p>
+                <textarea id="join-code" class="code" readonly rows="2"></textarea>
+                <button id="join-code-copy" class="small-btn">Copy</button>
+              </div>
+              <p class="muted small" style="margin-top:14px">Paste the invite you got back:</p>
+              <textarea id="join-invite" class="code" rows="3" placeholder="paste invite code here"></textarea>
+              <div class="add-row" style="margin-top:8px"><button id="join-do" class="secondary">Join</button></div>
+            </div>
           </section>
 
           <!-- Mesh mode: Overview (docs/GUI_PAGES.md §3) -->

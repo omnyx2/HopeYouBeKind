@@ -25,6 +25,14 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.add("hidden"), 2600);
 }
 
+// ---- join-flow codes (§2b): base64(JSON) so each is one copy-pasteable string ----
+function b64encode(obj) { return btoa(unescape(encodeURIComponent(JSON.stringify(obj)))); }
+function b64decode(s) { try { return JSON.parse(decodeURIComponent(escape(atob((s || "").trim())))); } catch { return null; } }
+function encodeIdentity(id) { return b64encode({ m: id.member_pubkey_hex, e: id.enc_pubkey_hex }); }
+function decodeIdentity(code) { const o = b64decode(code); return o && o.m && o.e ? o : null; }
+function encodeInvite(blob) { return b64encode(blob); }
+function decodeInvite(code) { const o = b64decode(code); return o && o.mesh_id != null ? o : null; }
+
 // ---- meshd bridge (the only daemon channel) ----
 async function meshd(req) {
   const s = await invoke("meshd", { request: JSON.stringify(req) });
@@ -141,13 +149,43 @@ async function renderPeersFor(id) {
 
 document.querySelectorAll(".nav-item").forEach((b) =>
   b.addEventListener("click", () => {
-    if (b.dataset.tab === "meshes") return setMode("user");
-    activateTab(b.dataset.tab);
+    const tab = b.dataset.tab;
+    if (tab === "meshes") return setMode("user");
+    if (tab === "new-mesh") return activateTab("new-mesh"); // user-mode sibling page
+    activateTab(tab);
+    if (tab === "mesh-overview") return CURRENT_MESH != null ? renderOverview(CURRENT_MESH) : renderMeshPlain();
     if (CURRENT_MESH == null) return;
-    if (b.dataset.tab === "mesh-topology") renderTopologyFor(CURRENT_MESH);
-    if (b.dataset.tab === "mesh-peers") renderPeersFor(CURRENT_MESH);
+    if (tab === "mesh-topology") renderTopologyFor(CURRENT_MESH);
+    if (tab === "mesh-peers") renderPeersFor(CURRENT_MESH);
   })
 );
+
+// "＋ New mesh" button on the Meshes list → the New mesh page.
+el("goto-new-mesh")?.addEventListener("click", () => activateTab("new-mesh"));
+
+// ---- New mesh page: join flow (§2b) ----
+el("join-getcode")?.addEventListener("click", async () => {
+  try {
+    const r = await meshd("NewIdentity");
+    el("join-code").value = encodeIdentity(r.Identity);
+    el("join-code-box").classList.remove("hidden");
+    toast("join code ready — copy + send it to the mesh owner");
+  } catch (e) { toast(String(e)); }
+});
+el("join-code-copy")?.addEventListener("click", () => {
+  navigator.clipboard.writeText(el("join-code").value); toast("copied");
+});
+el("join-do")?.addEventListener("click", async () => {
+  const blob = decodeInvite(el("join-invite").value);
+  if (!blob) return toast("invalid invite code");
+  try {
+    const r = await meshd({ JoinMesh: { invite: blob } });
+    el("join-invite").value = "";
+    toast(`joined mesh #${r.MeshCreated.mesh}`);
+    CURRENT_MESH = r.MeshCreated.mesh;
+    return setMode("mesh");
+  } catch (e) { toast(String(e)); }
+});
 
 // ---- User mode: Meshes page (§2) ----
 async function renderMeshes() {
@@ -254,11 +292,16 @@ async function renderOverview(id) {
       <select id="ov-exit" class="select">${exitOpts}</select>
       <button class="small-btn" id="ov-exit-set">set exit</button>
     </div>
-    <h3 class="topo-h">Admit a member <span class="muted small">(demo)</span></h3>
-    <div class="add-row">
-      <input id="ov-admit-name" placeholder="name" />
-      <input id="ov-admit-pk" placeholder="pubkey 64 hex (blank = random)" />
-      <button class="small-btn" id="ov-admit">admit</button>
+    <h3 class="topo-h">Invite a member</h3>
+    <p class="muted small">Paste the joiner's <b>join code</b> + a name → get an
+      <b>invite code</b> to send back. (docs/GUI_PAGES.md §2b)</p>
+    <div class="add-row"><input id="ov-inv-name" placeholder="their name in this mesh" /></div>
+    <textarea id="ov-inv-code" class="code" rows="2" placeholder="paste their join code" style="margin-top:8px"></textarea>
+    <div class="add-row" style="margin-top:8px"><button class="small-btn" id="ov-invite">create invite</button></div>
+    <div id="ov-inv-out" class="hidden" style="margin-top:10px">
+      <p class="muted small">Invite code — send it back to them:</p>
+      <textarea id="ov-inv-result" class="code" readonly rows="3"></textarea>
+      <button class="small-btn" id="ov-inv-copy">Copy</button>
     </div>`;
   el("ov-egress").onclick = async () => {
     try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); }
@@ -275,14 +318,19 @@ async function renderOverview(id) {
     try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("exit set"); } catch (e) { toast(String(e)); }
     refreshMode();
   };
-  el("ov-admit").onclick = async () => {
-    const name = el("ov-admit-name").value.trim();
-    let pk = el("ov-admit-pk").value.trim();
+  el("ov-invite").onclick = async () => {
+    const name = el("ov-inv-name").value.trim();
+    const ident = decodeIdentity(el("ov-inv-code").value);
     if (!name) return toast("name required");
-    if (!/^[0-9a-fA-F]{64}$/.test(pk)) pk = randHex64();
-    try { await meshd({ AdmitMember: { mesh: id, name, pubkey_hex: pk } }); toast("member admitted"); } catch (e) { toast(String(e)); }
-    refreshMode();
+    if (!ident) return toast("invalid join code");
+    try {
+      const r = await meshd({ CreateInvite: { mesh: id, name, member_pubkey_hex: ident.m, enc_pubkey_hex: ident.e } });
+      el("ov-inv-result").value = encodeInvite(r.Invite);
+      el("ov-inv-out").classList.remove("hidden");
+      toast("invite created — copy + send it back");
+    } catch (e) { toast(String(e)); }
   };
+  el("ov-inv-copy").onclick = () => { navigator.clipboard.writeText(el("ov-inv-result").value); toast("copied"); };
 }
 
 // ---- top widget bar (§1): status (left) + view toggle + egress dropdown ----
