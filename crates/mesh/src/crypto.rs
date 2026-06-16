@@ -258,6 +258,54 @@ impl HeaderCrypto {
     }
 }
 
+/// Per-mesh frame **scramble** (P-C5, docs/PROTOCOL_DESIGN.md §6): a secret-derived
+/// transform that (a) XOR-masks the cleartext `seq` so it doesn't look like a counter
+/// starting at 0, and (b) floats the 21-byte sealed header to a **per-frame** position
+/// inside the body. With nothing constant at a fixed offset, traffic carries no
+/// signature to fingerprint Lattice by — even knowing the program exists. The scheme
+/// is fixed at mesh creation (it's a pure function of the secret); the position varies
+/// per frame (it depends on `seq`).
+pub struct Scramble {
+    secret: [u8; 32],
+    seq_mask: [u8; 8],
+}
+
+impl Scramble {
+    pub fn new(secret: &[u8; 32]) -> Self {
+        let mut h = Blake2s256::new();
+        h.update(b"lattice-seq-mask-v1");
+        h.update(secret);
+        let d = h.finalize();
+        let mut seq_mask = [0u8; 8];
+        seq_mask.copy_from_slice(&d[..8]);
+        Self {
+            secret: *secret,
+            seq_mask,
+        }
+    }
+
+    /// XOR the 8 seq bytes with the per-mesh mask (its own inverse — the receiver
+    /// calls it again to recover the real seq).
+    pub fn mask_seq(&self, mut b: [u8; 8]) -> [u8; 8] {
+        for (x, m) in b.iter_mut().zip(self.seq_mask.iter()) {
+            *x ^= m;
+        }
+        b
+    }
+
+    /// Where to splice the sealed header into the body: a per-mesh, per-frame offset
+    /// in `0..=body_len` (so the header can land before, inside, or after the body).
+    pub fn header_offset(&self, seq: u64, body_len: usize) -> usize {
+        let mut h = Blake2s256::new();
+        h.update(b"lattice-scramble-off-v1");
+        h.update(self.secret);
+        h.update(seq.to_be_bytes());
+        let d = h.finalize();
+        let v = u64::from_be_bytes(d[..8].try_into().unwrap());
+        (v % (body_len as u64 + 1)) as usize
+    }
+}
+
 /// An opaque per-mesh LAN-discovery tag (docs/DISCOVERY.md P-D4): a domain-separated
 /// hash of the mesh secret, truncated to 8 bytes. Broadcast in the LAN beacon so
 /// same-mesh peers recognise each other without revealing the mesh id or any pubkey;
@@ -394,5 +442,24 @@ mod tests {
         assert!(hc.open(8, &sealed).is_none()); // wrong seq (nonce)
         assert!(HeaderCrypto::new(&SECRET, 4).open(7, &sealed).is_none()); // wrong mesh id
         assert!(HeaderCrypto::new(&[1u8; 32], 3).open(7, &sealed).is_none()); // non-member
+    }
+
+    #[test]
+    fn scramble_seq_mask_round_trips() {
+        let s = Scramble::new(&SECRET);
+        let seq = 42u64.to_be_bytes();
+        let masked = s.mask_seq(seq);
+        assert_ne!(masked, seq); // actually masked
+        assert_eq!(s.mask_seq(masked), seq); // XOR is its own inverse
+    }
+
+    #[test]
+    fn scramble_offset_in_range_and_deterministic() {
+        let s = Scramble::new(&SECRET);
+        for (seq, blen) in [(0u64, 0usize), (1, 10), (1000, 100), (5, 21)] {
+            let off = s.header_offset(seq, blen);
+            assert!(off <= blen);
+            assert_eq!(off, s.header_offset(seq, blen)); // deterministic
+        }
     }
 }

@@ -5,19 +5,20 @@
 //! opens + decides (deliver to us / forward). The TUN read/write and the transport
 //! send/recv that wrap this land in later phases.
 //!
-//! Frame layout (P-C2, docs/PROTOCOL_DESIGN.md §5-3): `seq(8, BE) ‖ sealed_header ‖
-//! body_ct`. `seq` is the AEAD nonce (plaintext). The header is sealed with a
-//! **time-windowed key** ([`HeaderCrypto`]) so nothing on the wire is constant /
-//! fingerprintable; the body with the per-mesh **dropbox cipher** ([`MeshSuite`]),
-//! authenticating the plaintext header as AAD (a tampered header or wrong `seq`
-//! fails). A relay opens only the header to read `dst`.
+//! Logical frame = `seq(8, BE) ‖ sealed_header ‖ body_ct`: `seq` is the AEAD nonce,
+//! the header is sealed with a **time-windowed key** ([`HeaderCrypto`], P-C2), the
+//! body with the per-mesh **dropbox cipher** ([`MeshSuite`]) over the plaintext header
+//! as AAD (a tampered header / wrong `seq` fails). P-C5 then [`Scramble`]s the wire
+//! form — `seq` is XOR-masked and the sealed header floats to a per-frame offset
+//! inside the body — so nothing constant sits at a fixed position to fingerprint. A
+//! relay un-scrambles + opens only the header to read `dst`.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use lattice_proto::wire_v2::{self, FrameType, Header, MemberId, MeshId};
 
-use crate::crypto::{HeaderCrypto, MeshSuite, TAG_LEN};
+use crate::crypto::{HeaderCrypto, MeshSuite, Scramble, TAG_LEN};
 
 /// On the wire the header is sealed (P-C2): the 5 header bytes + the AEAD tag.
 const SEALED_HEADER_LEN: usize = wire_v2::HEADER_LEN + TAG_LEN;
@@ -44,6 +45,9 @@ pub struct MeshDataPlane {
     suite: Box<dyn MeshSuite>,
     /// Header cipher — the time-windowed key that seals the wire header (P-C2).
     header: HeaderCrypto,
+    /// Frame scramble — floats the sealed header + masks `seq` so nothing is at a
+    /// fixed offset to fingerprint (P-C5).
+    scramble: Scramble,
     /// Outbound counter — the per-message AEAD nonce. Atomic so the run loop can
     /// seal and recv concurrently behind a shared `&MeshDataPlane`.
     send_seq: AtomicU64,
@@ -63,6 +67,7 @@ impl MeshDataPlane {
             overlay_prefix,
             suite,
             header: HeaderCrypto::new(secret, mesh_id),
+            scramble: Scramble::new(secret),
             send_seq: AtomicU64::new(0),
         }
     }
@@ -74,6 +79,7 @@ impl MeshDataPlane {
     pub fn recipher(&mut self, suite: Box<dyn MeshSuite>, secret: &[u8; 32]) {
         self.suite = suite;
         self.header = HeaderCrypto::new(secret, self.mesh_id);
+        self.scramble = Scramble::new(secret);
         self.send_seq.store(0, Ordering::Relaxed);
     }
 
@@ -91,20 +97,23 @@ impl MeshDataPlane {
         None
     }
 
-    /// Frame a payload for member `dst`: `seq(8) ‖ sealed_header(21) ‖ body_ct`
-    /// (P-C2). The header is sealed with the time-windowed key (no cleartext on the
-    /// wire); the body with the dropbox cipher, AAD = the plaintext header so a
-    /// tampered header is detected. Both AEADs use `seq` as the nonce.
+    /// Frame a payload for member `dst`. The logical parts are `seq(8) ‖
+    /// sealed_header(21) ‖ body_ct` (P-C2: header time-windowed, body the dropbox
+    /// cipher with the plaintext header as AAD). P-C5 then **scrambles** the wire form:
+    /// the seq is XOR-masked and the sealed header is spliced into the body at a
+    /// per-frame offset, so nothing constant sits at a fixed position.
     fn seal_frame(&self, dst: MemberId, ft: FrameType, payload: &[u8]) -> Vec<u8> {
         let header = Header::new(self.mesh_id, self.my_id, dst, ft);
         let hdr_bytes = wire_v2::encode(header, &[]); // the 5 plaintext header bytes
         let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
         let body_ct = self.suite.seal(seq, payload, &hdr_bytes);
-        let hdr_ct = self.header.seal(seq, &hdr_bytes); // 5 + tag = SEALED_HEADER_LEN
+        let hdr_ct = self.header.seal(seq, &hdr_bytes); // SEALED_HEADER_LEN bytes
+        let off = self.scramble.header_offset(seq, body_ct.len());
         let mut frame = Vec::with_capacity(8 + hdr_ct.len() + body_ct.len());
-        frame.extend_from_slice(&seq.to_be_bytes());
+        frame.extend_from_slice(&self.scramble.mask_seq(seq.to_be_bytes()));
+        frame.extend_from_slice(&body_ct[..off]);
         frame.extend_from_slice(&hdr_ct);
-        frame.extend_from_slice(&body_ct);
+        frame.extend_from_slice(&body_ct[off..]);
         frame
     }
 
@@ -118,16 +127,23 @@ impl MeshDataPlane {
         self.seal_frame(dst, FrameType::Control, payload)
     }
 
-    /// Parse + open an inbound frame. `None` if it isn't ours / fails to open. Layout
-    /// is `seq(8) ‖ sealed_header ‖ body_ct` (P-C2): open the header with the
-    /// time-windowed key first (a non-member can't, which also drops foreign frames),
-    /// then route off the recovered header; only the destination opens the body.
+    /// Parse + open an inbound frame. `None` if it isn't ours / fails to open. Undo the
+    /// P-C5 scramble (unmask seq, lift the sealed header out of the body), open the
+    /// header with the time-windowed key (a non-member can't, which also drops foreign
+    /// frames), route off it, and only the destination opens the body.
     pub fn recv(&self, frame: &[u8]) -> Option<Inbound> {
         if frame.len() < 8 + SEALED_HEADER_LEN {
             return None;
         }
-        let seq = u64::from_be_bytes(frame[0..8].try_into().ok()?);
-        let hdr_bytes = self.header.open(seq, &frame[8..8 + SEALED_HEADER_LEN])?;
+        // Undo the P-C5 scramble: unmask seq, then lift the sealed header back out of
+        // the body at its per-frame offset.
+        let seq = u64::from_be_bytes(self.scramble.mask_seq(frame[0..8].try_into().ok()?));
+        let scrambled = &frame[8..];
+        let body_len = scrambled.len() - SEALED_HEADER_LEN;
+        let off = self.scramble.header_offset(seq, body_len);
+        let hdr_ct = &scrambled[off..off + SEALED_HEADER_LEN];
+        let body_ct = [&scrambled[..off], &scrambled[off + SEALED_HEADER_LEN..]].concat();
+        let hdr_bytes = self.header.open(seq, hdr_ct)?;
         let (header, _) = wire_v2::decode(&hdr_bytes)?;
         if header.mesh != self.mesh_id {
             return None; // a different mesh's frame
@@ -137,9 +153,7 @@ impl MeshDataPlane {
             // (body still sealed) on to the next hop, untouched.
             return Some(Inbound::Forward { to: header.dst });
         }
-        let pt = self
-            .suite
-            .open(seq, &frame[8 + SEALED_HEADER_LEN..], &hdr_bytes)?;
+        let pt = self.suite.open(seq, &body_ct, &hdr_bytes)?;
         Some(match header.frame_type {
             FrameType::Control => Inbound::Control(pt),
             _ => Inbound::Deliver(pt),
