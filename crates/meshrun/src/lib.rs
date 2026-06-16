@@ -173,11 +173,15 @@ pub async fn run<X: Transport + 'static>(
                 let Ok((frame, from)) = inbound else { break };
                 // Roaming + liveness: re-learn the sender's endpoint from the frame's
                 // source on the spot, so a peer that moved is reachable again (§6).
+                // Never learn our OWN id (a relayed/looped frame can carry src==us);
+                // a self-entry pollutes the table and shows up as our endpoint.
                 if let Some((hdr, _)) = lattice_proto::wire_v2::decode(&frame) {
-                    links
-                        .lock()
-                        .unwrap()
-                        .insert(hdr.src, Link { endpoint: from, last_seen_ms: now_ms() });
+                    if hdr.src != my_id {
+                        links
+                            .lock()
+                            .unwrap()
+                            .insert(hdr.src, Link { endpoint: from, last_seen_ms: now_ms() });
+                    }
                 }
                 match dp.recv(&frame) {
                     Some(Inbound::Deliver(inner)) => { let _ = tun.write_packet(&inner).await; }

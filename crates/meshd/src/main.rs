@@ -81,6 +81,10 @@ struct MeshState {
     /// This mesh's local data-plane UDP port (set at bringup; 0 = not up). Advertised
     /// in the LAN beacon so same-router peers reach us directly (P-D4).
     dp_port: u16,
+    /// Abort handle for this mesh's data-plane loop (set at bringup). `RemoveMesh`
+    /// aborts it so the loop's future is dropped, freeing its TUN + UDP socket —
+    /// otherwise the port leaks and a re-created mesh can't bind it.
+    dp_task: Option<tokio::task::AbortHandle>,
 }
 
 impl MeshState {
@@ -333,7 +337,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}, advertise {advertise:?} pinned={pinned}",
         b.mesh_id
     );
-    tokio::spawn(lattice_meshrun::run(
+    let task = tokio::spawn(lattice_meshrun::run(
         dp,
         tun,
         transport,
@@ -343,6 +347,10 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         Arc::clone(&b.my_endpoint),
         pinned,
     ));
+    // Record the loop's abort handle so RemoveMesh can stop it (freeing the port/TUN).
+    if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
+        ms.dp_task = Some(task.abort_handle());
+    }
 }
 
 /// Best-effort primary local IP — the source address the OS picks to reach the
@@ -572,7 +580,12 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
         },
 
         Request::RemoveMesh { mesh } => {
-            if st.meshes.remove(&mesh).is_some() {
+            if let Some(ms) = st.meshes.remove(&mesh) {
+                // Stop the data-plane loop so its TUN + UDP socket are dropped — else
+                // the port leaks and a re-created mesh on the same port can't bind.
+                if let Some(task) = &ms.dp_task {
+                    task.abort();
+                }
                 if st.current == Some(mesh) {
                     st.current = None;
                     exit::restore_routes();
@@ -772,6 +785,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             tun_name: None,
             my_endpoint,
             dp_port: 0,
+            dp_task: None,
         },
     );
     (
@@ -841,6 +855,7 @@ fn create_mesh(
             tun_name: None,
             my_endpoint,
             dp_port: 0,
+            dp_task: None,
         },
     );
     (
