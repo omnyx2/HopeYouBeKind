@@ -16,19 +16,19 @@ and any IPC additions needed.** Build order at the end (G-1..G-4). / 새 프로�
 
 | Feature | IPC | GUI today | Plan |
 |---|---|---|---|
-| Per-mesh cipher at creation (P-C1) | `CreateMesh{cipher}`, `Ciphers` | ✅ Create-form dropbox + warning | — done |
-| Re-cipher / rotate key (P-C3) | `Recipher{mesh,cipher?}` | ❌ none | **G-1** |
-| Invite algorithm secrecy (P-C6) | `CreateInvite{algo}`, `JoinMesh{algo}`, `InviteAlgorithms` | ❌ defaulted, no UI | **G-2** |
-| Attack report / all-clear (P-C7) | `ReportAttack`, `AllClear` | ❌ none | **G-3** |
-| Live-paired health + armed state (P-C4/P-C7) | (needs MeshDetail fields) | ❌ not surfaced | **G-4** |
-| Current cipher + epoch (P-C3) | `MeshInfo` (`cipher`,`epoch`) | partial (charter line) | G-4 |
+| Per-mesh cipher at creation (P-C1) | `CreateMesh{cipher}`, `Ciphers` | ✅ Create-mesh dropbox + warning | — done |
+| Re-cipher / rotate key (P-C3) | `Recipher{mesh,cipher?}` | ✅ Configs ▸ Security card | **G-1** ✅ |
+| Invite algorithm secrecy (P-C6) | `CreateInvite{algo}`, `JoinMesh{algo}`, `InviteAlgorithms` | ✅ Configs invite + Join page selects | **G-2** ✅ |
+| Attack report / all-clear (P-C7) | `ReportAttack`, `AllClear` | ✅ Configs danger zone + Warnings + banner + badge + notify | **G-3** ✅ |
+| Live-paired health + armed state (P-C4/P-C7) | `MeshDetail{live,threshold,attack_armed_secs_left,is_creator}` | ✅ Overview health + Warnings | **G-4** ✅ |
+| Current cipher + epoch (P-C3) | `MeshInfo` (`cipher`,`epoch`) | ✅ Overview | G-4 ✅ |
 
 ---
 
 ## 2. Feature specs / 기능별 명세
 
-### G-1. Re-cipher (rotate key / change cipher) — Mesh ▸ Overview
-- **Where:** a card on the **mesh-overview** panel, "Security".
+### G-1. Re-cipher (rotate key / change cipher) — Mesh ▸ Configs
+- **Where:** a **"Security"** card on the **mesh-configs** panel (moved off Overview).
 - **Control:** a **`Re-cipher`** button + a cipher `<select>` (current selected; from `Ciphers`).
   Optional: leave the select unchanged ⇒ key-only rotation; change it ⇒ also switch cipher.
 - **IPC:** `Recipher { mesh, cipher: <select or null> }` → `Ok` / `Error`.
@@ -38,15 +38,15 @@ and any IPC additions needed.** Build order at the end (G-1..G-4). / 새 프로�
   message (`re-cipher needs ≥60% online — X/N up`).
 - **After:** toast "re-ciphered → epoch N+1"; the Overview cipher/epoch (G-4) updates.
 
-### G-2. Invite algorithm secrecy — New mesh ▸ Join, and Overview ▸ Invite
+### G-2. Invite algorithm secrecy — Join mesh page, and Configs ▸ Invite
 The invite-wrap algorithm is **not** in the invite code; it's shared human-to-human (P-C6).
-- **Inviter side (Overview ▸ "Invite a member"):**
+- **Inviter side (Configs ▸ "Invite a member"):**
   - An **algorithm `<select>`** (from `InviteAlgorithms`; default first). 
   - On creating the invite, show **two things to send the joiner separately**: the invite
     code (textarea) **and** a clear line *"Tell them the algorithm: **mix-chacha-v1**"* — with
     a hint to send it over a *different* channel than the code.
   - **IPC:** `CreateInvite { …, algo: <select> }`.
-- **Joiner side (New mesh ▸ Join a mesh):**
+- **Joiner side (Join mesh page):**
   - An **algorithm `<select>`** (from `InviteAlgorithms`) the joiner sets to what the inviter
     told them, next to the "paste invite" box.
   - **IPC:** `JoinMesh { invite, algo: <select> }`. On the wrong algorithm the daemon returns
@@ -56,33 +56,42 @@ The invite-wrap algorithm is **not** in the invite code; it's shared human-to-hu
   *"code valid ~10 min"* note by "Get my join code"; if `CreateInvite` errors *"identity code
   expired"*, prompt the joiner to regenerate.
 
-### G-3. Attack response (report / all-clear) — Overview + global banner
+### G-3. Attack response (report / all-clear) — Configs danger zone + Warnings + banner
 **Fail-deadly, one-veto** (§7): a report destroys the mesh in `ATTACK_GRACE` (30s) unless the
 creator all-clears. The GUI must make this **hard to trigger by accident** and **obvious when
-armed**.
-- **Report control (Overview ▸ Security, danger zone):** a red **`Report attack`** button →
-  a **strong confirm** (type the mesh name, or a two-step "Yes, this is an attack"): *"This
-  ALERTS every member and DESTROYS the mesh in 30s unless the creator calls it off. The mesh and
-  its keys are wiped everywhere. Continue?"* → `ReportAttack { mesh }`.
-- **Armed banner (global, top of window):** when this mesh is armed (G-4 status), a persistent
-  red banner: *"⚠ ATTACK ALERT — this mesh self-destructs in ~Ns"* with a live countdown.
+armed**. The armed state now surfaces in **four** places (banner + Warnings page + badge +
+desktop notification).
+- **Report control (Configs ▸ Danger zone):** a red **`Report attack`** button → a **strong
+  confirm** (**type the mesh name**): *"This ALERTS every member and DESTROYS the mesh in 30s
+  unless the creator calls it off. The mesh and its keys are wiped everywhere. Continue?"* →
+  `ReportAttack { mesh }`. (Moved off Overview to the Configs danger zone.)
+- **Armed banner (global, top of window):** when any mesh is armed (G-4 status), a persistent
+  red banner polling `ListMeshes` every 3s: *"⚠ ATTACK ALERT — this mesh self-destructs in
+  ~Ns"* with a live countdown.
   - **Creator** sees an **`All clear`** button in the banner → `AllClear { mesh }` (creator-only;
     daemon rejects non-creators).
-  - **Non-creator** sees *"waiting for the creator to clear or the mesh self-destructs"*.
+  - **Non-creator** sees *"waiting for the creator"*.
+- **Warnings page (Mesh ▸ Warnings):** a detailed **attack** card — the one-veto/fail-deadly
+  explanation, a live **"Self-destruct in Ns"** countdown, and the creator-only **All clear**
+  button (`AllClear`). See `docs/GUI_PAGES.md` §7.
+- **Sidebar badge + notification:** the **red count badge** on the Warnings tab includes the
+  attack while armed (refreshed every 3s by `updateMeshWarnings()`); a **desktop notification**
+  (`notify`) fires **once** when the attack is first detected for a mesh.
 - **After self-destruct:** the mesh disappears from the list; toast *"mesh self-destructed"*.
 
-### G-4. Mesh health + state surface — Overview
-- **Show:** current **cipher** + **epoch**, and **live N/total (threshold T)** so the user
-  understands the P-C4 self-destruct floor. If `attack_armed_at` is set, show the armed state
-  (drives G-3's banner). A subtle health pill: green (≥T live), amber (forming / below T),
-  red (armed).
-- **Requires IPC additions** (see §3) — MeshDetail doesn't carry this yet.
+### G-4. Mesh health + state surface — Overview (+ Warnings)
+- **Where:** the **Overview** summary — current **cipher** + **epoch**, and the **health**
+  line **live N/total · floor T** so the user understands the P-C4 self-destruct floor, plus an
+  `⚠ ARMED Ns` flag inline when armed. The below-quorum / armed states also drive the
+  **Warnings** page (§7) and the sidebar badge.
+- **IPC:** `MeshDetail` carries `live`, `threshold`, `attack_armed_secs_left`, `is_creator`
+  (built — see §3).
 
 ---
 
-## 3. IPC additions needed / 필요한 IPC 추가
-G-3's banner + G-4's health need state the GUI can't see today. Add to `MeshDetail`
-(`ipc.rs`) + populate in `meshd` `mesh_detail`:
+## 3. IPC additions / IPC 추가 — ✅ BUILT
+G-3's banner + G-4's health need state Overview couldn't see before. These were added to
+`MeshDetail` (`ipc.rs`) + populated in `meshd` `mesh_detail`:
 - `live: usize` — members heard within the live window (incl. self).
 - `threshold: usize` — `quorum_threshold(roster)` (the self-destruct / re-cipher floor).
 - `attack_armed_secs_left: Option<u64>` — `None` if not armed, else seconds until self-destruct
