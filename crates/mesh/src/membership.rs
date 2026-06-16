@@ -125,6 +125,10 @@ impl MemberKey {
     pub fn pubkey(&self) -> PubKey {
         self.0.verifying_key().to_bytes()
     }
+    /// The 32-byte secret seed — for persisting + restoring this identity (P-S1).
+    pub fn to_seed(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
     /// Sign arbitrary bytes with this member's key (used by discovery records).
     pub(crate) fn sign(&self, msg: &[u8]) -> [u8; 64] {
         self.0.sign(msg).to_bytes()

@@ -624,6 +624,7 @@ dependencies = [
  "lattice-proto",
  "lattice-tun",
  "rand",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

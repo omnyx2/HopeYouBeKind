@@ -17,6 +17,7 @@ lattice-tun.workspace = true
 lattice-net.workspace = true
 lattice-proto.workspace = true
 tokio = { workspace = true }
+serde.workspace = true
 serde_json.workspace = true
 rand.workspace = true
 anyhow.workspace = true

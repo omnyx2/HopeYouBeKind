@@ -13,8 +13,11 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use lattice_mesh::charter::{GenesisCharter, InviteTopology, RecipherTrigger};
 use lattice_mesh::crypto::suite;
@@ -154,6 +157,10 @@ struct State {
     /// Freshly minted identities (member + enc keypair) awaiting an invite, keyed
     /// by member public key. Drained when `JoinMesh` consumes one.
     pending: HashMap<PubKey, (MemberKey, EncKey)>,
+    /// Where meshes are persisted (P-S1); `None` = persistence off. Saved on every
+    /// state change, pruned on self-destruct/remove, reloaded at startup so a reboot
+    /// (or a network change) doesn't drop the node from its meshes.
+    persist_dir: Option<PathBuf>,
 }
 
 /// Work the IPC handler defers to the async caller (it can't `.await` or spawn
@@ -185,6 +192,204 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// ---- P-S1 persistence: survive reboots / network changes ---------------------
+// v1 stores keys/secret in plaintext JSON with 0600 perms. NOTE: this trades the
+// RAM-only ephemerality for reboot-survival; a self-destruct / RemoveMesh deletes the
+// file too, so the ephemeral property still holds for those. At-rest encryption is a
+// follow-on (P-S1b).
+
+/// The on-disk form of one mesh.
+#[derive(Serialize, Deserialize)]
+struct PersistedMesh {
+    mesh_id: MeshId,
+    mesh_name: String,
+    charter: GenesisCharter,
+    certs: Vec<Cert>,
+    secret: [u8; 32],
+    epoch: u64,
+    cipher: String,
+    member_seed: [u8; 32],
+    enc_bytes: [u8; 32],
+    master_seed: Option<[u8; 32]>,
+    exit: Option<MemberId>,
+    /// Last-known peer endpoints — re-seeded on load so reconnect is fast (discovery
+    /// then re-learns the rest, e.g. after a network change).
+    peers: Vec<(MemberId, String)>,
+}
+
+/// Where to persist (env `MESHD_STATE_DIR`, else `$HOME/.lattice/meshd`), or `None`
+/// if `MESHD_NO_PERSIST` is set or no home is found. Creates the dir (0700).
+fn persist_dir() -> Option<PathBuf> {
+    if std::env::var("MESHD_NO_PERSIST").is_ok() {
+        return None;
+    }
+    let dir = std::env::var("MESHD_STATE_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".lattice/meshd"))
+        })?;
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
+}
+
+fn mesh_file(dir: &std::path::Path, id: MeshId) -> PathBuf {
+    dir.join(format!("mesh-{id}.json"))
+}
+
+/// Save all current meshes and prune files for meshes that are gone (so a
+/// self-destruct / RemoveMesh erases the on-disk copy too).
+fn persist(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    for ms in st.meshes.values() {
+        let p = PersistedMesh {
+            mesh_id: ms.mesh.id,
+            mesh_name: ms.mesh.name.clone(),
+            charter: ms.mesh.charter.clone(),
+            certs: ms.certs.clone(),
+            secret: ms.secret,
+            epoch: ms.epoch,
+            cipher: ms.cipher.clone(),
+            member_seed: ms.my_key.to_seed(),
+            enc_bytes: ms.my_enc.to_bytes(),
+            master_seed: ms.master.as_ref().map(|m| m.to_seed()),
+            exit: *ms.exit_sel.lock().unwrap(),
+            peers: ms
+                .links
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(m, l)| (*m, l.endpoint.to_string()))
+                .collect(),
+        };
+        if let Ok(json) = serde_json::to_vec_pretty(&p) {
+            let f = mesh_file(dir, ms.mesh.id);
+            if std::fs::write(&f, &json).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
+    }
+    // Prune meshes no longer present.
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if let Some(idstr) = name
+                .strip_prefix("mesh-")
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                if let Ok(id) = idstr.parse::<MeshId>() {
+                    if !st.meshes.contains_key(&id) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load persisted meshes from disk (startup).
+fn load_persisted(dir: &std::path::Path) -> Vec<PersistedMesh> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with("mesh-") {
+                if let Ok(bytes) = std::fs::read(e.path()) {
+                    if let Ok(p) = serde_json::from_slice::<PersistedMesh>(&bytes) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by_key(|p| p.mesh_id);
+    out
+}
+
+/// Rebuild a `MeshState` (+ a `Bringup`) from its persisted form (startup).
+fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
+    let my_key = MemberKey::from_seed(&p.member_seed);
+    let my_enc = EncKey::from_bytes(&p.enc_bytes);
+    let master = p.master_seed.map(|s| MasterKey::from_seed(&s));
+    let my_pub = my_key.pubkey();
+    let my_id = p
+        .certs
+        .iter()
+        .find(|c| c.member == my_pub)
+        .map(|c| c.id)
+        .unwrap_or(0);
+    let prefix = p.charter.overlay_prefix;
+    let mut mesh = Mesh::new(p.mesh_id, p.mesh_name.clone(), p.charter, my_id);
+    mesh.epoch = p.epoch;
+    mesh.exit = p.exit;
+    let mut seed: HashMap<MemberId, SocketAddr> = HashMap::new();
+    for (m, ep) in &p.peers {
+        if let Ok(a) = ep.parse() {
+            seed.insert(*m, a);
+        }
+    }
+    let links = seed_links(seed);
+    let exit_sel: SharedExit = Arc::new(Mutex::new(p.exit));
+    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
+    let bringup = Bringup {
+        mesh_id: p.mesh_id,
+        my_id,
+        prefix,
+        secret: p.secret,
+        cipher: p.cipher.clone(),
+        epoch: p.epoch,
+        links: Arc::clone(&links),
+        exit_sel: Arc::clone(&exit_sel),
+        my_endpoint: Arc::clone(&my_endpoint),
+    };
+    let ms = MeshState {
+        mesh,
+        master,
+        my_key,
+        my_enc,
+        certs: p.certs,
+        secret: p.secret,
+        links,
+        exit_sel,
+        tun_name: None,
+        my_endpoint,
+        dp_port: 0,
+        dp_task: None,
+        cipher: p.cipher,
+        epoch: p.epoch,
+        loop_cmd: None,
+        attack_armed_at: None,
+    };
+    (ms, bringup)
+}
+
+/// Whether a request mutates persistent mesh state (⇒ re-save afterward).
+fn request_mutates(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::CreateMesh { .. }
+            | Request::JoinMesh { .. }
+            | Request::CreateInvite { .. }
+            | Request::SetExit { .. }
+            | Request::SetPeer { .. }
+            | Request::SetCurrent { .. }
+            | Request::RemoveMesh { .. }
+            | Request::Recipher { .. }
+            | Request::AllClear { .. }
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let socket = std::env::args()
@@ -193,7 +398,12 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(Mutex::new(State::default()));
     let data_plane = matches!(std::env::var("DATA_PLANE").as_deref(), Ok("1"));
-    state.lock().unwrap().data_plane = data_plane;
+    let pdir = persist_dir();
+    {
+        let mut st = state.lock().unwrap();
+        st.data_plane = data_plane;
+        st.persist_dir = pdir.clone();
+    }
     eprintln!(
         "meshd: data-plane mode {}",
         if data_plane {
@@ -202,6 +412,32 @@ async fn main() -> anyhow::Result<()> {
             "off"
         }
     );
+    // P-S1: reload persisted meshes so a reboot / network change doesn't drop us from
+    // them; bring each data plane back up at its live secret/epoch/cipher.
+    if let Some(dir) = &pdir {
+        let persisted = load_persisted(dir);
+        let mut bringups = Vec::new();
+        {
+            let mut st = state.lock().unwrap();
+            for p in persisted {
+                let (ms, b) = restore_mesh(p);
+                st.meshes.insert(ms.mesh.id, ms);
+                if data_plane {
+                    bringups.push(b);
+                }
+            }
+            if !st.meshes.is_empty() {
+                eprintln!(
+                    "meshd: restored {} mesh(es) from {}",
+                    st.meshes.len(),
+                    dir.display()
+                );
+            }
+        }
+        for b in bringups {
+            bringup_dataplane(b, Arc::clone(&state)).await;
+        }
+    }
     // P-D4: one LAN-discovery beacon for the whole node. Each round it snapshots the
     // live meshes (those with a data plane up) and advertises/seeds them, so same-LAN
     // peers find each other with no WAN. Best-effort; harmless when data plane is off.
@@ -275,6 +511,7 @@ where
             Ok(req) => {
                 // Handle under the lock; do any async data-plane bringup AFTER
                 // releasing it (TUN/UDP open is async and must not block IPC).
+                let mutates = request_mutates(&req);
                 let (resp, action) = {
                     let mut st = state.lock().unwrap();
                     handle(req, &mut st)
@@ -285,6 +522,9 @@ where
                         arm_kill_switch(mesh, Arc::clone(&state))
                     }
                     None => {}
+                }
+                if mutates {
+                    persist(&state.lock().unwrap()); // P-S1: save after a state change
                 }
                 resp
             }
@@ -405,12 +645,14 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
             let Some(ms) = state.meshes.get_mut(&mid) else {
                 continue;
             };
+            let mut persist_after = false;
             match ev {
                 LoopEvent::Recipher(r) => {
                     ms.secret = r.secret;
                     ms.epoch = r.epoch;
                     ms.mesh.epoch = r.epoch;
                     ms.cipher = r.cipher;
+                    persist_after = true; // P-S1: the new secret must reach disk
                 }
                 LoopEvent::Control(CTRL_ATTACK) => {
                     if ms.attack_armed_at.is_none() {
@@ -424,6 +666,9 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                     }
                 }
                 LoopEvent::Control(_) => {}
+            }
+            if persist_after {
+                persist(&state);
             }
         }
     });
@@ -499,6 +744,7 @@ fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<State>>) {
                     exit::restore_dns();
                 }
             }
+            persist(&st); // P-S1: erase the on-disk copy too (keeps the ephemeral property)
             return;
         }
     });
