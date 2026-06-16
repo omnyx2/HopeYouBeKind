@@ -404,7 +404,18 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             name,
             my_name,
             max_members,
-        } => create_mesh(st, name, my_name, max_members),
+            cipher,
+        } => create_mesh(st, name, my_name, max_members, cipher),
+
+        Request::Ciphers => (
+            Response::Ciphers(
+                lattice_mesh::crypto::available_ciphers()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            None,
+        ),
 
         Request::ListMeshes => {
             let cur = st.current;
@@ -801,11 +812,24 @@ fn create_mesh(
     name: String,
     my_name: String,
     max_members: u8,
+    cipher: Option<String>,
 ) -> (Response, Option<PostAction>) {
     let id = match (1u8..=255).find(|id| !st.meshes.contains_key(id)) {
         Some(id) => id,
         None => return (err("too many meshes on this computer (max 255)"), None),
     };
+    // The data-plane cipher is fixed at creation (P-C1, the GUI dropbox). Validate
+    // the chosen name against the registry; default if unspecified.
+    let cipher = cipher.unwrap_or_else(|| lattice_mesh::crypto::DEFAULT_CIPHER.to_string());
+    if !lattice_mesh::crypto::is_known_cipher(&cipher) {
+        return (
+            err(&format!(
+                "unknown cipher '{cipher}'; one of {:?}",
+                lattice_mesh::crypto::available_ciphers()
+            )),
+            None,
+        );
+    }
     let master = MasterKey::generate();
     let my_key = MemberKey::generate();
     let charter = GenesisCharter {
@@ -813,7 +837,7 @@ fn create_mesh(
         invite: InviteTopology::OpenChain,
         trigger: RecipherTrigger::Quorum { k: 2 },
         max_members,
-        initial_cipher: "noise-ik-chachapoly".into(),
+        initial_cipher: cipher,
         overlay_prefix: [100, 80],
     };
     if let Err(e) = charter.validate() {

@@ -26,7 +26,14 @@ pub enum Request {
         my_name: String,
         /// `1..=254`.
         max_members: u8,
+        /// The data-plane cipher, fixed at creation (the GUI dropbox — P-C1). One of
+        /// [`crate::crypto::available_ciphers`]; `None` → the default. Changing it later
+        /// is a re-cipher (≥60% quorum, docs/PROTOCOL_DESIGN.md §5-4).
+        #[serde(default)]
+        cipher: Option<String>,
     },
+    /// List the data-plane ciphers a mesh can be created with (populates the dropbox).
+    Ciphers,
     /// Every mesh this node belongs to.
     ListMeshes,
     /// Full detail for one mesh.
@@ -95,6 +102,8 @@ pub enum Response {
     },
     /// An invite to hand to the joiner (from `CreateInvite`).
     Invite(InviteBlob),
+    /// Available data-plane cipher names (from `Ciphers`).
+    Ciphers(Vec<String>),
     Ok,
     Error {
         message: String,

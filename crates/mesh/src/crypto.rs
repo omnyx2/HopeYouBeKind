@@ -67,10 +67,9 @@ impl MeshCipher {
 }
 
 /// The **cipher seam** — a mesh's symmetric suite, kept deliberately separate so the
-/// data plane is suite-agnostic. The research time-window cipher
-/// (docs/CIPHER_TIMEWINDOW.md) will be a second `impl MeshSuite`, dropped in here
-/// without touching any caller. It is **parked** for now; we ship the simple
-/// default.
+/// data plane is suite-agnostic. [`suite`] dispatches on `charter.initial_cipher`
+/// (P-C1); the default is [`MeshCipher`] and the research time-window cipher is the
+/// second registered suite [`TimeWindowSuite`], dropped in without touching any caller.
 pub trait MeshSuite: Send + Sync {
     /// Suite name (logged / matched against `charter.initial_cipher`).
     fn name(&self) -> &'static str;
@@ -93,11 +92,101 @@ impl MeshSuite for MeshCipher {
     }
 }
 
-/// Build a mesh's cipher suite by name (from `charter.initial_cipher`). For now
-/// every name maps to the simple epoch-keyed default; the research time-window
-/// suite lands here later (one extra match arm + impl).
-pub fn suite(_name: &str, secret: &[u8; 32], epoch: u64) -> Box<dyn MeshSuite> {
-    Box::new(MeshCipher::new(secret, epoch))
+/// The default cipher (the proven epoch-keyed ChaCha20-Poly1305).
+pub const DEFAULT_CIPHER: &str = "chachapoly-epoch";
+
+/// The registered cipher suites, by name — populates the GUI cipher dropbox (P-C1)
+/// and validates `charter.initial_cipher`. A mesh's cipher is **fixed at creation**;
+/// changing it later is a re-cipher (≥60% quorum, docs/PROTOCOL_DESIGN.md §5-4).
+pub fn available_ciphers() -> &'static [&'static str] {
+    &[DEFAULT_CIPHER, TimeWindowSuite::NAME]
+}
+
+/// Can we build a suite for `name`? (`"default"` aliases [`DEFAULT_CIPHER`].)
+pub fn is_known_cipher(name: &str) -> bool {
+    name == "default" || available_ciphers().contains(&name)
+}
+
+/// Build a mesh's cipher suite by name (from `charter.initial_cipher`). Dispatches
+/// on the registered name; any legacy/unknown name falls back to the proven default
+/// (so an older mesh keeps working — all its nodes share the same name anyway).
+pub fn suite(name: &str, secret: &[u8; 32], epoch: u64) -> Box<dyn MeshSuite> {
+    match name {
+        TimeWindowSuite::NAME => Box::new(TimeWindowSuite::new(secret, epoch)),
+        // "default", DEFAULT_CIPHER, or anything legacy/unknown → the default.
+        _ => Box::new(MeshCipher::new(secret, epoch)),
+    }
+}
+
+// ============================================================================
+//  RESEARCH CIPHER DROP-IN — time-window / manifold suite
+//  --------------------------------------------------------------------------
+//  The second registered MeshSuite and the HOME of the research cipher
+//  (docs/PROTOCOL_DESIGN.md, docs/CIPHER_TIMEWINDOW.md). Select it per mesh with
+//  charter.initial_cipher = "timewindow".
+//
+//  P-C1 state: a WORKING PLACEHOLDER — an *independent* epoch key (distinct KDF
+//  domain so it can't open chachapoly-epoch's frames) over ChaCha20-Poly1305. This
+//  makes the seam real, selectable, and testable. Replace the two marked blocks in
+//  `seal`/`open` with the manifold + forward-secure time-window construction; P-C4
+//  wires the wall-clock window + key-erasure ratchet (and adds a time input to the
+//  trait), so `open` returns None once a window has passed = data unrecoverable.
+// ============================================================================
+
+/// Research time-window suite (placeholder cipher — see banner above).
+pub struct TimeWindowSuite {
+    cipher: ChaCha20Poly1305,
+}
+
+impl TimeWindowSuite {
+    /// The charter name that selects this suite.
+    pub const NAME: &'static str = "timewindow";
+
+    pub fn new(secret: &[u8; 32], epoch: u64) -> Self {
+        // Distinct KDF domain ⇒ keys independent from `chachapoly-epoch`.
+        let mut h = Blake2s256::new();
+        h.update(b"lattice-mesh-timewindow-v1");
+        h.update(secret);
+        h.update(epoch.to_be_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h.finalize());
+        Self {
+            cipher: ChaCha20Poly1305::new(Key::from_slice(&key)),
+        }
+    }
+}
+
+impl MeshSuite for TimeWindowSuite {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+    fn seal(&self, seq: u64, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+        // ▼▼▼ RESEARCH: replace with the manifold / time-window encrypt ▼▼▼
+        self.cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes(seq)),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .expect("timewindow seal")
+        // ▲▲▲
+    }
+    fn open(&self, seq: u64, ciphertext: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
+        // ▼▼▼ RESEARCH: replace with the time-window decrypt — return None once the
+        //     window has passed (key erased) so the data is unrecoverable. ▼▼▼
+        self.cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes(seq)),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .ok()
+        // ▲▲▲
+    }
 }
 
 /// An opaque per-mesh LAN-discovery tag (docs/DISCOVERY.md P-D4): a domain-separated
@@ -191,5 +280,37 @@ mod tests {
         let ct = s.seal(1, b"via the seam", AAD);
         assert_eq!(s.open(1, &ct, AAD).unwrap(), b"via the seam");
         assert!(s.open(2, &ct, AAD).is_none());
+    }
+
+    #[test]
+    fn suite_dispatches_by_name() {
+        assert_eq!(suite("default", &SECRET, 0).name(), "chachapoly-epoch");
+        assert_eq!(
+            suite("chachapoly-epoch", &SECRET, 0).name(),
+            "chachapoly-epoch"
+        );
+        assert_eq!(suite("timewindow", &SECRET, 0).name(), "timewindow");
+        // Unknown names fall back to the default (legacy meshes keep working).
+        assert_eq!(suite("who-knows", &SECRET, 0).name(), "chachapoly-epoch");
+    }
+
+    #[test]
+    fn registered_ciphers_are_known() {
+        assert!(is_known_cipher("default"));
+        for name in available_ciphers() {
+            assert!(is_known_cipher(name));
+        }
+        assert!(!is_known_cipher("not-a-cipher"));
+    }
+
+    #[test]
+    fn timewindow_round_trips_but_is_independent_of_default() {
+        let tw = suite("timewindow", &SECRET, 0);
+        let def = suite("chachapoly-epoch", &SECRET, 0);
+        let ct = tw.seal(1, b"window payload", AAD);
+        // Round-trips under its own suite...
+        assert_eq!(tw.open(1, &ct, AAD).unwrap(), b"window payload");
+        // ...but the default suite can't open it (distinct KDF domain ⇒ distinct key).
+        assert!(def.open(1, &ct, AAD).is_none());
     }
 }
