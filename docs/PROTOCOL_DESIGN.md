@@ -184,7 +184,7 @@
 | ✅ **P-C1 본문 cipher seam** | 생성 시 메쉬별 cipher 확정 + `suite(name)` 실제 분기 + 두 번째 suite(`timewindow`) 등록. **연구용 시간창/manifold cipher가 여기 꽂힘** (crypto.rs `TimeWindowSuite` seal/open 배너 블록). GUI 드롭박스용 `Ciphers` IPC. *(commit 40b3fed)* | 이미 있는 `MeshSuite`/charter.initial_cipher |
 | ✅ **P-C2 헤더/본문 분리** | 헤더 = `HeaderCrypto`(mesh_secret+mesh_id+time-window, 인접창 슬라이드), 본문 = P-C1 dropbox suite. 프레임 = `seq‖sealed_header‖body_ct`, 평문 헤더 제거(지문화 차단), 릴레이는 헤더만 열어 dst 라우팅. *(commit 9bd7b39)* | wire_v2 + P-C1 |
 | ✅ **P-C3 재암호화 거버넌스** | IPC `Recipher{mesh,cipher?}` → 정족수 ⌈0.6N⌉ 검사 → 새 secret/epoch+1 → loop가 구 cipher로 announce 후 `dp` in-place 교체, 수신자도 교체+보고. 오프라인=암묵 퇴출. invite가 epoch+cipher 운반. *(commit b4a2f7f, §11)* | charter `RecipherTrigger::Quorum` |
-| **P-C4 live-paired 자폭** | threshold(60%) 비밀 공유: t개 미만 live → secret 복원 불가 → 자가 폐기. | keydist + share 분배 |
+| ✅ **P-C4 live-paired 자폭** | meshd 워치독: established mesh가 grace(180s) 동안 live < ⌈0.6N⌉ → secret zeroize + mesh 폐기. 형성중 mesh는 면제, `MESHD_NO_SELF_DESTRUCT=1`로 끔. **v1=협력적 wipe**; 진짜 never-hold-secret **Shamir threshold 공유 = P-C4b**. *(commit 6149459)* | keydist + share 분배 |
 | **P-C5 헤더 순열** | 필수 헤더 요소를 per-mesh 비밀 순열로 MTU 내 배치 (안티-핑거프린트). | wire_v2 |
 | **P-C6 초대코드 + 알고리즘 비공개** | time-expire 신원코드 → 초대코드(seed들+n), 대역외 알고리즘 공유. | 가입 플로우 재작업 |
 | **P-C7 공격 대응** | 3-strike 잠금/경보, one-veto 자폭, 생성자 override. | P-C6 |
