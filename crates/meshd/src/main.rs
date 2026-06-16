@@ -402,7 +402,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut st = state.lock().unwrap();
         st.data_plane = data_plane;
-        st.persist_dir = pdir.clone();
+        st.persist_dir.clone_from(&pdir);
     }
     eprintln!(
         "meshd: data-plane mode {}",
