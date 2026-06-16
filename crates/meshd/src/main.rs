@@ -104,6 +104,14 @@ struct State {
     pending: HashMap<PubKey, (MemberKey, EncKey)>,
 }
 
+/// Work the IPC handler defers to the async caller (it can't `.await` or spawn
+/// under the state lock): data-plane bringup, or arming the full-tunnel watchdog.
+enum PostAction {
+    Bringup(Bringup),
+    /// Full tunnel just went up for this mesh — start the kill-switch.
+    ArmKillSwitch(MeshId),
+}
+
 /// Everything `bringup_dataplane` needs to spawn a mesh's live loop — built inside
 /// the locked handler, executed (async TUN/UDP open) after the lock is released.
 struct Bringup {
@@ -151,12 +159,18 @@ async fn main() -> anyhow::Result<()> {
                     Ok(req) => {
                         // Handle under the lock; do any async data-plane bringup AFTER
                         // releasing it (TUN/UDP open is async and must not block IPC).
-                        let (resp, bringup) = {
+                        let (resp, action) = {
                             let mut st = state.lock().unwrap();
                             handle(req, &mut st)
                         };
-                        if let Some(b) = bringup {
-                            bringup_dataplane(b, Arc::clone(&state)).await;
+                        match action {
+                            Some(PostAction::Bringup(b)) => {
+                                bringup_dataplane(b, Arc::clone(&state)).await
+                            }
+                            Some(PostAction::ArmKillSwitch(mesh)) => {
+                                arm_kill_switch(mesh, Arc::clone(&state))
+                            }
+                            None => {}
                         }
                         resp
                     }
@@ -225,7 +239,43 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     tokio::spawn(lattice_meshrun::run(dp, tun, transport, b.links, b.exit_sel));
 }
 
-fn handle(req: Request, st: &mut State) -> (Response, Option<Bringup>) {
+/// Kill-switch watchdog (from v1). Full tunnel diverts the host default route
+/// through the exit; if that path can't carry traffic the host is stranded OFFLINE.
+/// Every ~20s probe the internet THROUGH the tunnel (TCP connect to 1.1.1.1:443 —
+/// it travels TUN→exit, so success proves the exit forwards). The moment a probe
+/// fails, auto-revert to direct internet so the user is never cut off.
+fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            // Stop watching once egress moved off this mesh (user changed it).
+            if state.lock().unwrap().current != Some(mesh) {
+                return;
+            }
+            let alive = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::net::TcpStream::connect("1.1.1.1:443"),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            if !alive {
+                let mut st = state.lock().unwrap();
+                if st.current == Some(mesh) {
+                    eprintln!(
+                        "meshd kill-switch: full-tunnel exit not passing traffic — reverting to direct internet"
+                    );
+                    exit::restore_routes();
+                    exit::restore_dns();
+                    st.current = None;
+                }
+                return; // reverted (or someone else did) — stop probing
+            }
+        }
+    });
+}
+
+fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
     match req {
         Request::CreateMesh { name, my_name, max_members } => {
             create_mesh(st, name, my_name, max_members)
@@ -352,18 +402,23 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<Bringup>) {
                     None => return (no_mesh(id), None),
                 };
                 st.current = Some(id);
-                match plan {
+                let action = match plan {
                     (Some(tun), Some(ip)) => {
                         exit::route_through(&tun, ip);
                         if let Ok(dns) = FULL_TUNNEL_DNS.parse() {
                             exit::set_dns(&[dns]);
                         }
+                        // Arm the kill-switch: auto-revert if the exit can't carry traffic.
+                        Some(PostAction::ArmKillSwitch(id))
                     }
-                    _ => eprintln!(
-                        "meshd: full-tunnel not plumbed for mesh {id} — TUN or exit endpoint unknown (is the data plane up + exit reachable?)"
-                    ),
-                }
-                (Response::Ok, None)
+                    _ => {
+                        eprintln!(
+                            "meshd: full-tunnel not plumbed for mesh {id} — TUN or exit endpoint unknown (is the data plane up + exit reachable?)"
+                        );
+                        None
+                    }
+                };
+                (Response::Ok, action)
             }
         },
 
@@ -448,7 +503,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<Bringup>) {
     }
 }
 
-fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<Bringup>) {
+fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction>) {
     if st.meshes.contains_key(&invite.mesh_id) {
         return (err(&format!("already in mesh {}", invite.mesh_id)), None);
     }
@@ -499,7 +554,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<Bringup>) 
             tun_name: None,
         },
     );
-    (Response::MeshCreated { mesh: invite.mesh_id }, bringup)
+    (Response::MeshCreated { mesh: invite.mesh_id }, bringup.map(PostAction::Bringup))
 }
 
 fn create_mesh(
@@ -507,7 +562,7 @@ fn create_mesh(
     name: String,
     my_name: String,
     max_members: u8,
-) -> (Response, Option<Bringup>) {
+) -> (Response, Option<PostAction>) {
     let id = match (1u8..=255).find(|id| !st.meshes.contains_key(id)) {
         Some(id) => id,
         None => return (err("too many meshes on this computer (max 255)"), None),
@@ -559,7 +614,7 @@ fn create_mesh(
             tun_name: None,
         },
     );
-    (Response::MeshCreated { mesh: id }, bringup)
+    (Response::MeshCreated { mesh: id }, bringup.map(PostAction::Bringup))
 }
 
 fn detail(ms: &MeshState) -> MeshDetail {
