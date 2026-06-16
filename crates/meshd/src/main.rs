@@ -717,8 +717,8 @@ fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<State>>) {
             // P-C4: an established mesh that has sat below the live threshold past grace.
             // Opt-in per mesh (charter.self_destruct): a laptop-friendly mesh leaves this
             // off so a sleeping member never nukes the keys; only `OnIsolation` arms it.
-            let liveness_armed = ms.mesh.charter.self_destruct
-                == lattice_mesh::charter::SelfDestruct::OnIsolation;
+            let liveness_armed =
+                ms.mesh.charter.self_destruct == lattice_mesh::charter::SelfDestruct::OnIsolation;
             let mut starved = false;
             if live >= threshold {
                 established = true;
