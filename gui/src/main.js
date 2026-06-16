@@ -253,8 +253,9 @@ el("mesh-create").addEventListener("click", async () => {
   if (!name) return toast("mesh name required");
   if (Number.isNaN(max) || max < 1 || max > 254) return toast("max must be 1–254");
   const cipher = el("mesh-cipher").value || null;
+  const selfDestruct = el("mesh-selfdestruct").checked;
   try {
-    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher } });
+    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher, self_destruct: selfDestruct } });
     el("mesh-name").value = "";
     el("mesh-myname").value = "";
     toast(`mesh created (#${r.MeshCreated.mesh})`);
@@ -285,7 +286,7 @@ async function renderOverview(id) {
         <button class="small-btn" id="ov-wipe">wipe mesh</button>
       </div>
     </div>
-    <div class="kv"><span>charter</span><b class="small">${d.invite} · ${esc(d.trigger)} · max ${d.max_members}</b></div>
+    <div class="kv"><span>charter</span><b class="small">${d.invite} · ${esc(d.trigger)} · max ${d.max_members} · ${d.self_destruct ? "ephemeral (self-destruct)" : "persistent"}</b></div>
     <div class="kv"><span>cipher</span><b class="mono small">${esc(d.cipher)}</b></div>
     <div class="kv"><span>epoch</span><b>${d.epoch}</b></div>
     <div class="kv"><span>health</span><b>${d.live}/${d.members.length} live · floor ${d.threshold}${d.attack_armed_secs_left != null ? ` · <span style="color:#e44">⚠ ARMED ${d.attack_armed_secs_left}s</span>` : ""}</b></div>

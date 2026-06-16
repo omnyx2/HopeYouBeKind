@@ -715,11 +715,15 @@ fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<State>>) {
                 matches!(armed, Some(t) if now.saturating_sub(t) >= ATTACK_GRACE_SECS * 1000);
 
             // P-C4: an established mesh that has sat below the live threshold past grace.
+            // Opt-in per mesh (charter.self_destruct): a laptop-friendly mesh leaves this
+            // off so a sleeping member never nukes the keys; only `OnIsolation` arms it.
+            let liveness_armed = ms.mesh.charter.self_destruct
+                == lattice_mesh::charter::SelfDestruct::OnIsolation;
             let mut starved = false;
             if live >= threshold {
                 established = true;
                 below_since = None;
-            } else if established {
+            } else if established && liveness_armed {
                 let since = *below_since.get_or_insert(now);
                 starved = now.saturating_sub(since) >= SELF_DESTRUCT_GRACE_SECS * 1000;
             }
@@ -802,7 +806,8 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             my_name,
             max_members,
             cipher,
-        } => create_mesh(st, name, my_name, max_members, cipher),
+            self_destruct,
+        } => create_mesh(st, name, my_name, max_members, cipher, self_destruct),
 
         Request::Ciphers => (
             Response::Ciphers(
@@ -1366,6 +1371,7 @@ fn create_mesh(
     my_name: String,
     max_members: u8,
     cipher: Option<String>,
+    self_destruct: Option<bool>,
 ) -> (Response, Option<PostAction>) {
     let id = match (1u8..=255).find(|id| !st.meshes.contains_key(id)) {
         Some(id) => id,
@@ -1392,6 +1398,11 @@ fn create_mesh(
         max_members,
         initial_cipher: cipher,
         overlay_prefix: [100, 80],
+        self_destruct: if self_destruct == Some(true) {
+            lattice_mesh::charter::SelfDestruct::OnIsolation
+        } else {
+            lattice_mesh::charter::SelfDestruct::Off
+        },
     };
     if let Err(e) = charter.validate() {
         return (err(&e.to_string()), None);
@@ -1509,6 +1520,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
         threshold,
         attack_armed_secs_left,
         is_creator: ms.master.is_some(),
+        self_destruct: ch.self_destruct == lattice_mesh::charter::SelfDestruct::OnIsolation,
     }
 }
 

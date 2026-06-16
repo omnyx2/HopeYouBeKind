@@ -127,6 +127,7 @@ mod tests {
             max_members: 254,
             initial_cipher: "noise-ik-chachapoly".into(),
             overlay_prefix: [100, 80],
+            self_destruct: crate::charter::SelfDestruct::Off,
         }
     }
 

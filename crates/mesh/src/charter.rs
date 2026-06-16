@@ -32,6 +32,20 @@ pub enum RecipherTrigger {
     RateLimit { period_secs: u32 },
 }
 
+/// Whether the mesh self-destructs when it loses live quorum (P-C4 §5-2). A per-mesh
+/// choice fixed at genesis: a laptop that sleeps shouldn't nuke a small mesh, so the
+/// liveness self-destruct is **off by default** and opt-in. (The attack-veto
+/// self-destruct, P-C7, is independent and always applies.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum SelfDestruct {
+    /// Never self-destruct on liveness — survives members going offline (default).
+    #[default]
+    Off,
+    /// Ephemeral: self-destruct once live members sit below the quorum floor for the
+    /// grace window (keys unrecoverable when too few are live — §5-2).
+    OnIsolation,
+}
+
 /// The 1-byte id space caps any mesh at 254 members (`0`/`255` reserved).
 pub const MAX_MEMBERS_CEILING: u8 = 254;
 
@@ -50,6 +64,10 @@ pub struct GenesisCharter {
     /// The first two octets of the overlay prefix this mesh draws member IPs from;
     /// the §9 coexistence pre-flight picks a collision-free one.
     pub overlay_prefix: [u8; 2],
+    /// Liveness self-destruct policy (P-C4) — off by default. `#[serde(default)]` so
+    /// older charters (invites/persisted state) still deserialize.
+    #[serde(default)]
+    pub self_destruct: SelfDestruct,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -88,6 +106,7 @@ mod tests {
             max_members: max,
             initial_cipher: "noise-ik-chachapoly".into(),
             overlay_prefix: [100, 80],
+            self_destruct: SelfDestruct::Off,
         }
     }
 

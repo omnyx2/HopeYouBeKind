@@ -31,6 +31,10 @@ pub enum Request {
         /// is a re-cipher (≥60% quorum, docs/PROTOCOL_DESIGN.md §5-4).
         #[serde(default)]
         cipher: Option<String>,
+        /// Liveness self-destruct (P-C4): `Some(true)` = ephemeral (self-destruct when
+        /// isolated); `None`/`Some(false)` = off (default — laptop-friendly).
+        #[serde(default)]
+        self_destruct: Option<bool>,
     },
     /// List the data-plane ciphers a mesh can be created with (populates the dropbox).
     Ciphers,
@@ -246,6 +250,10 @@ pub struct MeshDetail {
     /// `All clear` control only to the creator (G-3).
     #[serde(default)]
     pub is_creator: bool,
+    /// True if this mesh is ephemeral (liveness self-destruct armed, P-C4) — off by
+    /// default; shown in the overview so the choice is visible.
+    #[serde(default)]
+    pub self_destruct: bool,
 }
 
 /// The routing policy summary (§1).

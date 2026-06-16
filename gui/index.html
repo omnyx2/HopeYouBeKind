@@ -82,6 +82,11 @@
                 <select id="mesh-cipher" title="data-plane cipher — fixed at creation"></select>
                 <button id="mesh-create" class="secondary">Create</button>
               </div>
+              <label class="muted small" style="display:flex;align-items:center;gap:6px;margin:8px 0 0;cursor:pointer"
+                     title="When ON, the mesh keys self-destruct if too few members stay live (ephemeral). Leave OFF for a laptop that sleeps.">
+                <input id="mesh-selfdestruct" type="checkbox" style="width:auto;margin:0" />
+                Ephemeral — self-destruct when isolated (off by default; laptop-friendly)
+              </label>
               <p id="mesh-cipher-warn" class="muted small hidden" style="margin:8px 0 0;color:#e0a020">
                 ⚠ Experimental research cipher. The cipher is <b>permanent</b> — changing it later
                 needs ≥60% of nodes online. Pick the default unless you're testing the time-window cipher.
