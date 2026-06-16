@@ -21,6 +21,12 @@ const SAVED: &str = "/tmp/lattice-saved-default";
 /// Where we stash the original DNS config so `restore_dns` can put it back.
 #[cfg(unix)]
 const DNS_SAVED: &str = "/tmp/lattice-saved-resolv";
+/// Where we record the `/32` host route to the exit's physical endpoint that
+/// `route_through` pins (so the tunnel doesn't loop). `restore_routes` reads it to
+/// delete that route — otherwise it lingers and a later connect to the exit IP fails
+/// with `EADDRNOTAVAIL` once the diverted default is gone.
+#[cfg(unix)]
+const EXIT_HOST_SAVED: &str = "/tmp/lattice-saved-exit-host";
 
 #[cfg(any(unix, windows))]
 fn run(cmd: &str, args: &[&str]) {
@@ -39,7 +45,10 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) {
         return;
     };
     let _ = std::fs::write(SAVED, &gw);
-    // Keep the path to the exit's physical endpoint off the tunnel (no loop).
+    // Keep the path to the exit's physical endpoint off the tunnel (no loop). Record
+    // it so restore_routes can delete it — a left-behind /32 to the exit IP makes a
+    // later connect to that IP fail with EADDRNOTAVAIL.
+    let _ = std::fs::write(EXIT_HOST_SAVED, exit_ip.to_string());
     run("route", &["-q", "add", "-host", &exit_ip.to_string(), &gw]);
     // Send everything else into the tunnel.
     run("route", &["-q", "change", "default", "-interface", tun]);
@@ -52,6 +61,11 @@ pub fn restore_routes() {
         run("route", &["-q", "change", "default", gw.trim()]);
         let _ = std::fs::remove_file(SAVED);
         tracing::info!("default route restored");
+    }
+    // Tear down the pinned host route to the exit's physical endpoint.
+    if let Ok(exit_ip) = std::fs::read_to_string(EXIT_HOST_SAVED) {
+        run("route", &["-q", "delete", "-host", exit_ip.trim()]);
+        let _ = std::fs::remove_file(EXIT_HOST_SAVED);
     }
 }
 
@@ -191,6 +205,9 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) {
         return;
     };
     let _ = std::fs::write(SAVED, format!("{gw} {dev}"));
+    // Record the pinned host route so restore_routes can tear it down (else it
+    // lingers and a later connect to the exit IP fails once default is restored).
+    let _ = std::fs::write(EXIT_HOST_SAVED, exit_ip.to_string());
     run(
         "ip",
         &[
@@ -219,6 +236,11 @@ pub fn restore_routes() {
         }
         let _ = std::fs::remove_file(SAVED);
         tracing::info!("default route restored");
+    }
+    // Tear down the pinned /32 to the exit's physical endpoint.
+    if let Ok(exit_ip) = std::fs::read_to_string(EXIT_HOST_SAVED) {
+        run("ip", &["route", "del", &format!("{}/32", exit_ip.trim())]);
+        let _ = std::fs::remove_file(EXIT_HOST_SAVED);
     }
 }
 

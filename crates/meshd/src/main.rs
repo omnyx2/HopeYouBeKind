@@ -1060,10 +1060,15 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 st.current = Some(id);
                 let action = match plan {
                     (Some(tun), Some(ip)) => {
-                        exit::route_through(&tun, ip);
+                        // Point DNS through the tunnel BEFORE diverting the default
+                        // route: `set_dns` keys off the primary network service, which
+                        // it derives from the current default interface — once the
+                        // route is on the TUN that lookup finds the tunnel (no service)
+                        // and DNS is silently left on the now-unreachable LAN resolver.
                         if let Ok(dns) = FULL_TUNNEL_DNS.parse() {
                             exit::set_dns(&[dns]);
                         }
+                        exit::route_through(&tun, ip);
                         // Arm the kill-switch: auto-revert if the exit can't carry traffic.
                         Some(PostAction::ArmKillSwitch(id))
                     }
