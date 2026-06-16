@@ -189,7 +189,10 @@ mod tests {
         let bob = node(2);
         let packet = b"an inner IP packet (pretend)";
         let frame = alice.seal_to(2, packet);
-        assert_eq!(bob.recv(&frame), Some((1, Inbound::Deliver(packet.to_vec()))));
+        assert_eq!(
+            bob.recv(&frame),
+            Some((1, Inbound::Deliver(packet.to_vec())))
+        );
     }
 
     #[test]
