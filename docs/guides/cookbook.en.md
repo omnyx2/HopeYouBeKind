@@ -23,6 +23,7 @@ numbers** (e.g. `home` or `1`, `alice` or `1`).
 9. [Survives reboot & network change (persistence)](#9-survives-reboot--network-change-persistence)
 10. [Automatic peer discovery / NAT traversal](#10-automatic-peer-discovery--nat-traversal)
 11. [Always-on protections (nothing to configure)](#11-always-on-protections-nothing-to-configure)
+12. [Updating Lattice (and keeping your meshes)](#12-updating-lattice-and-keeping-your-meshes)
 - [Coming soon / planned (design only — not usable yet)](#coming-soon--planned-design-only--not-usable-yet)
 
 ---
@@ -278,6 +279,36 @@ public member instead. Set `MESHD_ADVERTISE` to a real, reachable `ip:port`.
 
 **Caveats:** none to configure — there are no commands here. This recipe is just
 to let you know these protections exist.
+
+---
+
+## 12. Updating Lattice (and keeping your meshes)
+
+**What you get:** the desktop app tells you when a newer version exists and
+preserves your mesh membership across the reinstall.
+
+**When to use:** automatic — a banner appears at the top of the app when an update
+is available.
+
+- On launch the app checks GitHub Releases for a newer version. If there is one, an
+  **Update** banner appears (or **Later** to dismiss).
+- **Update** first backs up every mesh to `<tempdir>/lattice-mesh-backup.json`, then
+  opens the download page. Install the new version and reopen Lattice — the new
+  `meshd` re-imports the backup (then deletes it), so you stay in all your meshes
+  even if the install wiped local state.
+- From the CLI you can take the same backup manually before any reinstall:
+
+```sh
+lattice backup                 # snapshot to <tempdir>/lattice-mesh-backup.json
+lattice backup /path/to/x.json # or a chosen path
+```
+
+- The **Windows installer** offers per-user or per-machine install; the **MSI**
+  shows a Change / Repair / Remove menu when you run it again on an installed copy.
+
+**Caveats:** the backup is a one-shot hand-off — `meshd` deletes it after importing.
+Normal persistence (recipe 9) already survives most updates; this backup is the
+safety net for a clean reinstall that wipes the state dir.
 
 ---
 
