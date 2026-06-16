@@ -38,7 +38,10 @@ async fn main() -> anyhow::Result<()> {
     // fragmentation on a reduced-PMTU underlay (campus firewalls drop fragments,
     // which silently kills large packets like SSH's PQ KEX reply). 1280 mirrors
     // Tailscale's default. Override with MTU= if the path allows larger.
-    let mtu: u16 = std::env::var("MTU").ok().and_then(|s| s.parse().ok()).unwrap_or(1280);
+    let mtu: u16 = std::env::var("MTU")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1280);
     let tun = open(TunConfig {
         address: VirtualIp(overlay),
         prefix_len: 24,
@@ -71,16 +74,31 @@ fn env(k: &str) -> anyhow::Result<String> {
 fn enable_exit_nat(prefix: [u8; 2], mesh: u8) {
     use std::process::Command;
     let cidr = format!("{}.{}.{}.0/24", prefix[0], prefix[1], mesh);
-    let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).status();
+    let _ = Command::new("sysctl")
+        .args(["-w", "net.ipv4.ip_forward=1"])
+        .status();
     let _ = Command::new("iptables")
-        .args(["-t", "nat", "-A", "POSTROUTING", "-s", &cidr, "-j", "MASQUERADE"])
+        .args([
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            &cidr,
+            "-j",
+            "MASQUERADE",
+        ])
         .status();
     // INSERT the forward-accepts at the TOP of FORWARD, not append. Distros like
     // Oracle/RHEL Linux ship a default `-A FORWARD -j REJECT`; appending would put
     // our ACCEPTs *after* that reject, so the overlay's exit traffic would be
     // dropped before it could be forwarded out. `-I FORWARD 1` jumps the queue.
-    let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-s", &cidr, "-j", "ACCEPT"]).status();
-    let _ = Command::new("iptables").args(["-I", "FORWARD", "1", "-d", &cidr, "-j", "ACCEPT"]).status();
+    let _ = Command::new("iptables")
+        .args(["-I", "FORWARD", "1", "-s", &cidr, "-j", "ACCEPT"])
+        .status();
+    let _ = Command::new("iptables")
+        .args(["-I", "FORWARD", "1", "-d", &cidr, "-j", "ACCEPT"])
+        .status();
     eprintln!("meshrun: exit NAT enabled for {cidr}");
 }
 

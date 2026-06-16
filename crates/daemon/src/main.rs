@@ -1196,11 +1196,10 @@ async fn start_dht(
                                             "bridge election: looking for a relay bridge"
                                         );
                                         for &r in &connected_vec {
-                                            let rec = kad.get_record(net.connectivity_key(&r)).await;
-                                            let rconn = rec
-                                                .as_deref()
-                                                .map(decode_ids)
-                                                .unwrap_or_default();
+                                            let rec =
+                                                kad.get_record(net.connectivity_key(&r)).await;
+                                            let rconn =
+                                                rec.as_deref().map(decode_ids).unwrap_or_default();
                                             let cov = unreachable
                                                 .iter()
                                                 .filter(|t| rconn.contains(*t))

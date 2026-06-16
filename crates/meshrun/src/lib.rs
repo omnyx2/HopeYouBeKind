@@ -37,14 +37,25 @@ pub type SharedExit = Arc<Mutex<Option<MemberId>>>;
 
 /// Unix epoch milliseconds (best-effort; 0 if the clock is before the epoch).
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Build a [`PeerLinks`] from seed endpoints (last_seen = 0 until they speak).
 pub fn seed_links(endpoints: HashMap<MemberId, SocketAddr>) -> PeerLinks {
     let map = endpoints
         .into_iter()
-        .map(|(m, endpoint)| (m, Link { endpoint, last_seen_ms: 0 }))
+        .map(|(m, endpoint)| {
+            (
+                m,
+                Link {
+                    endpoint,
+                    last_seen_ms: 0,
+                },
+            )
+        })
         .collect();
     Arc::new(Mutex::new(map))
 }
@@ -222,7 +233,11 @@ mod tests {
 
         #[async_trait::async_trait]
         impl lattice_net::Transport for Router {
-            async fn send_to(&self, data: &[u8], dest: SocketAddr) -> Result<(), lattice_net::NetError> {
+            async fn send_to(
+                &self,
+                data: &[u8],
+                dest: SocketAddr,
+            ) -> Result<(), lattice_net::NetError> {
                 if let Some(tx) = self.hub.0.lock().unwrap().get(&dest) {
                     let _ = tx.send((data.to_vec(), self.me));
                 }

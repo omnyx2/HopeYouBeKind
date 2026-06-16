@@ -43,7 +43,10 @@ impl MeshCipher {
         self.cipher
             .encrypt(
                 Nonce::from_slice(&nonce_bytes(nonce)),
-                Payload { msg: plaintext, aad },
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
             )
             .expect("chacha20poly1305 seal")
     }
@@ -54,7 +57,10 @@ impl MeshCipher {
         self.cipher
             .decrypt(
                 Nonce::from_slice(&nonce_bytes(nonce)),
-                Payload { msg: ciphertext, aad },
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
             )
             .ok()
     }

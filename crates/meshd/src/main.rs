@@ -33,6 +33,7 @@ use lattice_tun::{open as tun_open, TunConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+#[allow(dead_code)] // ported from v1: some restore/disable paths aren't wired yet.
 mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1.
 
 const DEFAULT_SOCKET: &str = "/tmp/lattice-meshd.sock";
@@ -77,18 +78,25 @@ impl MeshState {
     }
     /// The validated roster (certs chaining to the master), id-sorted.
     fn roster(&self) -> Vec<Cert> {
-        let mut v: Vec<Cert> =
-            valid_members(&self.mesh.charter.master_pubkey, &self.certs, self.topology())
-                .into_iter()
-                .cloned()
-                .collect();
+        let mut v: Vec<Cert> = valid_members(
+            &self.mesh.charter.master_pubkey,
+            &self.certs,
+            self.topology(),
+        )
+        .into_iter()
+        .cloned()
+        .collect();
         v.sort_by_key(|c| c.id);
         v
     }
     /// This node's in-mesh id (from its own cert).
     fn my_id(&self) -> MemberId {
         let me = self.my_key.pubkey();
-        self.certs.iter().find(|c| c.member == me).map(|c| c.id).unwrap_or(0)
+        self.certs
+            .iter()
+            .find(|c| c.member == me)
+            .map(|c| c.id)
+            .unwrap_or(0)
     }
 }
 
@@ -133,7 +141,9 @@ fn now_ms() -> u64 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let socket = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_SOCKET.to_string());
+    let socket = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_SOCKET.to_string());
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     eprintln!("meshd: listening on {socket}");
@@ -143,7 +153,11 @@ async fn main() -> anyhow::Result<()> {
     state.lock().unwrap().data_plane = data_plane;
     eprintln!(
         "meshd: data-plane mode {}",
-        if data_plane { "ON (per-mesh TUN+UDP loops; needs root)" } else { "off" }
+        if data_plane {
+            "ON (per-mesh TUN+UDP loops; needs root)"
+        } else {
+            "off"
+        }
     );
     loop {
         let (stream, _) = listener.accept().await?;
@@ -174,11 +188,12 @@ async fn main() -> anyhow::Result<()> {
                         }
                         resp
                     }
-                    Err(e) => Response::Error { message: format!("bad request: {e}") },
+                    Err(e) => Response::Error {
+                        message: format!("bad request: {e}"),
+                    },
                 };
-                let mut out = serde_json::to_string(&resp).unwrap_or_else(|_| {
-                    "{\"Error\":{\"message\":\"encode failed\"}}".to_string()
-                });
+                let mut out = serde_json::to_string(&resp)
+                    .unwrap_or_else(|_| "{\"Error\":{\"message\":\"encode failed\"}}".to_string());
                 out.push('\n');
                 if wr.write_all(out.as_bytes()).await.is_err() {
                     break;
@@ -202,7 +217,10 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("meshd: data-plane TUN open failed for mesh {} (need root?): {e}", b.mesh_id);
+            eprintln!(
+                "meshd: data-plane TUN open failed for mesh {} (need root?): {e}",
+                b.mesh_id
+            );
             return;
         }
     };
@@ -217,7 +235,10 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     let transport = match UdpTransport::bind(bind).await {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("meshd: data-plane UDP bind {bind} failed for mesh {}: {e}", b.mesh_id);
+            eprintln!(
+                "meshd: data-plane UDP bind {bind} failed for mesh {}: {e}",
+                b.mesh_id
+            );
             return;
         }
     };
@@ -236,7 +257,9 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}",
         b.mesh_id
     );
-    tokio::spawn(lattice_meshrun::run(dp, tun, transport, b.links, b.exit_sel));
+    tokio::spawn(lattice_meshrun::run(
+        dp, tun, transport, b.links, b.exit_sel,
+    ));
 }
 
 /// Kill-switch watchdog (from v1). Full tunnel diverts the host default route
@@ -277,9 +300,11 @@ fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
 
 fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
     match req {
-        Request::CreateMesh { name, my_name, max_members } => {
-            create_mesh(st, name, my_name, max_members)
-        }
+        Request::CreateMesh {
+            name,
+            my_name,
+            max_members,
+        } => create_mesh(st, name, my_name, max_members),
 
         Request::ListMeshes => {
             let cur = st.current;
@@ -304,7 +329,11 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             None => (no_mesh(mesh), None),
         },
 
-        Request::AdmitMember { mesh, name, pubkey_hex } => {
+        Request::AdmitMember {
+            mesh,
+            name,
+            pubkey_hex,
+        } => {
             let pubkey = match parse_hex32(&pubkey_hex) {
                 Some(p) => p,
                 None => return (err("pubkey must be 64 hex chars"), None),
@@ -315,7 +344,13 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             };
             let roster = ms.roster();
             if roster.len() >= ms.mesh.charter.max_members as usize {
-                return (err(&format!("mesh is full (max {})", ms.mesh.charter.max_members)), None);
+                return (
+                    err(&format!(
+                        "mesh is full (max {})",
+                        ms.mesh.charter.max_members
+                    )),
+                    None,
+                );
             }
             if roster.iter().any(|c| c.member == pubkey) {
                 return (err("already a member"), None);
@@ -362,17 +397,29 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             (Response::Ok, None)
         }
 
-        Request::SetPeer { mesh, member, endpoint } => {
+        Request::SetPeer {
+            mesh,
+            member,
+            endpoint,
+        } => {
             let addr: SocketAddr = match endpoint.parse() {
                 Ok(a) => a,
-                Err(_) => return (err(&format!("bad endpoint '{endpoint}' (want ip:port)")), None),
+                Err(_) => {
+                    return (
+                        err(&format!("bad endpoint '{endpoint}' (want ip:port)")),
+                        None,
+                    )
+                }
             };
             match st.meshes.get(&mesh) {
                 Some(ms) => {
-                    ms.links
-                        .lock()
-                        .unwrap()
-                        .insert(member, Link { endpoint: addr, last_seen_ms: 0 });
+                    ms.links.lock().unwrap().insert(
+                        member,
+                        Link {
+                            endpoint: addr,
+                            last_seen_ms: 0,
+                        },
+                    );
                     (Response::Ok, None)
                 }
                 None => (no_mesh(mesh), None),
@@ -393,11 +440,21 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 let plan = match st.meshes.get(&id) {
                     Some(ms) if ms.mesh.exit.is_some() => {
                         let exit_id = ms.mesh.exit.unwrap();
-                        let exit_ip = ms.links.lock().unwrap().get(&exit_id).map(|l| l.endpoint.ip());
+                        let exit_ip = ms
+                            .links
+                            .lock()
+                            .unwrap()
+                            .get(&exit_id)
+                            .map(|l| l.endpoint.ip());
                         (ms.tun_name.clone(), exit_ip)
                     }
                     Some(_) => {
-                        return (err(&format!("set an exit for mesh {id} before making it current")), None)
+                        return (
+                            err(&format!(
+                                "set an exit for mesh {id} before making it current"
+                            )),
+                            None,
+                        )
                     }
                     None => return (no_mesh(id), None),
                 };
@@ -443,7 +500,13 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 },
                 None => "direct".into(),
             };
-            (Response::Policy(PolicyView { default, current_mesh: st.current }), None)
+            (
+                Response::Policy(PolicyView {
+                    default,
+                    current_mesh: st.current,
+                }),
+                None,
+            )
         }
 
         Request::NewIdentity => {
@@ -452,10 +515,21 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             let member_pubkey_hex = hex(&member.pubkey());
             let enc_pubkey_hex = hex(&enc.public());
             st.pending.insert(member.pubkey(), (member, enc));
-            (Response::Identity { member_pubkey_hex, enc_pubkey_hex }, None)
+            (
+                Response::Identity {
+                    member_pubkey_hex,
+                    enc_pubkey_hex,
+                },
+                None,
+            )
         }
 
-        Request::CreateInvite { mesh, name, member_pubkey_hex, enc_pubkey_hex } => {
+        Request::CreateInvite {
+            mesh,
+            name,
+            member_pubkey_hex,
+            enc_pubkey_hex,
+        } => {
             let member_pk = match parse_hex32(&member_pubkey_hex) {
                 Some(p) => p,
                 None => return (err("member_pubkey must be 64 hex chars"), None),
@@ -474,7 +548,13 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             };
             let roster = ms.roster();
             if roster.len() >= ms.mesh.charter.max_members as usize {
-                return (err(&format!("mesh is full (max {})", ms.mesh.charter.max_members)), None);
+                return (
+                    err(&format!(
+                        "mesh is full (max {})",
+                        ms.mesh.charter.max_members
+                    )),
+                    None,
+                );
             }
             if roster.iter().any(|c| c.member == member_pk) {
                 return (err("already a member"), None);
@@ -514,7 +594,12 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     };
     let (my_key, my_enc) = match st.pending.remove(&my_cert.member) {
         Some(pair) => pair,
-        None => return (err("no pending identity for this invite — call NewIdentity first"), None),
+        None => {
+            return (
+                err("no pending identity for this invite — call NewIdentity first"),
+                None,
+            )
+        }
     };
     // Open the sealed mesh secret with our encryption key.
     let secret = match my_enc.open(&invite.sealed_secret) {
@@ -522,15 +607,30 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         None => return (err("could not open the sealed secret (wrong key?)"), None),
     };
     // Verify our cert actually chains to the charter's master before adopting.
-    let roster = valid_members(&invite.charter.master_pubkey, &invite.certs, invite.charter.invite);
-    if !roster.iter().any(|c| c.id == invite.member_id && c.member == my_key.pubkey()) {
-        return (err("our cert does not validate against the master — bad invite"), None);
+    let roster = valid_members(
+        &invite.charter.master_pubkey,
+        &invite.certs,
+        invite.charter.invite,
+    );
+    if !roster
+        .iter()
+        .any(|c| c.id == invite.member_id && c.member == my_key.pubkey())
+    {
+        return (
+            err("our cert does not validate against the master — bad invite"),
+            None,
+        );
     }
     let prefix = invite.charter.overlay_prefix;
     let cipher = invite.charter.initial_cipher.clone();
     let links = seed_links(HashMap::new());
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
-    let mesh = Mesh::new(invite.mesh_id, invite.mesh_name.clone(), invite.charter, invite.member_id);
+    let mesh = Mesh::new(
+        invite.mesh_id,
+        invite.mesh_name.clone(),
+        invite.charter,
+        invite.member_id,
+    );
     let bringup = st.data_plane.then(|| Bringup {
         mesh_id: invite.mesh_id,
         my_id: invite.member_id,
@@ -554,7 +654,12 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             tun_name: None,
         },
     );
-    (Response::MeshCreated { mesh: invite.mesh_id }, bringup.map(PostAction::Bringup))
+    (
+        Response::MeshCreated {
+            mesh: invite.mesh_id,
+        },
+        bringup.map(PostAction::Bringup),
+    )
 }
 
 fn create_mesh(
@@ -614,7 +719,10 @@ fn create_mesh(
             tun_name: None,
         },
     );
-    (Response::MeshCreated { mesh: id }, bringup.map(PostAction::Bringup))
+    (
+        Response::MeshCreated { mesh: id },
+        bringup.map(PostAction::Bringup),
+    )
 }
 
 fn detail(ms: &MeshState) -> MeshDetail {
@@ -632,14 +740,24 @@ fn detail(ms: &MeshState) -> MeshDetail {
                 "me".to_string()
             } else {
                 match link {
-                    Some(l) if l.last_seen_ms != 0 && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS => {
+                    Some(l)
+                        if l.last_seen_ms != 0
+                            && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS =>
+                    {
                         "live".into()
                     }
                     Some(_) => "idle".into(),
                     None => "unknown".into(),
                 }
             };
-            MemberView { id: c.id, name: c.name.clone(), pubkey_fp: fp(&c.member), is_me, endpoint, state }
+            MemberView {
+                id: c.id,
+                name: c.name.clone(),
+                pubkey_fp: fp(&c.member),
+                is_me,
+                endpoint,
+                state,
+            }
         })
         .collect();
     let ch = &ms.mesh.charter;
@@ -658,11 +776,15 @@ fn detail(ms: &MeshState) -> MeshDetail {
 }
 
 fn no_mesh(id: MeshId) -> Response {
-    Response::Error { message: format!("no mesh {id}") }
+    Response::Error {
+        message: format!("no mesh {id}"),
+    }
 }
 
 fn err(message: &str) -> Response {
-    Response::Error { message: message.to_string() }
+    Response::Error {
+        message: message.to_string(),
+    }
 }
 
 fn fp(pk: &PubKey) -> String {

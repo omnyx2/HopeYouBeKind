@@ -38,7 +38,12 @@ pub struct MeshDataPlane {
 }
 
 impl MeshDataPlane {
-    pub fn new(mesh_id: MeshId, my_id: MemberId, overlay_prefix: [u8; 2], suite: Box<dyn MeshSuite>) -> Self {
+    pub fn new(
+        mesh_id: MeshId,
+        my_id: MemberId,
+        overlay_prefix: [u8; 2],
+        suite: Box<dyn MeshSuite>,
+    ) -> Self {
         Self {
             mesh_id,
             my_id,
@@ -52,7 +57,8 @@ impl MeshDataPlane {
     /// `/24` is `prefix.prefix.mesh_id.0`, host octet = the 1-byte member id.
     pub fn route(&self, dst: Ipv4Addr) -> Option<MemberId> {
         let o = dst.octets();
-        if o[0] == self.overlay_prefix[0] && o[1] == self.overlay_prefix[1] && o[2] == self.mesh_id {
+        if o[0] == self.overlay_prefix[0] && o[1] == self.overlay_prefix[1] && o[2] == self.mesh_id
+        {
             let k = o[3];
             if (1..=254).contains(&k) {
                 return Some(k);

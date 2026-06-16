@@ -35,3 +35,4 @@ Thumbs.db
 *.swp
 /dist-linux
 ssh-key-2026-06-13.key*
+gui/src-tauri/resources/meshd

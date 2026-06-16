@@ -50,6 +50,69 @@ pub fn decode(buf: &[u8]) -> Option<([u8; 32], [u8; 32], &[u8])> {
     Some((dest, src, &buf[HDR..]))
 }
 
+// ===== L1 anonymity: opaque relay circuits (see docs/ANONYMITY.md) =====
+// A DATA frame carries a per-leg opaque circuit id instead of plaintext node ids,
+// so an underlay eavesdropper on one leg can't track the origin by its stable
+// cert-bound identity. `[0xF2]` SETUP frames (handled at a higher layer over the
+// origin↔relay Noise session) install circuits; here is the data-plane.
+
+/// Opaque per-leg circuit id (never a node id).
+pub type Cid = [u8; 16];
+/// DATA frame tag: `[0xF1][cid:16][inner]`. Outside wire::MessageType (0x01..=0x05).
+const CIRCUIT_DATA: u8 = 0xF1;
+/// SETUP frame tag: `[0xF2][cid:16][noise-sealed setup]` — reserved; installs a circuit.
+pub const CIRCUIT_SETUP: u8 = 0xF2;
+const CIRCUIT_HDR: usize = 1 + 16;
+
+/// Wrap `inner` for a circuit leg identified by `cid`.
+pub fn encode_circuit(cid: &Cid, inner: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(CIRCUIT_HDR + inner.len());
+    f.push(CIRCUIT_DATA);
+    f.extend_from_slice(cid);
+    f.extend_from_slice(inner);
+    f
+}
+
+/// Parse a circuit DATA frame into `(cid, inner)`.
+pub fn decode_circuit(buf: &[u8]) -> Option<(Cid, &[u8])> {
+    if buf.len() < CIRCUIT_HDR || buf[0] != CIRCUIT_DATA {
+        return None;
+    }
+    let mut cid = [0u8; 16];
+    cid.copy_from_slice(&buf[1..17]);
+    Some((cid, &buf[CIRCUIT_HDR..]))
+}
+
+/// A relay's circuit table: each INCOMING cid maps to the (outgoing cid, next addr).
+/// A circuit installs BOTH directions (`cid_OR→(cid_RP, P_addr)` and
+/// `cid_RP→(cid_OR, O_addr)`), so forwarding is direction-agnostic and a relayed
+/// frame never carries a node id — only opaque, per-leg-distinct circuit ids.
+#[derive(Default)]
+pub struct CircuitTable {
+    hops: HashMap<Cid, (Cid, SocketAddr)>,
+}
+
+impl CircuitTable {
+    /// Install one direction of a circuit: a frame arriving on `in_cid` is rewritten
+    /// to `out_cid` and sent to `out_addr`.
+    pub fn install(&mut self, in_cid: Cid, out_cid: Cid, out_addr: SocketAddr) {
+        self.hops.insert(in_cid, (out_cid, out_addr));
+    }
+
+    /// Forget a circuit leg (e.g. on teardown / timeout).
+    pub fn remove(&mut self, in_cid: &Cid) {
+        self.hops.remove(in_cid);
+    }
+
+    /// Rewrite a DATA frame to its next hop: returns `(rewritten frame, next addr)`,
+    /// or `None` if `buf` isn't a DATA frame or no circuit matches its cid.
+    pub fn forward(&self, buf: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
+        let (in_cid, inner) = decode_circuit(buf)?;
+        let (out_cid, out_addr) = self.hops.get(&in_cid)?;
+        Some((encode_circuit(out_cid, inner), *out_addr))
+    }
+}
+
 /// The relay forwarder loop: learn each sender's address, forward by dest id.
 /// Run this on a publicly reachable UDP socket (`--relay-bind`).
 pub async fn run_relay(socket: tokio::net::UdpSocket) -> std::io::Result<()> {
@@ -408,7 +471,10 @@ mod tests {
             None,
             r_id,
         ));
-        assert!(!r.is_relay_server(), "R must not be a designated relay server");
+        assert!(
+            !r.is_relay_server(),
+            "R must not be a designated relay server"
+        );
         let r_addr = r.local_addr().unwrap();
 
         let ta = Arc::new(RelayTransport::new(
@@ -452,5 +518,39 @@ mod tests {
             .expect("B should receive the relayed packet via the undesignated bridge")
             .unwrap();
         assert_eq!(data, b"bridged with no designation");
+    }
+
+    /// L1 anonymity: a relay rewrites a circuit DATA frame to a DIFFERENT per-leg
+    /// cid in BOTH directions, carrying no node id on the wire. (docs/ANONYMITY.md)
+    #[test]
+    fn circuit_forwards_both_ways_without_node_ids() {
+        let o_addr: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let p_addr: SocketAddr = "127.0.0.1:2002".parse().unwrap();
+        let cid_or: Cid = [0x11; 16];
+        let cid_rp: Cid = [0x22; 16];
+
+        // Relay R installs both directions of the O–R–P circuit.
+        let mut r = CircuitTable::default();
+        r.install(cid_or, cid_rp, p_addr); // forward O→P
+        r.install(cid_rp, cid_or, o_addr); // return P→O
+
+        // Forward: O→R on cid_or → R rewrites to cid_rp toward P.
+        let f = encode_circuit(&cid_or, b"hello");
+        let (out, addr) = r.forward(&f).expect("forward circuit");
+        assert_eq!(addr, p_addr);
+        let (cid, inner) = decode_circuit(&out).unwrap();
+        assert_eq!(cid, cid_rp, "cid must change per leg");
+        assert_eq!(inner, b"hello");
+        // Frame is exactly [tag][16-byte cid][payload] — no 32-byte node id anywhere.
+        assert_eq!(out.len(), CIRCUIT_HDR + 5);
+
+        // Return: P→R on cid_rp → R rewrites to cid_or toward O.
+        let f2 = encode_circuit(&cid_rp, b"reply");
+        let (out2, addr2) = r.forward(&f2).expect("return circuit");
+        assert_eq!(addr2, o_addr);
+        assert_eq!(decode_circuit(&out2).unwrap().0, cid_or);
+
+        // Unknown cid → not forwarded.
+        assert!(r.forward(&encode_circuit(&[0x99; 16], b"x")).is_none());
     }
 }

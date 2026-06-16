@@ -33,7 +33,9 @@ async fn meshd(request: String) -> Result<String, String> {
         let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
         let mut line = request;
         line.push('\n');
-        writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|e| e.to_string())?;
         let mut resp = String::new();
         BufReader::new(stream)
             .read_line(&mut resp)
@@ -52,7 +54,79 @@ fn meshd(_request: String) -> Result<String, String> {
 
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            ensure_meshd(app);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![meshd])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");
+}
+
+/// On startup make sure the privileged `meshd` daemon is running. If it isn't,
+/// launch the bundled binary with a ONE-TIME elevation prompt — the OS's native
+/// auth dialog, NOT a terminal — so Lattice is a clean double-click with no manual
+/// `sudo meshd`. Best-effort: in dev (no bundled binary) or if already running, do
+/// nothing.
+fn ensure_meshd(app: &tauri::App) {
+    if meshd_running() {
+        return;
+    }
+    let meshd = match app.path_resolver().resolve_resource("resources/meshd") {
+        Some(p) if p.exists() => p.to_string_lossy().to_string(),
+        _ => {
+            eprintln!("Lattice: bundled meshd not found (dev build?) — start meshd manually");
+            return;
+        }
+    };
+    launch_meshd_elevated(&meshd);
+    // Give meshd a moment to bind its socket before the UI starts polling.
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+}
+
+#[cfg(unix)]
+fn meshd_running() -> bool {
+    std::os::unix::net::UnixStream::connect(MESHD_SOCKET).is_ok()
+}
+#[cfg(not(unix))]
+fn meshd_running() -> bool {
+    false
+}
+
+/// macOS: `do shell script ... with administrator privileges` → native auth dialog
+/// (no terminal); `&` detaches meshd as a background daemon.
+#[cfg(target_os = "macos")]
+fn launch_meshd_elevated(meshd: &str) {
+    let script = format!(
+        "do shell script \"DATA_PLANE=1 '{meshd}' '{MESHD_SOCKET}' >/tmp/lattice-meshd.log 2>&1 &\" \
+         with administrator privileges \
+         with prompt \"Lattice needs administrator access to create the VPN tunnel.\""
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .status();
+}
+
+/// Linux: pkexec shows a graphical PolicyKit auth dialog on the desktop; setsid +
+/// redirect detaches meshd as a background daemon.
+#[cfg(target_os = "linux")]
+fn launch_meshd_elevated(meshd: &str) {
+    let cmd = format!(
+        "setsid env DATA_PLANE=1 '{meshd}' '{MESHD_SOCKET}' >/tmp/lattice-meshd.log 2>&1 &"
+    );
+    let _ = std::process::Command::new("pkexec")
+        .args(["sh", "-c", &cmd])
+        .status();
+}
+
+/// Windows: UAC elevation via PowerShell `Start-Process -Verb RunAs` (hidden window).
+#[cfg(target_os = "windows")]
+fn launch_meshd_elevated(meshd: &str) {
+    let ps = format!(
+        "Start-Process -FilePath '{meshd}' -ArgumentList '{MESHD_SOCKET}' -Verb RunAs -WindowStyle Hidden"
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .status();
 }

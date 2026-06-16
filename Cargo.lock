@@ -619,10 +619,15 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "lattice-mesh",
+ "lattice-meshrun",
+ "lattice-net",
  "lattice-proto",
+ "lattice-tun",
  "rand",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -630,6 +635,7 @@ name = "lattice-meshrun"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "lattice-mesh",
  "lattice-net",
  "lattice-proto",

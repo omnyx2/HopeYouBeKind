@@ -33,10 +33,18 @@ impl EncKey {
     /// Open a secret sealed to our public key; `None` if it wasn't for us or was
     /// tampered.
     pub fn open(&self, sealed: &SealedSecret) -> Option<[u8; 32]> {
-        let shared = self.0.diffie_hellman(&PublicKey::from(sealed.ephemeral_pub));
+        let shared = self
+            .0
+            .diffie_hellman(&PublicKey::from(sealed.ephemeral_pub));
         let key = derive_key(shared.as_bytes(), &sealed.ephemeral_pub, &self.public());
         let pt = ChaCha20Poly1305::new(Key::from_slice(&key))
-            .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: &sealed.ct, aad: b"" })
+            .decrypt(
+                Nonce::from_slice(&[0u8; 12]),
+                Payload {
+                    msg: &sealed.ct,
+                    aad: b"",
+                },
+            )
             .ok()?;
         pt.try_into().ok()
     }
@@ -58,9 +66,18 @@ pub fn seal_secret(to: &[u8; 32], secret: &[u8; 32]) -> SealedSecret {
     let shared = eph.diffie_hellman(&PublicKey::from(*to));
     let key = derive_key(shared.as_bytes(), &eph_pub, to);
     let ct = ChaCha20Poly1305::new(Key::from_slice(&key))
-        .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: secret, aad: b"" })
+        .encrypt(
+            Nonce::from_slice(&[0u8; 12]),
+            Payload {
+                msg: secret,
+                aad: b"",
+            },
+        )
         .expect("sealed-box encrypt");
-    SealedSecret { ephemeral_pub: eph_pub, ct }
+    SealedSecret {
+        ephemeral_pub: eph_pub,
+        ct,
+    }
 }
 
 fn derive_key(shared: &[u8; 32], eph_pub: &[u8; 32], recipient_pub: &[u8; 32]) -> [u8; 32] {

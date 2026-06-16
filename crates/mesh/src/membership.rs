@@ -204,7 +204,9 @@ pub fn valid_members<'a>(
             }
         }
     }
-    ok.into_iter().filter(|c| rooted.contains(&c.member)).collect()
+    ok.into_iter()
+        .filter(|c| rooted.contains(&c.member))
+        .collect()
 }
 
 #[cfg(test)]
@@ -221,7 +223,11 @@ mod tests {
         let alice = MemberKey::from_seed(&[2u8; 32]);
         let cert = master.issue(alice.pubkey(), 1, "alice", at());
         assert!(cert.sig_ok());
-        let valid = valid_members(&master.network(), std::slice::from_ref(&cert), InviteTopology::OpenChain);
+        let valid = valid_members(
+            &master.network(),
+            std::slice::from_ref(&cert),
+            InviteTopology::OpenChain,
+        );
         assert_eq!(valid.len(), 1);
         assert_eq!(valid[0].member, alice.pubkey());
     }
@@ -264,7 +270,12 @@ mod tests {
         let mut cert = master.issue(alice.pubkey(), 1, "alice", at());
         cert.name = "mallory".into(); // signature no longer matches
         assert!(!cert.sig_ok());
-        assert!(valid_members(&master.network(), std::slice::from_ref(&cert), InviteTopology::OpenChain).is_empty());
+        assert!(valid_members(
+            &master.network(),
+            std::slice::from_ref(&cert),
+            InviteTopology::OpenChain
+        )
+        .is_empty());
     }
 
     #[test]
@@ -275,6 +286,11 @@ mod tests {
         // a cert validly signed by `other`, but we verify against `master`'s network.
         let foreign = other.issue(alice.pubkey(), 1, "alice", at());
         assert!(foreign.sig_ok());
-        assert!(valid_members(&master.network(), std::slice::from_ref(&foreign), InviteTopology::OpenChain).is_empty());
+        assert!(valid_members(
+            &master.network(),
+            std::slice::from_ref(&foreign),
+            InviteTopology::OpenChain
+        )
+        .is_empty());
     }
 }

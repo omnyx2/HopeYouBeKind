@@ -93,7 +93,9 @@ mod tests {
 
     #[test]
     fn valid_charter_passes() {
-        assert!(charter(254, RecipherTrigger::Quorum { k: 2 }).validate().is_ok());
+        assert!(charter(254, RecipherTrigger::Quorum { k: 2 })
+            .validate()
+            .is_ok());
         assert!(charter(8, RecipherTrigger::MasterOnly).validate().is_ok());
     }
 

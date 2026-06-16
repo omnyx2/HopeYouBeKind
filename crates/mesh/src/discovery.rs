@@ -58,7 +58,13 @@ impl EndpointRecord {
         };
         let sig = Signature::from_bytes(&self.sig);
         vk.verify(
-            &signing_bytes(&self.network, &self.member, &self.endpoints, self.seq, self.at_ms),
+            &signing_bytes(
+                &self.network,
+                &self.member,
+                &self.endpoints,
+                self.seq,
+                self.at_ms,
+            ),
             &sig,
         )
         .is_ok()
@@ -161,10 +167,16 @@ mod tests {
         assert!(book.observe(alice.publish_endpoints(net, vec![ep("1.1.1.1:1")], 1, 1)));
         // newer seq wins
         assert!(book.observe(alice.publish_endpoints(net, vec![ep("2.2.2.2:2")], 2, 2)));
-        assert_eq!(book.get(&alice.pubkey()).unwrap().endpoints, vec![ep("2.2.2.2:2")]);
+        assert_eq!(
+            book.get(&alice.pubkey()).unwrap().endpoints,
+            vec![ep("2.2.2.2:2")]
+        );
         // stale (lower/equal seq) rejected
         assert!(!book.observe(alice.publish_endpoints(net, vec![ep("3.3.3.3:3")], 2, 9)));
-        assert_eq!(book.get(&alice.pubkey()).unwrap().endpoints, vec![ep("2.2.2.2:2")]);
+        assert_eq!(
+            book.get(&alice.pubkey()).unwrap().endpoints,
+            vec![ep("2.2.2.2:2")]
+        );
     }
 
     #[test]

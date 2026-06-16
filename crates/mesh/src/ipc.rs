@@ -82,16 +82,23 @@ pub enum Request {
 /// A daemon → client reply.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
-    MeshCreated { mesh: MeshId },
+    MeshCreated {
+        mesh: MeshId,
+    },
     Meshes(Vec<MeshSummary>),
     Mesh(MeshDetail),
     Policy(PolicyView),
     /// A freshly minted identity's public keys (from `NewIdentity`).
-    Identity { member_pubkey_hex: String, enc_pubkey_hex: String },
+    Identity {
+        member_pubkey_hex: String,
+        enc_pubkey_hex: String,
+    },
     /// An invite to hand to the joiner (from `CreateInvite`).
     Invite(InviteBlob),
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// A self-contained invite: everything a joiner needs to install the mesh and key

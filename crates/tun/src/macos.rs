@@ -146,7 +146,11 @@ fn configure_interface(name: &str, config: &TunConfig) -> Result<(), TunError> {
 /// Network base address for `ip`/`prefix` (e.g. 10.99.3.1/24 → 10.99.3.0).
 fn subnet_base(ip: std::net::Ipv4Addr, prefix: u8) -> std::net::Ipv4Addr {
     let bits = u32::from(ip);
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     std::net::Ipv4Addr::from(bits & mask)
 }
 

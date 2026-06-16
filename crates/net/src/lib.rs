@@ -159,10 +159,17 @@ pub mod tcp {
     /// One inbound connection: the first frame is the dialer's hello (its listening
     /// address); the rest are datagrams. Register a reply queue keyed by that
     /// address so `send_to` can answer over the same stream.
-    async fn serve_inbound(stream: TcpStream, conns: Conns, tx: mpsc::Sender<(Vec<u8>, SocketAddr)>) {
+    async fn serve_inbound(
+        stream: TcpStream,
+        conns: Conns,
+        tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    ) {
         let (mut rd, wr) = stream.into_split();
         let peer: SocketAddr = match read_frame(&mut rd).await {
-            Ok(hello) => match std::str::from_utf8(&hello).ok().and_then(|s| s.parse().ok()) {
+            Ok(hello) => match std::str::from_utf8(&hello)
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
                 Some(p) => p,
                 None => return,
             },
@@ -178,9 +185,16 @@ pub mod tcp {
     /// Drain a per-connection outbound queue onto the socket, framing each payload.
     /// When `hello` is set (the dialer side) the listening address is announced
     /// first.
-    async fn drive_writer(mut wr: OwnedWriteHalf, hello: Option<SocketAddr>, mut crx: mpsc::Receiver<Vec<u8>>) {
+    async fn drive_writer(
+        mut wr: OwnedWriteHalf,
+        hello: Option<SocketAddr>,
+        mut crx: mpsc::Receiver<Vec<u8>>,
+    ) {
         if let Some(addr) = hello {
-            if write_frame(&mut wr, addr.to_string().as_bytes()).await.is_err() {
+            if write_frame(&mut wr, addr.to_string().as_bytes())
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -193,7 +207,12 @@ pub mod tcp {
 
     /// Read frames off a connection and surface each as a datagram from `peer`'s
     /// listening address; drop the connection from the pool when it closes.
-    async fn pump_reads(mut rd: OwnedReadHalf, peer: SocketAddr, tx: mpsc::Sender<(Vec<u8>, SocketAddr)>, conns: Conns) {
+    async fn pump_reads(
+        mut rd: OwnedReadHalf,
+        peer: SocketAddr,
+        tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+        conns: Conns,
+    ) {
         loop {
             match read_frame(&mut rd).await {
                 Ok(buf) => {
@@ -215,11 +234,13 @@ pub mod tcp {
         Ok(buf)
     }
 
-    async fn write_frame<W: AsyncWriteExt + Unpin>(wr: &mut W, payload: &[u8]) -> std::io::Result<()> {
-        let n: u16 = payload
-            .len()
-            .try_into()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame too large"))?;
+    async fn write_frame<W: AsyncWriteExt + Unpin>(
+        wr: &mut W,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        let n: u16 = payload.len().try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame too large")
+        })?;
         wr.write_all(&n.to_be_bytes()).await?;
         wr.write_all(payload).await?;
         wr.flush().await
@@ -237,7 +258,12 @@ pub mod tcp {
             let (rd, wr) = TcpStream::connect(dest).await?.into_split();
             let (ctx, crx) = mpsc::channel::<Vec<u8>>(256);
             tokio::spawn(drive_writer(wr, Some(self.local), crx));
-            tokio::spawn(pump_reads(rd, dest, self.tx.clone(), Arc::clone(&self.conns)));
+            tokio::spawn(pump_reads(
+                rd,
+                dest,
+                self.tx.clone(),
+                Arc::clone(&self.conns),
+            ));
             // Race: a concurrent dial may have registered first — keep that one and
             // let ours close (its writer ends when this `ctx` drops).
             let tx = self.conns.lock().await.entry(dest).or_insert(ctx).clone();
