@@ -25,12 +25,13 @@ use lattice_mesh::ipc::{
 use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey};
 use lattice_mesh::Mesh;
-use lattice_meshrun::{seed_links, Link, PeerLinks, SharedEndpoint, SharedExit};
+use lattice_meshrun::{seed_links, Link, PeerLinks, Recipher, SharedEndpoint, SharedExit};
 use lattice_net::udp::UdpTransport;
 use lattice_proto::wire_v2::{MemberId, MeshId};
 use lattice_proto::VirtualIp;
 use lattice_tun::{open as tun_open, TunConfig};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::UnboundedSender;
 
 #[allow(dead_code)] // ported from v1: some restore/disable paths aren't wired yet.
 mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1.
@@ -85,6 +86,12 @@ struct MeshState {
     /// aborts it so the loop's future is dropped, freeing its TUN + UDP socket —
     /// otherwise the port leaks and a re-created mesh can't bind it.
     dp_task: Option<tokio::task::AbortHandle>,
+    /// The mesh's **current** data-plane cipher + epoch (P-C3). Start from the
+    /// charter; a re-cipher rotates `secret`, bumps `epoch`, and may change `cipher`.
+    cipher: String,
+    epoch: u64,
+    /// Sender into this mesh's data-plane loop to trigger a re-cipher (set at bringup).
+    recipher_cmd: Option<UnboundedSender<(Recipher, Vec<MemberId>)>>,
 }
 
 impl MeshState {
@@ -143,6 +150,7 @@ struct Bringup {
     prefix: [u8; 2],
     secret: [u8; 32],
     cipher: String,
+    epoch: u64,
     links: PeerLinks,
     exit_sel: SharedExit,
     my_endpoint: SharedEndpoint,
@@ -314,7 +322,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         b.mesh_id,
         b.my_id,
         b.prefix,
-        suite(&b.cipher, &b.secret, 0),
+        suite(&b.cipher, &b.secret, b.epoch),
         &b.secret,
     );
     // Record the TUN name (needed to divert the default route for full-tunnel) and
@@ -343,6 +351,11 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}, advertise {advertise:?} pinned={pinned}",
         b.mesh_id
     );
+    // P-C3 re-cipher channels: cmd (meshd→loop, trigger) + applied (loop→meshd, so we
+    // update our stored secret/epoch/cipher when a re-cipher lands — initiated or
+    // received).
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (applied_tx, mut applied_rx) = tokio::sync::mpsc::unbounded_channel::<Recipher>();
     let task = tokio::spawn(lattice_meshrun::run(
         dp,
         tun,
@@ -352,11 +365,28 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         b.my_id,
         Arc::clone(&b.my_endpoint),
         pinned,
+        cmd_rx,
+        applied_tx,
     ));
-    // Record the loop's abort handle so RemoveMesh can stop it (freeing the port/TUN).
+    // Record the loop's abort handle (RemoveMesh stops it) + the re-cipher trigger.
     if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
         ms.dp_task = Some(task.abort_handle());
+        ms.recipher_cmd = Some(cmd_tx);
     }
+    // Keep MeshState's secret/epoch/cipher in step with the live data plane after a
+    // re-cipher (the joiner-sealing secret + the displayed state must follow).
+    let st = Arc::clone(&state);
+    let mid = b.mesh_id;
+    tokio::spawn(async move {
+        while let Some(r) = applied_rx.recv().await {
+            if let Some(ms) = st.lock().unwrap().meshes.get_mut(&mid) {
+                ms.secret = r.secret;
+                ms.epoch = r.epoch;
+                ms.mesh.epoch = r.epoch;
+                ms.cipher = r.cipher;
+            }
+        }
+    });
 }
 
 /// Best-effort primary local IP — the source address the OS picks to reach the
@@ -422,6 +452,50 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             ),
             None,
         ),
+
+        Request::Recipher { mesh, cipher } => {
+            let ms = match st.meshes.get(&mesh) {
+                Some(m) => m,
+                None => return (no_mesh(mesh), None),
+            };
+            // Quorum: self + peers heard within the liveness window ≥ ⌈0.6·N⌉.
+            let n = ms.roster().len().max(1);
+            let now = now_ms();
+            let online = 1 + ms
+                .links
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|l| now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS)
+                .count();
+            let threshold = (3 * n + 4) / 5; // ⌈0.6·N⌉
+            if online < threshold {
+                return (
+                    err(&format!(
+                        "re-cipher needs ≥60% online — {online}/{n} up, need {threshold}"
+                    )),
+                    None,
+                );
+            }
+            let new_cipher = cipher.unwrap_or_else(|| ms.cipher.clone());
+            if !lattice_mesh::crypto::is_known_cipher(&new_cipher) {
+                return (err(&format!("unknown cipher '{new_cipher}'")), None);
+            }
+            // Announce to every known peer (offline ones won't receive it → evicted).
+            let peers: Vec<MemberId> = ms.links.lock().unwrap().keys().copied().collect();
+            let r = Recipher {
+                epoch: ms.epoch + 1,
+                cipher: new_cipher,
+                secret: rand::random(),
+            };
+            match &ms.recipher_cmd {
+                Some(tx) => {
+                    let _ = tx.send((r, peers));
+                    (Response::Ok, None)
+                }
+                None => (err("data plane is not running; can't re-cipher"), None),
+            }
+        }
 
         Request::ListMeshes => {
             let cur = st.current;
@@ -709,6 +783,8 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 certs: ms.certs.clone(),
                 sealed_secret,
                 endpoints,
+                epoch: ms.epoch, // bring the joiner up at the live epoch (P-C3)
+                cipher: ms.cipher.clone(), // ...and the live cipher (may differ post-re-cipher)
             };
             (Response::Invite(blob), None)
         }
@@ -756,10 +832,16 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         );
     }
     let prefix = invite.charter.overlay_prefix;
-    let cipher = invite.charter.initial_cipher.clone();
-    // Seed the data plane with the bootstrap endpoints the inviter handed us (P-D1):
-    // we can reach the inviter (and any peers it knew) immediately, before gossip
-    // converges. Skip our own id and any unparseable address.
+    // Prefer the invite's live cipher (post-re-cipher); fall back to the charter's.
+    let cipher = if invite.cipher.is_empty() {
+        invite.charter.initial_cipher.clone()
+    } else {
+        invite.cipher.clone()
+    };
+    let epoch = invite.epoch; // bring the data plane up at the mesh's live epoch (P-C3)
+                              // Seed the data plane with the bootstrap endpoints the inviter handed us (P-D1):
+                              // we can reach the inviter (and any peers it knew) immediately, before gossip
+                              // converges. Skip our own id and any unparseable address.
     let mut seed: HashMap<MemberId, SocketAddr> = HashMap::new();
     for (m, ep) in &invite.endpoints {
         if *m == invite.member_id {
@@ -772,18 +854,20 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
-    let mesh = Mesh::new(
+    let mut mesh = Mesh::new(
         invite.mesh_id,
         invite.mesh_name.clone(),
         invite.charter,
         invite.member_id,
     );
+    mesh.epoch = epoch;
     let bringup = st.data_plane.then(|| Bringup {
         mesh_id: invite.mesh_id,
         my_id: invite.member_id,
         prefix,
         secret,
-        cipher,
+        cipher: cipher.clone(),
+        epoch,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
         my_endpoint: Arc::clone(&my_endpoint),
@@ -803,6 +887,9 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             my_endpoint,
             dp_port: 0,
             dp_task: None,
+            cipher,
+            epoch,
+            recipher_cmd: None,
         },
     );
     (
@@ -866,7 +953,8 @@ fn create_mesh(
         my_id: 1,
         prefix,
         secret,
-        cipher,
+        cipher: cipher.clone(),
+        epoch: 0,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
         my_endpoint: Arc::clone(&my_endpoint),
@@ -886,6 +974,9 @@ fn create_mesh(
             my_endpoint,
             dp_port: 0,
             dp_task: None,
+            cipher,
+            epoch: 0,
+            recipher_cmd: None,
         },
     );
     (
@@ -933,13 +1024,13 @@ fn detail(ms: &MeshState) -> MeshDetail {
     MeshDetail {
         id: ms.mesh.id,
         name: ms.mesh.name.clone(),
-        epoch: ms.mesh.epoch,
+        epoch: ms.epoch,
         me: ms.my_id(),
         exit: ms.mesh.exit,
         invite: format!("{:?}", ch.invite),
         trigger: format!("{:?}", ch.trigger),
         max_members: ch.max_members,
-        cipher: ch.initial_cipher.clone(),
+        cipher: ms.cipher.clone(), // current cipher (may differ from charter post-re-cipher)
         members,
     }
 }

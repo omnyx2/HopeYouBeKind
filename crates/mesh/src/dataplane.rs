@@ -67,6 +67,16 @@ impl MeshDataPlane {
         }
     }
 
+    /// Swap to a new cipher epoch **in place** (P-C3 re-cipher): replace the body
+    /// suite + header crypto and reset the nonce counter (a fresh key restarts at
+    /// seq 0). The TUN/UDP, overlay, and member ids are untouched — only the keys
+    /// change, so the run loop can re-cipher without respawning.
+    pub fn recipher(&mut self, suite: Box<dyn MeshSuite>, secret: &[u8; 32]) {
+        self.suite = suite;
+        self.header = HeaderCrypto::new(secret, self.mesh_id);
+        self.send_seq.store(0, Ordering::Relaxed);
+    }
+
     /// Which member (if any) owns the overlay address `dst` in this mesh: the
     /// `/24` is `prefix.prefix.mesh_id.0`, host octet = the 1-byte member id.
     pub fn route(&self, dst: Ipv4Addr) -> Option<MemberId> {
@@ -197,6 +207,31 @@ mod tests {
         let outsider =
             MeshDataPlane::new(3, 2, PREFIX, suite("default", &[7u8; 32], 0), &[7u8; 32]);
         assert_eq!(outsider.recv(&frame), None);
+    }
+
+    #[test]
+    fn recipher_swaps_keys_in_place() {
+        let mut alice = node(1);
+        let bob = node(2);
+        let old = alice.seal_to(2, b"old-epoch");
+        assert_eq!(
+            bob.recv(&old),
+            Some(Inbound::Deliver(b"old-epoch".to_vec()))
+        );
+
+        // Alice re-ciphers to a fresh secret/epoch; Bob (still on the old key) can't
+        // open her new frame — until he re-ciphers to the same new secret too.
+        let new_secret = [7u8; 32];
+        alice.recipher(suite("default", &new_secret, 1), &new_secret);
+        let neu = alice.seal_to(2, b"new-epoch");
+        assert_eq!(bob.recv(&neu), None);
+
+        let mut bob2 = node(2);
+        bob2.recipher(suite("default", &new_secret, 1), &new_secret);
+        assert_eq!(
+            bob2.recv(&neu),
+            Some(Inbound::Deliver(b"new-epoch".to_vec()))
+        );
     }
 
     #[test]

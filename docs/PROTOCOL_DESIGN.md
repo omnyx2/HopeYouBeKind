@@ -191,6 +191,34 @@
 
 권장 시작 = **P-C1** (가장 작고, 이미 절반 구현됐고, 연구 cipher의 집).
 
+## 11. 재암호화 프로토콜 (P-C3) / Re-cipher protocol
+
+§5-4의 거버넌스를 실제 와이어로. **핵심 단순화: 재암호화는 TUN/UDP를 안 건드리고 cipher만 교체** →
+run 루프 안에서 `MeshDataPlane`만 in-place 재생성(respawn 불필요).
+
+1. **트리거.** IPC `Recipher { mesh, cipher? }` (사용자/관리자). cipher 생략 시 현재 유지(키만 회전).
+2. **정족수.** online = self + LIVE_WINDOW 내 들린 피어. **online ≥ ⌈0.6·N⌉** (N=로스터 크기) 아니면 거부.
+3. **새 상태 생성.** `epoch' = epoch+1`, `secret' = 새 랜덤 32B`, `cipher' = 주어진 값 또는 현재.
+4. **announce 프레임.** 태그된 Control: `[0x02][epoch'(8)][cipher_len(1)][cipher'][secret'(32)]`, **현재(구)
+   data-plane cipher로 봉인**(현 멤버만 읽음), 각 online 피어에게 전송.
+5. **적용.** 각 노드가 `MeshDataPlane`(body suite + HeaderCrypto)를 **새 secret/epoch/cipher로 in-place 교체**
+   — TUN/UDP 유지. meshd는 MeshState{secret,epoch,cipher} 갱신(이후 invite·영속화용).
+6. **퇴출.** offline 노드는 announce 못 받음 → 구 epoch/secret 유지 → online과 **상호 복호 실패** → 게이트에서
+   드롭. 본인은 "해독 안 됨"으로 퇴출 인지(§8-4: 데이터평면 해독실패=조용히, 공격경보 X).
+
+**배선 (구현):**
+- `run()`이 `dp`를 `let mut`로 소유 → in-place 교체. 채널 2개:
+  - **meshd→loop** `recipher_cmd`: 초대자 meshd가 {epoch',cipher',secret', peers} 주입 → loop가 구 cipher로
+    announce 봉인·전송 후 `dp` 교체.
+  - **loop→meshd** `recipher_applied`: 수신자 loop가 announce로 교체 후 {epoch',cipher',secret'} 보고 → meshd가
+    MeshState 갱신.
+- Control 페이로드 첫 바이트 태그: `0x01`=gossip(기존), `0x02`=recipher. run 루프가 분기.
+
+**v1 한계 (명시):**
+- announce를 **구 secret으로 봉인** → announce 프레임을 캡처한 퇴출 멤버는 secret' 복원 가능. 진짜 forward
+  eviction은 **멤버별 enc 키로 봉인** 필요(현재 enc 키가 로스터에 없음) → **P-C3b** 하드닝.
+- 전환 순간 멤버마다 교체 시점이 미세하게 달라 **짧은 끊김**. v1 수용; 구 cipher를 N초 유지하는 overlap은 후속.
+
 ## TL;DR (EN)
 Target protocol: a joiner's time-expiring random **identity code** → inviter turns it into an
 **invite code** via an algorithm kept secret (shared human-to-human), keyed by both seeds + an

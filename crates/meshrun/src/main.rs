@@ -65,7 +65,23 @@ async fn main() -> anyhow::Result<()> {
     let pinned = std::env::var("ADVERTISE").is_ok();
     let advertise = std::env::var("ADVERTISE").ok().and_then(|s| s.parse().ok());
     let my_endpoint = std::sync::Arc::new(std::sync::Mutex::new(advertise));
-    lattice_meshrun::run(dp, tun, transport, links, exit, my, my_endpoint, pinned).await;
+    // The standalone runner has no control-plane re-cipher trigger: a live cmd
+    // receiver that never fires, and a dropped applied receiver.
+    let (_rc_tx, rc_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ra_tx, _ra_rx) = tokio::sync::mpsc::unbounded_channel();
+    lattice_meshrun::run(
+        dp,
+        tun,
+        transport,
+        links,
+        exit,
+        my,
+        my_endpoint,
+        pinned,
+        rc_rx,
+        ra_tx,
+    )
+    .await;
     Ok(())
 }
 

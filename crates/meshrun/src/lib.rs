@@ -134,6 +134,57 @@ fn decode_gossip(payload: &[u8]) -> (Vec<(MemberId, SocketAddr)>, Option<SocketA
     (table, reflect)
 }
 
+/// Control-frame sub-tags (the first byte of a `Control` payload): gossip vs a
+/// re-cipher announce (P-C3), so one frame type carries both.
+const CTRL_GOSSIP: u8 = 0x01;
+const CTRL_RECIPHER: u8 = 0x02;
+
+/// A re-cipher: the new cipher epoch (P-C3, docs/PROTOCOL_DESIGN.md §11). Used both
+/// as the meshd→loop command and as the on-wire announce payload.
+#[derive(Clone)]
+pub struct Recipher {
+    pub epoch: u64,
+    pub cipher: String,
+    pub secret: [u8; 32],
+}
+
+/// meshd→loop: re-cipher now, announcing to `peers` (with the *old* cipher) then
+/// swapping locally.
+pub type RecipherCmdRx = tokio::sync::mpsc::UnboundedReceiver<(Recipher, Vec<MemberId>)>;
+/// loop→meshd: a re-cipher was applied (we initiated it, or received an announce) —
+/// the supervisor updates its stored secret/epoch/cipher.
+pub type RecipherAppliedTx = tokio::sync::mpsc::UnboundedSender<Recipher>;
+
+/// Encode a re-cipher announce: `[epoch(8 BE)][cipher_len(1)][cipher][secret(32)]`.
+fn encode_recipher(r: &Recipher) -> Vec<u8> {
+    let cb = r.cipher.as_bytes();
+    let mut v = Vec::with_capacity(8 + 1 + cb.len() + 32);
+    v.extend_from_slice(&r.epoch.to_be_bytes());
+    v.push(cb.len() as u8);
+    v.extend_from_slice(cb);
+    v.extend_from_slice(&r.secret);
+    v
+}
+
+fn decode_recipher(b: &[u8]) -> Option<Recipher> {
+    if b.len() < 9 {
+        return None;
+    }
+    let epoch = u64::from_be_bytes(b[0..8].try_into().ok()?);
+    let clen = b[8] as usize;
+    if b.len() < 9 + clen + 32 {
+        return None;
+    }
+    let cipher = String::from_utf8(b[9..9 + clen].to_vec()).ok()?;
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&b[9 + clen..9 + clen + 32]);
+    Some(Recipher {
+        epoch,
+        cipher,
+        secret,
+    })
+}
+
 /// Run the data-plane loop until the TUN or transport closes. `links` maps a member
 /// id → where to reach it + liveness (seeded from the invite, learned + gossiped
 /// thereafter); `exit` is the egress member for non-mesh traffic. `my_endpoint` is
@@ -142,7 +193,7 @@ fn decode_gossip(payload: &[u8]) -> (Vec<(MemberId, SocketAddr)>, Option<SocketA
 /// `endpoint_pinned` (an explicit MESHD_ADVERTISE for a known public node).
 #[allow(clippy::too_many_arguments)]
 pub async fn run<X: Transport + 'static>(
-    dp: MeshDataPlane,
+    mut dp: MeshDataPlane,
     mut tun: Box<dyn TunDevice>,
     transport: X,
     links: PeerLinks,
@@ -150,6 +201,8 @@ pub async fn run<X: Transport + 'static>(
     my_id: MemberId,
     my_endpoint: SharedEndpoint,
     endpoint_pinned: bool,
+    mut recipher_cmd: RecipherCmdRx,
+    recipher_applied: RecipherAppliedTx,
 ) {
     let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
     loop {
@@ -185,34 +238,50 @@ pub async fn run<X: Transport + 'static>(
                 }
                 match dp.recv(&frame) {
                     Some(Inbound::Deliver(inner)) => { let _ = tun.write_packet(&inner).await; }
-                    // Endpoint gossip: add members we don't know yet (the sender's own
-                    // current address already came from the src-learn above).
-                    Some(Inbound::Control(payload)) => {
-                        let (table, reflect) = decode_gossip(&payload);
-                        {
-                            let mut l = links.lock().unwrap();
-                            for (m, ep) in table {
-                                if m != my_id {
-                                    l.entry(m).or_insert(Link { endpoint: ep, last_seen_ms: 0 });
+                    // Control frame: gossip (endpoint table) or a re-cipher announce,
+                    // told apart by the first payload byte.
+                    Some(Inbound::Control(payload)) => match payload.first().copied() {
+                        Some(CTRL_GOSSIP) => {
+                            let (table, reflect) = decode_gossip(&payload[1..]);
+                            {
+                                let mut l = links.lock().unwrap();
+                                for (m, ep) in table {
+                                    if m != my_id {
+                                        l.entry(m).or_insert(Link { endpoint: ep, last_seen_ms: 0 });
+                                    }
+                                }
+                            }
+                            // P-D3: a peer reaching us from a PUBLIC source observed our
+                            // public NAT mapping and reflected it back. Adopt it as our
+                            // advertised endpoint (unless pinned) so peers on other
+                            // networks can reach us; the next gossip tick re-advertises it.
+                            if !endpoint_pinned && is_public(from.ip()) {
+                                if let Some(observed) = reflect {
+                                    let mut me = my_endpoint.lock().unwrap();
+                                    if *me != Some(observed) {
+                                        eprintln!(
+                                            "meshrun: learned public address {observed} (reflected by {from}) — re-advertising"
+                                        );
+                                        *me = Some(observed);
+                                    }
                                 }
                             }
                         }
-                        // P-D3: a peer reaching us from a PUBLIC source observed our
-                        // public NAT mapping and reflected it back. Adopt it as our
-                        // advertised endpoint (unless pinned) so peers on other
-                        // networks can reach us; the next gossip tick re-advertises it.
-                        if !endpoint_pinned && is_public(from.ip()) {
-                            if let Some(observed) = reflect {
-                                let mut me = my_endpoint.lock().unwrap();
-                                if *me != Some(observed) {
-                                    eprintln!(
-                                        "meshrun: learned public address {observed} (reflected by {from}) — re-advertising"
-                                    );
-                                    *me = Some(observed);
-                                }
+                        // P-C3: a member re-ciphered the mesh. We could open this frame
+                        // (so it's authentic), so swap our data plane to the new epoch
+                        // in place and report it up to the supervisor.
+                        Some(CTRL_RECIPHER) => {
+                            if let Some(r) = decode_recipher(&payload[1..]) {
+                                eprintln!("meshrun: re-cipher → epoch {} cipher {}", r.epoch, r.cipher);
+                                dp.recipher(
+                                    lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
+                                    &r.secret,
+                                );
+                                let _ = recipher_applied.send(r);
                             }
                         }
-                    }
+                        _ => {}
+                    },
                     // P5 relay: we're a hop, not the destination — pass the frame on
                     // unchanged (we don't need to decrypt to forward).
                     Some(Inbound::Forward { to }) => {
@@ -243,10 +312,30 @@ pub async fn run<X: Transport + 'static>(
                 for (m, addr) in peers {
                     // Per-peer payload: the shared table + a `self` line telling THIS
                     // peer where we observe it, so a NAT'd peer learns its public
-                    // address from us if we're public (P-D3).
-                    let payload = encode_gossip(&table, Some(addr));
+                    // address from us if we're public (P-D3). Tagged as gossip.
+                    let mut payload = vec![CTRL_GOSSIP];
+                    payload.extend_from_slice(&encode_gossip(&table, Some(addr)));
                     let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
                 }
+            }
+            // P-C3 initiator: meshd asked us to re-cipher. Announce to `peers` with the
+            // CURRENT (old) cipher — so present members can read it — then swap our own
+            // data plane to the new epoch and report it back up.
+            Some((r, peers)) = recipher_cmd.recv() => {
+                let mut payload = vec![CTRL_RECIPHER];
+                payload.extend_from_slice(&encode_recipher(&r));
+                for m in peers {
+                    let endpoint = links.lock().unwrap().get(&m).map(|l| l.endpoint);
+                    if let Some(addr) = endpoint {
+                        let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
+                    }
+                }
+                eprintln!("meshrun: re-ciphered (initiator) → epoch {} cipher {}", r.epoch, r.cipher);
+                dp.recipher(
+                    lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
+                    &r.secret,
+                );
+                let _ = recipher_applied.send(r);
             }
         }
     }
@@ -280,6 +369,16 @@ mod tests {
         Arc::new(Mutex::new(addr))
     }
 
+    // Dummy re-cipher channels for tests that don't exercise P-C3: the cmd receiver's
+    // sender is dropped (recv → None → branch disabled); the applied sender's receiver
+    // is dropped (send is a harmless error).
+    fn dummy_cmd() -> RecipherCmdRx {
+        tokio::sync::mpsc::unbounded_channel().1
+    }
+    fn dummy_applied() -> RecipherAppliedTx {
+        tokio::sync::mpsc::unbounded_channel().0
+    }
+
     fn ipv4_to(dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0u8; 28]; // 20B IPv4 header + 8B payload
         p[0] = 0x45; // v4, ihl 5
@@ -308,6 +407,8 @@ mod tests {
             1,
             ep(None),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         )); // Alice (member 1)
         tokio::spawn(run(
             dp(2),
@@ -318,6 +419,8 @@ mod tests {
             2,
             ep(None),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         )); // Bob   (member 2)
 
         // Inject an IP packet at Alice's TUN, destined for Bob's overlay IP.
@@ -353,6 +456,8 @@ mod tests {
             1,
             ep(None),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         )); // exit = member 2
         tokio::spawn(run(
             dp(2),
@@ -363,6 +468,8 @@ mod tests {
             2,
             ep(None),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         ));
 
         // A real internet destination (not in the mesh /24) → goes to the exit.
@@ -456,6 +563,8 @@ mod tests {
             1,
             ep(None),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -466,6 +575,8 @@ mod tests {
             2,
             ep(None),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         )); // relay hop
         tokio::spawn(run(
             dp(3),
@@ -476,6 +587,8 @@ mod tests {
             3,
             ep(None),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         ));
 
         let packet = ipv4_to("100.80.3.3".parse().unwrap()); // member 3 = C
@@ -532,6 +645,8 @@ mod tests {
             1,
             ep(Some(a)),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -542,6 +657,8 @@ mod tests {
             2,
             ep(Some(b)),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         ));
         tokio::spawn(run(
             dp(3),
@@ -552,6 +669,8 @@ mod tests {
             3,
             ep(Some(c)),
             false,
+            dummy_cmd(),
+            dummy_applied(),
         ));
 
         // Poll A's link table until C (member 3) appears, learned via B's gossip.
@@ -611,6 +730,8 @@ mod tests {
             1,
             ep(Some(a_pub)),
             true,
+            dummy_cmd(),
+            dummy_applied(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -621,6 +742,8 @@ mod tests {
             2,
             b_ep,
             false,
+            dummy_cmd(),
+            dummy_applied(),
         ));
 
         // B should adopt the public address A reflected (the `self` line in A's gossip).
@@ -636,5 +759,95 @@ mod tests {
         .await
         .expect("B never upgraded its endpoint from A's reflexion");
         assert_eq!(upgraded, Some(b_public));
+    }
+
+    #[test]
+    fn recipher_payload_roundtrips() {
+        let r = Recipher {
+            epoch: 7,
+            cipher: "timewindow".into(),
+            secret: [3u8; 32],
+        };
+        let got = decode_recipher(&encode_recipher(&r)).unwrap();
+        assert_eq!(got.epoch, 7);
+        assert_eq!(got.cipher, "timewindow");
+        assert_eq!(got.secret, [3u8; 32]);
+        assert!(decode_recipher(b"short").is_none());
+    }
+
+    /// P-C3 end-to-end: A initiates a re-cipher (via the cmd channel); the announce
+    /// reaches B (read with the OLD cipher), both swap to the new epoch in place, and
+    /// traffic keeps flowing on the new key.
+    #[tokio::test]
+    async fn recipher_rotates_both_nodes_and_traffic_keeps_flowing() {
+        let a_addr: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b_addr: SocketAddr = "10.0.0.2:2".parse().unwrap();
+        let (ta, tb) = duplex(a_addr, b_addr);
+        let (atun, ahandle) = MemoryTun::new();
+        let (btun, mut bhandle) = MemoryTun::new();
+        let a_eps = seed_links(std::iter::once((2u8, b_addr)).collect());
+        let b_eps = seed_links(std::iter::once((1u8, a_addr)).collect());
+
+        let (a_cmd_tx, a_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_applied_tx, mut b_applied_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(run(
+            dp(1),
+            Box::new(atun),
+            ta,
+            a_eps,
+            exit(None),
+            1,
+            ep(None),
+            false,
+            a_cmd_rx,
+            dummy_applied(),
+        ));
+        tokio::spawn(run(
+            dp(2),
+            Box::new(btun),
+            tb,
+            b_eps,
+            exit(None),
+            2,
+            ep(None),
+            false,
+            dummy_cmd(),
+            b_applied_tx,
+        ));
+
+        // Baseline: a packet flows on the original cipher.
+        let p1 = ipv4_to("100.80.3.2".parse().unwrap());
+        ahandle.inject.send(p1.clone()).await.unwrap();
+        let got1 = tokio::time::timeout(Duration::from_secs(2), bhandle.observe.recv())
+            .await
+            .expect("baseline packet timed out")
+            .unwrap();
+        assert_eq!(got1, p1);
+
+        // A re-ciphers to a fresh secret; wait for B to report it applied.
+        a_cmd_tx
+            .send((
+                Recipher {
+                    epoch: 1,
+                    cipher: "default".into(),
+                    secret: [99u8; 32],
+                },
+                vec![2],
+            ))
+            .unwrap();
+        let applied = tokio::time::timeout(Duration::from_secs(2), b_applied_rx.recv())
+            .await
+            .expect("B never applied the re-cipher")
+            .unwrap();
+        assert_eq!(applied.epoch, 1);
+
+        // Traffic still flows — now on the new key.
+        let p2 = ipv4_to("100.80.3.2".parse().unwrap());
+        ahandle.inject.send(p2.clone()).await.unwrap();
+        let got2 = tokio::time::timeout(Duration::from_secs(2), bhandle.observe.recv())
+            .await
+            .expect("post-re-cipher packet timed out")
+            .unwrap();
+        assert_eq!(got2, p2);
     }
 }

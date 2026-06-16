@@ -34,6 +34,14 @@ pub enum Request {
     },
     /// List the data-plane ciphers a mesh can be created with (populates the dropbox).
     Ciphers,
+    /// Re-cipher a mesh (P-C3): rotate to a fresh secret (and optionally a new
+    /// `cipher`), advancing the epoch. Needs ≥60% of the roster online; members that
+    /// are offline at the time are evicted (docs/PROTOCOL_DESIGN.md §11).
+    Recipher {
+        mesh: MeshId,
+        #[serde(default)]
+        cipher: Option<String>,
+    },
     /// Every mesh this node belongs to.
     ListMeshes,
     /// Full detail for one mesh.
@@ -125,6 +133,15 @@ pub struct InviteBlob {
     pub certs: Vec<Cert>,
     /// The mesh secret, sealed to the joiner's encryption public key.
     pub sealed_secret: SealedSecret,
+    /// The current cipher epoch (P-C3) — bumped by each re-cipher. The joiner brings
+    /// its data plane up at this epoch so it shares the live key. `#[serde(default)]`
+    /// = 0 for older invites.
+    #[serde(default)]
+    pub epoch: u64,
+    /// The mesh's **current** cipher name (P-C3) — may differ from the charter's
+    /// `initial_cipher` after a re-cipher. Empty (`serde(default)`) ⇒ use the charter.
+    #[serde(default)]
+    pub cipher: String,
     /// Bootstrap endpoints (`member_id`, `ip:port`) the joiner seeds its data plane
     /// with — at minimum the inviter's own address, plus any peers the inviter
     /// already reaches. Lets the joiner send to them immediately, before gossip
