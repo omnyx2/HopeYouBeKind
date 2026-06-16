@@ -51,6 +51,17 @@ no matter where they physically are. No central server to run, no accounts.
 Each box is its own crate so features, tests, and version bumps move
 independently. Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+## Make your first VPN (beginner guide)
+
+New here? The hands-on, bilingual beginner guides walk you from zero to a working
+VPN using the friendly [`lattice` CLI](scripts/lattice):
+
+- **English** — [Getting started](docs/guides/getting-started.en.md) ·
+  [Feature cookbook](docs/guides/cookbook.en.md)
+- **한국어** — [시작하기](docs/guides/getting-started.ko.md) ·
+  [기능 쿡북](docs/guides/cookbook.ko.md)
+- Index: [`docs/guides/`](docs/guides/README.md)
+
 ## Quick start (developers)
 
 ```bash

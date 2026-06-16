@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+lattice — a friendly command-line client for the v2 mesh daemon (`meshd`).
+
+`meshd` speaks newline-delimited JSON over a unix socket. This wraps that wire
+in human subcommands so you never hand-write JSON. Zero dependencies (Python 3
+stdlib only).
+
+Quick start:
+    lattice new home --me alice          # create a mesh, become member #1
+    lattice id                           # (on a 2nd machine) print an identity code
+    lattice invite home bob <id-code>    # (on the host) mint an invite for bob
+    lattice join <invite-code>           # (on the 2nd machine) join with it
+    lattice ls                           # list meshes
+    lattice info home                    # members, liveness, exit, cipher
+    lattice exit home alice              # pick alice as the internet exit
+    lattice vpn home                     # route ALL traffic through that exit
+    lattice off                          # back to direct internet
+
+The socket defaults to $LATTICE_SOCK or /tmp/lattice-meshd.sock
+(Windows: \\.\pipe\lattice-meshd — use --sock to override).
+"""
+
+import argparse
+import base64
+import json
+import os
+import socket
+import sys
+
+DEFAULT_SOCK = os.environ.get("LATTICE_SOCK", "/tmp/lattice-meshd.sock")
+
+
+# ----------------------------- transport -----------------------------
+def call(sock_path, request):
+    """Send one Request dict, return the parsed Response dict (or raise)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    try:
+        s.connect(sock_path)
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        die(f"meshd not reachable at {sock_path} ({e}). Is the daemon running?")
+    s.sendall((json.dumps(request) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    if not buf.strip():
+        die("empty reply from meshd")
+    reply = json.loads(buf.decode().strip())
+    if isinstance(reply, dict) and "Error" in reply:
+        die("meshd: " + reply["Error"].get("message", "unknown error"))
+    return reply
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ----------------------------- helpers -----------------------------
+def b64(obj):
+    return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
+
+
+def unb64(s):
+    try:
+        return json.loads(base64.urlsafe_b64decode(s.strip().encode()))
+    except Exception as e:
+        die(f"malformed code: {e}")
+
+
+def resolve_mesh(sock, ref):
+    """Accept a mesh id (number) or a mesh name; return the numeric id."""
+    if ref.isdigit():
+        return int(ref)
+    meshes = call(sock, "ListMeshes").get("Meshes", [])
+    for m in meshes:
+        if m["name"] == ref:
+            return m["id"]
+    die(f"no mesh named '{ref}' (try `lattice ls`)")
+
+
+def resolve_member(sock, mesh_id, ref):
+    """Accept a member id (number) or an in-mesh name; return the numeric id."""
+    if ref.isdigit():
+        return int(ref)
+    detail = call(sock, {"MeshInfo": {"mesh": mesh_id}})["Mesh"]
+    for mb in detail["members"]:
+        if mb["name"] == ref:
+            return mb["id"]
+    die(f"no member named '{ref}' in mesh {mesh_id} (try `lattice info {mesh_id}`)")
+
+
+# ----------------------------- commands -----------------------------
+def cmd_ls(sock, a):
+    meshes = call(sock, "ListMeshes").get("Meshes", [])
+    if not meshes:
+        print("no meshes yet — create one with `lattice new <name>`")
+        return
+    print(f"{'ID':>2}  {'NAME':<16} {'MEMBERS':>7} {'EPOCH':>5}  {'EXIT':>5}  EGRESS")
+    for m in meshes:
+        egress = "→ THIS MESH" if m.get("is_current") else "direct"
+        exit_s = f"#{m['exit']}" if m.get("exit") is not None else "—"
+        flag = " ⚠ATTACK" if m.get("attack_armed_secs_left") is not None else ""
+        print(f"{m['id']:>2}  {m['name']:<16} {m['members']:>7} {m['epoch']:>5}  "
+              f"{exit_s:>5}  {egress}{flag}")
+
+
+def cmd_info(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    d = call(sock, {"MeshInfo": {"mesh": mid}})["Mesh"]
+    sd = "ephemeral (self-destruct when isolated)" if d.get("self_destruct") else "persistent"
+    print(f"mesh #{d['id']}  {d['name']}")
+    print(f"  cipher     {d['cipher']}   epoch {d['epoch']}")
+    print(f"  charter    {d['invite']} · {d['trigger']} · max {d['max_members']} · {sd}")
+    print(f"  health     {d['live']}/{len(d['members'])} live · floor {d['threshold']}")
+    if d.get("attack_armed_secs_left") is not None:
+        print(f"  ⚠ ATTACK   self-destruct in {d['attack_armed_secs_left']}s "
+              f"(creator: `lattice allclear {d['name']}`)")
+    print(f"  exit       {('#' + str(d['exit'])) if d['exit'] is not None else 'none'}")
+    print("  members:")
+    for mb in d["members"]:
+        me = " (me)" if mb["is_me"] else ""
+        ep = mb.get("endpoint") or "—"
+        print(f"    #{mb['id']:<3} {mb['name']:<14} {mb['state']:<8} {ep}{me}")
+
+
+def cmd_new(sock, a):
+    req = {"CreateMesh": {
+        "name": a.name, "my_name": a.me, "max_members": a.max,
+        "cipher": a.cipher, "self_destruct": a.ephemeral}}
+    r = call(sock, req)
+    mid = r["MeshCreated"]["mesh"]
+    print(f"created mesh #{mid} '{a.name}' — you are '{a.me}'.")
+    print(f"invite someone: ask them for `lattice id`, then `lattice invite {a.name} <name> <id-code>`")
+
+
+def cmd_id(sock, a):
+    r = call(sock, "NewIdentity")["Identity"]
+    print("# Your identity code — send this ONE line to the mesh host:", file=sys.stderr)
+    print("# (valid ~10 min; host runs: lattice invite <mesh> <your-name> <this-code>)",
+          file=sys.stderr)
+    print(b64(r))  # stdout = just the code, so `$(lattice id)` is clean
+
+
+def cmd_invite(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    ident = unb64(a.id_code)
+    req = {"CreateInvite": {
+        "mesh": mid, "name": a.name,
+        "member_pubkey_hex": ident["member_pubkey_hex"],
+        "enc_pubkey_hex": ident["enc_pubkey_hex"],
+        "issued_at": ident.get("issued_at", 0)}}
+    if a.algo:
+        req["CreateInvite"]["algo"] = a.algo
+    inv = call(sock, req)["Invite"]
+    print("# Invite code — send this ONE line back to the joiner:", file=sys.stderr)
+    if a.algo:
+        print(f"# Tell them the invite-algorithm out-of-band: {a.algo}", file=sys.stderr)
+    print(b64(inv))  # stdout = just the code
+
+
+def cmd_join(sock, a):
+    inv = unb64(a.invite_code)
+    req = {"JoinMesh": {"invite": inv}}
+    if a.algo:
+        req["JoinMesh"]["algo"] = a.algo
+    r = call(sock, req)
+    mid = r.get("MeshCreated", {}).get("mesh")
+    print(f"joined mesh #{mid}. `lattice info {mid}` to see peers.")
+
+
+def cmd_exit(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    eid = resolve_member(sock, mid, a.member)
+    call(sock, {"SetExit": {"mesh": mid, "exit": eid}})
+    print(f"exit for mesh {mid} set to member #{eid}. `lattice vpn {a.mesh}` to route through it.")
+
+
+def cmd_vpn(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    call(sock, {"SetCurrent": {"mesh": mid}})
+    print(f"full tunnel ON — all internet traffic now exits via mesh {mid}. `lattice off` to stop.")
+
+
+def cmd_off(sock, a):
+    call(sock, {"SetCurrent": {"mesh": None}})
+    print("full tunnel OFF — back to direct internet.")
+
+
+def cmd_recipher(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    req = {"Recipher": {"mesh": mid, "cipher": a.cipher}}
+    call(sock, req)
+    print(f"mesh {mid} re-ciphered (epoch bumped). Offline members were evicted.")
+
+
+def cmd_attack(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    call(sock, {"ReportAttack": {"mesh": mid}})
+    print(f"⚠ attack reported on mesh {mid}. Every member self-destructs unless the "
+          f"creator runs `lattice allclear {a.mesh}` within the grace window.")
+
+
+def cmd_allclear(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    call(sock, {"AllClear": {"mesh": mid}})
+    print(f"all-clear sent for mesh {mid} — self-destruct cancelled.")
+
+
+def cmd_rm(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    call(sock, {"RemoveMesh": {"mesh": mid}})
+    print(f"mesh {mid} wiped from this computer.")
+
+
+def cmd_ciphers(sock, a):
+    for c in call(sock, "Ciphers").get("Ciphers", []):
+        print(c)
+
+
+def cmd_algos(sock, a):
+    for c in call(sock, "InviteAlgorithms").get("Ciphers", []):
+        print(c)
+
+
+def cmd_policy(sock, a):
+    p = call(sock, "GetPolicy")["Policy"]
+    print(f"default route: {p['default']}")
+    print(f"current mesh:  {p['current_mesh']}")
+
+
+def cmd_raw(sock, a):
+    req = json.loads(a.json)
+    print(json.dumps(call(sock, req), indent=2))
+
+
+# ----------------------------- arg parser -----------------------------
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="lattice", description="Friendly CLI for the Lattice v2 mesh daemon.")
+    p.add_argument("--sock", default=DEFAULT_SOCK,
+                   help=f"meshd socket (default {DEFAULT_SOCK})")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("ls", help="list meshes on this computer")
+    s.set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("info", help="show one mesh (members, liveness, exit)")
+    s.add_argument("mesh", help="mesh id or name")
+    s.set_defaults(fn=cmd_info)
+
+    s = sub.add_parser("new", help="create a new mesh (you become member #1)")
+    s.add_argument("name", help="mesh label")
+    s.add_argument("--me", default="me", help="your in-mesh name (default: me)")
+    s.add_argument("--max", type=int, default=254, help="max members 1..254")
+    s.add_argument("--cipher", default=None, help="data-plane cipher (see `lattice ciphers`)")
+    s.add_argument("--ephemeral", action="store_true",
+                   help="self-destruct keys when the mesh loses live quorum (default off)")
+    s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("id", help="mint an identity code to hand to a mesh host")
+    s.set_defaults(fn=cmd_id)
+
+    s = sub.add_parser("invite", help="(host) mint an invite for a joiner's identity code")
+    s.add_argument("mesh", help="mesh id or name")
+    s.add_argument("name", help="the joiner's in-mesh name")
+    s.add_argument("id_code", help="the joiner's identity code (from `lattice id`)")
+    s.add_argument("--algo", default=None, help="invite-wrap algorithm (secrecy; see `lattice algos`)")
+    s.set_defaults(fn=cmd_invite)
+
+    s = sub.add_parser("join", help="join a mesh from an invite code")
+    s.add_argument("invite_code", help="the invite code (from the host's `lattice invite`)")
+    s.add_argument("--algo", default=None, help="invite-wrap algorithm the host used")
+    s.set_defaults(fn=cmd_join)
+
+    s = sub.add_parser("exit", help="pick which member is the internet exit")
+    s.add_argument("mesh", help="mesh id or name")
+    s.add_argument("member", help="member id or name")
+    s.set_defaults(fn=cmd_exit)
+
+    s = sub.add_parser("vpn", help="route ALL internet traffic through the mesh exit")
+    s.add_argument("mesh", help="mesh id or name")
+    s.set_defaults(fn=cmd_vpn)
+
+    s = sub.add_parser("off", help="stop full tunnel; back to direct internet")
+    s.set_defaults(fn=cmd_off)
+
+    s = sub.add_parser("recipher", help="rotate the mesh key (evicts offline members)")
+    s.add_argument("mesh", help="mesh id or name")
+    s.add_argument("--cipher", default=None, help="optionally switch cipher too")
+    s.set_defaults(fn=cmd_recipher)
+
+    s = sub.add_parser("attack", help="raise an attack alert (one-veto self-destruct)")
+    s.add_argument("mesh", help="mesh id or name")
+    s.set_defaults(fn=cmd_attack)
+
+    s = sub.add_parser("allclear", help="(creator) cancel an attack alert")
+    s.add_argument("mesh", help="mesh id or name")
+    s.set_defaults(fn=cmd_allclear)
+
+    s = sub.add_parser("rm", help="wipe a mesh from this computer")
+    s.add_argument("mesh", help="mesh id or name")
+    s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("ciphers", help="list available data-plane ciphers")
+    s.set_defaults(fn=cmd_ciphers)
+    s = sub.add_parser("algos", help="list invite-wrap algorithms")
+    s.set_defaults(fn=cmd_algos)
+    s = sub.add_parser("policy", help="show the current routing policy")
+    s.set_defaults(fn=cmd_policy)
+
+    s = sub.add_parser("raw", help="send a raw JSON request (escape hatch)")
+    s.add_argument("json", help='e.g. \'{"ListMeshes":null}\'')
+    s.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.fn(args.sock, args)
+
+
+if __name__ == "__main__":
+    main()
