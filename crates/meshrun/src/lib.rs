@@ -35,6 +35,30 @@ pub type PeerLinks = Arc<Mutex<HashMap<MemberId, Link>>>;
 /// supervisor can change egress live (the GUI's egress toggle) without a respawn.
 pub type SharedExit = Arc<Mutex<Option<MemberId>>>;
 
+/// This node's own advertised endpoint (`ip:port`), shared so a supervisor (meshd)
+/// reads the current value for invites/gossip while the run loop updates it — it
+/// changes when a public peer reflects our public (reflexive) address to us (P-D3).
+pub type SharedEndpoint = Arc<Mutex<Option<SocketAddr>>>;
+
+/// Is `ip` a globally-routable (public) address? Used to decide whether to trust a
+/// peer's reflexion of our address: only a peer reaching us over the public internet
+/// observes our public NAT mapping (P-D3). Private/loopback/link-local/CGNAT = not.
+fn is_public(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let cgnat = o[0] == 100 && (64..=127).contains(&o[1]); // 100.64.0.0/10
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || cgnat)
+        }
+        std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified()),
+    }
+}
+
 /// Unix epoch milliseconds (best-effort; 0 if the clock is before the epoch).
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -73,29 +97,46 @@ pub fn ipv4_dst(p: &[u8]) -> Option<Ipv4Addr> {
 /// DISCOVERY.md §3,§6).
 const GOSSIP_INTERVAL_SECS: u64 = 20;
 
-/// Encode an endpoint table as `id ip:port` lines (the gossip payload, sealed).
-fn encode_gossip(table: &[(MemberId, SocketAddr)]) -> Vec<u8> {
+/// Encode the gossip payload (sealed): the endpoint table as `id ip:port` lines,
+/// plus an optional `self ip:port` line = "where I observe YOU (the recipient)",
+/// the reflexion that lets a NAT'd peer learn its public address (P-D3).
+fn encode_gossip(table: &[(MemberId, SocketAddr)], reflect: Option<SocketAddr>) -> Vec<u8> {
     let mut s = String::new();
     for (m, a) in table {
         s.push_str(&format!("{m} {a}\n"));
     }
+    if let Some(r) = reflect {
+        s.push_str(&format!("self {r}\n"));
+    }
     s.into_bytes()
 }
 
-fn decode_gossip(payload: &[u8]) -> Vec<(MemberId, SocketAddr)> {
-    String::from_utf8_lossy(payload)
-        .lines()
-        .filter_map(|line| {
-            let (m, a) = line.trim().split_once(' ')?;
-            Some((m.parse().ok()?, a.parse().ok()?))
-        })
-        .collect()
+/// Decode a gossip payload → (endpoint table, our reflexive address if the sender
+/// reported one). Unknown/garbage lines are skipped (older senders sent no `self`).
+fn decode_gossip(payload: &[u8]) -> (Vec<(MemberId, SocketAddr)>, Option<SocketAddr>) {
+    let mut table = Vec::new();
+    let mut reflect = None;
+    for line in String::from_utf8_lossy(payload).lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("self ") {
+            if let Ok(a) = rest.trim().parse() {
+                reflect = Some(a);
+            }
+        } else if let Some((m, a)) = line.split_once(' ') {
+            if let (Ok(m), Ok(a)) = (m.parse::<MemberId>(), a.parse()) {
+                table.push((m, a));
+            }
+        }
+    }
+    (table, reflect)
 }
 
 /// Run the data-plane loop until the TUN or transport closes. `links` maps a member
 /// id → where to reach it + liveness (seeded from the invite, learned + gossiped
 /// thereafter); `exit` is the egress member for non-mesh traffic. `my_endpoint` is
-/// this node's own reachable address, advertised in the gossip (docs/DISCOVERY.md).
+/// this node's own advertised address (shared with the supervisor); the loop upgrades
+/// it to our public address when a public peer reflects it (P-D3), unless
+/// `endpoint_pinned` (an explicit MESHD_ADVERTISE for a known public node).
 #[allow(clippy::too_many_arguments)]
 pub async fn run<X: Transport + 'static>(
     dp: MeshDataPlane,
@@ -104,7 +145,8 @@ pub async fn run<X: Transport + 'static>(
     links: PeerLinks,
     exit: SharedExit,
     my_id: MemberId,
-    my_endpoint: Option<SocketAddr>,
+    my_endpoint: SharedEndpoint,
+    endpoint_pinned: bool,
 ) {
     let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
     loop {
@@ -139,10 +181,28 @@ pub async fn run<X: Transport + 'static>(
                     // Endpoint gossip: add members we don't know yet (the sender's own
                     // current address already came from the src-learn above).
                     Some(Inbound::Control(payload)) => {
-                        let mut l = links.lock().unwrap();
-                        for (m, ep) in decode_gossip(&payload) {
-                            if m != my_id {
-                                l.entry(m).or_insert(Link { endpoint: ep, last_seen_ms: 0 });
+                        let (table, reflect) = decode_gossip(&payload);
+                        {
+                            let mut l = links.lock().unwrap();
+                            for (m, ep) in table {
+                                if m != my_id {
+                                    l.entry(m).or_insert(Link { endpoint: ep, last_seen_ms: 0 });
+                                }
+                            }
+                        }
+                        // P-D3: a peer reaching us from a PUBLIC source observed our
+                        // public NAT mapping and reflected it back. Adopt it as our
+                        // advertised endpoint (unless pinned) so peers on other
+                        // networks can reach us; the next gossip tick re-advertises it.
+                        if !endpoint_pinned && is_public(from.ip()) {
+                            if let Some(observed) = reflect {
+                                let mut me = my_endpoint.lock().unwrap();
+                                if *me != Some(observed) {
+                                    eprintln!(
+                                        "meshrun: learned public address {observed} (reflected by {from}) — re-advertising"
+                                    );
+                                    *me = Some(observed);
+                                }
                             }
                         }
                     }
@@ -161,18 +221,23 @@ pub async fn run<X: Transport + 'static>(
             // keepalive + liveness ping). The first tick fires immediately → fast
             // bootstrap from the invite-seeded links.
             _ = gossip.tick() => {
-                let (peers, payload) = {
+                let my_ep = *my_endpoint.lock().unwrap();
+                let (peers, table) = {
                     let l = links.lock().unwrap();
                     let mut table: Vec<(MemberId, SocketAddr)> =
                         l.iter().map(|(m, lk)| (*m, lk.endpoint)).collect();
-                    if let Some(ep) = my_endpoint {
+                    if let Some(ep) = my_ep {
                         table.push((my_id, ep));
                     }
                     let peers: Vec<(MemberId, SocketAddr)> =
                         l.iter().map(|(m, lk)| (*m, lk.endpoint)).collect();
-                    (peers, encode_gossip(&table))
+                    (peers, table)
                 };
                 for (m, addr) in peers {
+                    // Per-peer payload: the shared table + a `self` line telling THIS
+                    // peer where we observe it, so a NAT'd peer learns its public
+                    // address from us if we're public (P-D3).
+                    let payload = encode_gossip(&table, Some(addr));
                     let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
                 }
             }
@@ -198,6 +263,10 @@ mod tests {
         Arc::new(Mutex::new(member))
     }
 
+    fn ep(addr: Option<SocketAddr>) -> SharedEndpoint {
+        Arc::new(Mutex::new(addr))
+    }
+
     fn ipv4_to(dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0u8; 28]; // 20B IPv4 header + 8B payload
         p[0] = 0x45; // v4, ihl 5
@@ -217,8 +286,26 @@ mod tests {
         let a_eps = seed_links(std::iter::once((2u8, b_addr)).collect());
         let b_eps = seed_links(std::iter::once((1u8, a_addr)).collect());
 
-        tokio::spawn(run(dp(1), Box::new(atun), ta, a_eps, exit(None), 1, None)); // Alice (member 1)
-        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps, exit(None), 2, None)); // Bob   (member 2)
+        tokio::spawn(run(
+            dp(1),
+            Box::new(atun),
+            ta,
+            a_eps,
+            exit(None),
+            1,
+            ep(None),
+            false,
+        )); // Alice (member 1)
+        tokio::spawn(run(
+            dp(2),
+            Box::new(btun),
+            tb,
+            b_eps,
+            exit(None),
+            2,
+            ep(None),
+            false,
+        )); // Bob   (member 2)
 
         // Inject an IP packet at Alice's TUN, destined for Bob's overlay IP.
         let packet = ipv4_to("100.80.3.2".parse().unwrap()); // mesh 3, member 2
@@ -251,9 +338,19 @@ mod tests {
             a_eps,
             exit(Some(2)),
             1,
-            None,
+            ep(None),
+            false,
         )); // exit = member 2
-        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps, exit(None), 2, None));
+        tokio::spawn(run(
+            dp(2),
+            Box::new(btun),
+            tb,
+            b_eps,
+            exit(None),
+            2,
+            ep(None),
+            false,
+        ));
 
         // A real internet destination (not in the mesh /24) → goes to the exit.
         let packet = ipv4_to("1.1.1.1".parse().unwrap());
@@ -344,7 +441,8 @@ mod tests {
             a_eps,
             exit(None),
             1,
-            None,
+            ep(None),
+            false,
         ));
         tokio::spawn(run(
             dp(2),
@@ -353,7 +451,8 @@ mod tests {
             b_eps,
             exit(None),
             2,
-            None,
+            ep(None),
+            false,
         )); // relay hop
         tokio::spawn(run(
             dp(3),
@@ -362,7 +461,8 @@ mod tests {
             c_eps,
             exit(None),
             3,
-            None,
+            ep(None),
+            false,
         ));
 
         let packet = ipv4_to("100.80.3.3".parse().unwrap()); // member 3 = C
@@ -381,10 +481,15 @@ mod tests {
             (1u8, "10.0.0.1:42001".parse().unwrap()),
             (7u8, "203.0.113.9:42007".parse().unwrap()),
         ];
-        let bytes = encode_gossip(&table);
-        assert_eq!(decode_gossip(&bytes), table);
-        // Garbage lines are skipped, not fatal.
-        assert!(decode_gossip(b"not a line\n2 1.2.3.4:5\nbad").len() == 1);
+        let reflect: SocketAddr = "198.51.100.7:55000".parse().unwrap();
+        let bytes = encode_gossip(&table, Some(reflect));
+        let (got_table, got_reflect) = decode_gossip(&bytes);
+        assert_eq!(got_table, table);
+        assert_eq!(got_reflect, Some(reflect));
+        // Garbage lines are skipped, the table survives, no `self` ⇒ no reflexion.
+        let (t, r) = decode_gossip(b"not a line\n2 1.2.3.4:5\nbad");
+        assert_eq!(t.len(), 1);
+        assert_eq!(r, None);
     }
 
     /// A doesn't know C's endpoint at start; B knows both. After the first gossip
@@ -412,7 +517,8 @@ mod tests {
             a_eps,
             exit(None),
             1,
-            Some(a),
+            ep(Some(a)),
+            false,
         ));
         tokio::spawn(run(
             dp(2),
@@ -421,7 +527,8 @@ mod tests {
             b_eps,
             exit(None),
             2,
-            Some(b),
+            ep(Some(b)),
+            false,
         ));
         tokio::spawn(run(
             dp(3),
@@ -430,7 +537,8 @@ mod tests {
             c_eps,
             exit(None),
             3,
-            Some(c),
+            ep(Some(c)),
+            false,
         ));
 
         // Poll A's link table until C (member 3) appears, learned via B's gossip.
@@ -445,5 +553,75 @@ mod tests {
         .await
         .expect("A never learned C's endpoint from gossip");
         assert_eq!(learned, c);
+    }
+
+    #[test]
+    fn is_public_classifies_addresses() {
+        let pub_ = |s: &str| is_public(s.parse().unwrap());
+        assert!(pub_("203.0.113.10")); // the Oracle exit
+        assert!(pub_("203.0.113.9"));
+        assert!(!pub_("10.0.0.5")); // campus LAN
+        assert!(!pub_("192.168.0.5"));
+        assert!(!pub_("172.16.4.4"));
+        assert!(!pub_("100.100.0.1")); // CGNAT
+        assert!(!pub_("127.0.0.1"));
+        assert!(!pub_("169.254.1.1"));
+    }
+
+    /// P-D3: a NAT'd node (B) advertises only its LAN address; a PUBLIC peer (A)
+    /// observes B's public mapping and reflects it in gossip. B adopts it as its own
+    /// advertised endpoint, so other-network peers can later reach B.
+    #[tokio::test]
+    async fn reflexion_from_a_public_peer_upgrades_our_endpoint() {
+        let net = hub::Hub::default();
+        // A is public; B sits behind NAT — the hub delivers B's frames to A stamped
+        // with B's *public* source (what A would see on the internet).
+        let a_pub: SocketAddr = "198.51.100.10:41000".parse().unwrap();
+        let b_lan: SocketAddr = "10.0.0.2:2".parse().unwrap();
+        let b_public: SocketAddr = "203.0.113.55:50000".parse().unwrap();
+        let (atun, _ah) = MemoryTun::new();
+        let (btun, _bh) = MemoryTun::new();
+
+        // A knows B at its public address; B knows A. B advertises only its LAN addr.
+        let a_eps = seed_links(std::iter::once((2u8, b_public)).collect());
+        let b_eps = seed_links(std::iter::once((1u8, a_pub)).collect());
+        let b_ep = ep(Some(b_lan));
+        let b_view = Arc::clone(&b_ep);
+
+        // A is pinned-public; B is not pinned and starts at its LAN address.
+        tokio::spawn(run(
+            dp(1),
+            Box::new(atun),
+            net.node(a_pub),
+            a_eps,
+            exit(None),
+            1,
+            ep(Some(a_pub)),
+            true,
+        ));
+        tokio::spawn(run(
+            dp(2),
+            Box::new(btun),
+            net.node(b_public),
+            b_eps,
+            exit(None),
+            2,
+            b_ep,
+            false,
+        ));
+
+        // B should adopt the public address A reflected (the `self` line in A's gossip).
+        let upgraded = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cur = *b_view.lock().unwrap();
+                if cur == Some(b_public) {
+                    break cur;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("B never upgraded its endpoint from A's reflexion");
+        assert_eq!(upgraded, Some(b_public));
     }
 }

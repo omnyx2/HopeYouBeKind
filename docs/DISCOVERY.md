@@ -101,7 +101,15 @@ self-healing cache** (re-learn + re-gossip + keepalive + relay). / 즉 churn은 
   every `GOSSIP_INTERVAL_SECS` (20 s; first tick immediate) to each known peer + NAT
   keepalive; on recv `Inbound::Control`, merge unknown members into `PeerLinks`. Own
   advertised endpoint = `MESHD_ADVERTISE` (public nodes) else the primary LAN addr.
-- ⏳ **reflexive address** per node (STUN; explicit for public nodes via env/flag) — P-D3.
+- ✅ **P-D3 reflexive address via peer reflexion** — instead of an external STUN server,
+  our own **public peer reflects** what it observes. The gossip payload carries a
+  per-recipient `self ip:port` line = "where I (sender) see YOU"; a receiver adopts it
+  as its advertised endpoint **only when the sender's source address is public**
+  (`is_public`), i.e. the sender saw our real NAT mapping. `MESHD_ADVERTISE` nodes are
+  `endpoint_pinned` (never overridden). Same UDP socket ⇒ the observed mapping is the
+  one peers actually use (no separate-socket port mismatch). `my_endpoint` is a shared
+  handle so meshd's invites pick up the upgraded address. LIVE: a campus-NAT Mac learned
+  `203.0.113.20:25459` reflected by the Oracle exit and re-advertised it.
 - ⏳ retire the manual **SetPeer** UI once gossip lands (keep as a fallback/override).
 
 ## Phases / 단계
@@ -109,7 +117,9 @@ self-healing cache** (re-learn + re-gossip + keepalive + relay). / 즉 churn은 
    win; unblocks 2-node joins without SetPeer). / 합류자가 초대자에 바로 닿음(가장 작은 성과).
 2. ✅ **P-D2 gossip Control frames** — endpoint table emit/merge in `run`; convergence.
    / 엔드포인트 테이블 송수신·병합; 수렴.
-3. **P-D3 reflexive (STUN)** — auto public address; public nodes set it explicitly.
-   / 자동 공인 주소; 공인 노드는 명시.
+3. ✅ **P-D3 reflexive address** — a public peer reflects our observed public address in
+   the gossip (`self` line); we adopt it when the reporter's source is public. Our own
+   exit doubles as the STUN reflector — no external server. / 공인 피어가 가십으로 우리
+   공인 주소를 반사(`self` 줄), 보고자 출발지가 공인일 때 채택. exit이 STUN 역할 — 외부 서버 X.
 4. **P-D4 LAN fast-path (mDNS)** — same-router peers find each other without the WAN.
    / 같은 공유기 피어를 WAN 없이.

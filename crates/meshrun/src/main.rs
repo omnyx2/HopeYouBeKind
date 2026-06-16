@@ -60,10 +60,12 @@ async fn main() -> anyhow::Result<()> {
     let dp = MeshDataPlane::new(mesh, my, prefix, suite("default", &secret, 0));
     let links = lattice_meshrun::seed_links(endpoints);
     let exit = std::sync::Arc::new(std::sync::Mutex::new(exit));
-    // This node's own reachable address, advertised in the gossip (ADVERTISE= for a
-    // public node; otherwise peers learn us from the frames we send).
+    // This node's own reachable address. ADVERTISE= pins it (a known public node);
+    // otherwise it starts unset and is filled by a public peer's reflexion (P-D3).
+    let pinned = std::env::var("ADVERTISE").is_ok();
     let advertise = std::env::var("ADVERTISE").ok().and_then(|s| s.parse().ok());
-    lattice_meshrun::run(dp, tun, transport, links, exit, my, advertise).await;
+    let my_endpoint = std::sync::Arc::new(std::sync::Mutex::new(advertise));
+    lattice_meshrun::run(dp, tun, transport, links, exit, my, my_endpoint, pinned).await;
     Ok(())
 }
 

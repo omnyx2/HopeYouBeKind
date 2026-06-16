@@ -25,7 +25,7 @@ use lattice_mesh::ipc::{
 use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey};
 use lattice_mesh::Mesh;
-use lattice_meshrun::{seed_links, Link, PeerLinks, SharedExit};
+use lattice_meshrun::{seed_links, Link, PeerLinks, SharedEndpoint, SharedExit};
 use lattice_net::udp::UdpTransport;
 use lattice_proto::wire_v2::{MemberId, MeshId};
 use lattice_proto::VirtualIp;
@@ -74,9 +74,10 @@ struct MeshState {
     /// The OS interface name of this mesh's TUN (set at bringup) — needed to divert
     /// the default route for full-tunnel egress.
     tun_name: Option<String>,
-    /// This node's own advertised data-plane endpoint (`ip:port`), set at bringup.
-    /// Handed to joiners in the invite so they can reach us at once (P-D1).
-    my_endpoint: Option<SocketAddr>,
+    /// This node's own advertised data-plane endpoint (`ip:port`), shared with the
+    /// run loop. Set at bringup; the loop upgrades it to our public address when a
+    /// public peer reflects it (P-D3). Read by CreateInvite to hand joiners (P-D1).
+    my_endpoint: SharedEndpoint,
 }
 
 impl MeshState {
@@ -137,6 +138,7 @@ struct Bringup {
     cipher: String,
     links: PeerLinks,
     exit_sel: SharedExit,
+    my_endpoint: SharedEndpoint,
 }
 
 fn now_ms() -> u64 {
@@ -294,22 +296,28 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     exit::enable_nat();
     // This node's own reachable address, advertised in the endpoint gossip so peers
     // can reach us without a manual SetPeer (docs/DISCOVERY.md §2). A public node
-    // (the Oracle exit) pins it via MESHD_ADVERTISE=ip:port; otherwise advertise the
-    // primary LAN address on our bind port (good for same-router peers; WAN peers
-    // still re-learn us from the frames we send / via a relay).
+    // (the Oracle exit) PINS it via MESHD_ADVERTISE=ip:port — never overridden;
+    // otherwise we start at the primary LAN address (same-router peers) and the run
+    // loop upgrades it to our public address when a public peer reflects it (P-D3).
+    let pinned = std::env::var("MESHD_ADVERTISE").is_ok();
     let advertise: Option<SocketAddr> = std::env::var("MESHD_ADVERTISE")
         .ok()
         .and_then(|s| s.parse().ok())
         .or_else(|| local_ip().map(|ip| SocketAddr::new(ip, port)));
-    if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
-        ms.my_endpoint = advertise;
-    }
+    *b.my_endpoint.lock().unwrap() = advertise;
     eprintln!(
-        "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}, advertise {advertise:?}",
+        "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}, advertise {advertise:?} pinned={pinned}",
         b.mesh_id
     );
     tokio::spawn(lattice_meshrun::run(
-        dp, tun, transport, b.links, b.exit_sel, b.my_id, advertise,
+        dp,
+        tun,
+        transport,
+        b.links,
+        b.exit_sel,
+        b.my_id,
+        Arc::clone(&b.my_endpoint),
+        pinned,
     ));
 }
 
@@ -632,7 +640,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             // plane with these so it can send to us (and them) before gossip
             // converges — no manual SetPeer needed.
             let mut endpoints: Vec<(MemberId, String)> = Vec::new();
-            if let Some(ep) = ms.my_endpoint {
+            if let Some(ep) = *ms.my_endpoint.lock().unwrap() {
                 endpoints.push((ms.my_id(), ep.to_string()));
             }
             for (m, link) in ms.links.lock().unwrap().iter() {
@@ -709,6 +717,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     }
     let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let mesh = Mesh::new(
         invite.mesh_id,
         invite.mesh_name.clone(),
@@ -723,6 +732,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         cipher,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
+        my_endpoint: Arc::clone(&my_endpoint),
     });
     st.meshes.insert(
         invite.mesh_id,
@@ -736,7 +746,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             links,
             exit_sel,
             tun_name: None,
-            my_endpoint: None,
+            my_endpoint,
         },
     );
     (
@@ -778,6 +788,7 @@ fn create_mesh(
     let secret: [u8; 32] = rand::random();
     let links = seed_links(HashMap::new());
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let mesh = Mesh::new(id, name, charter, 1);
     // If data-plane mode is on, ask the async caller to bring up this mesh's loop
     // (sharing the same links/exit handles we store below).
@@ -789,6 +800,7 @@ fn create_mesh(
         cipher,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
+        my_endpoint: Arc::clone(&my_endpoint),
     });
     st.meshes.insert(
         id,
@@ -802,7 +814,7 @@ fn create_mesh(
             links,
             exit_sel,
             tun_name: None,
-            my_endpoint: None,
+            my_endpoint,
         },
     );
     (
