@@ -132,7 +132,8 @@ def cmd_info(sock, a):
 def cmd_new(sock, a):
     req = {"CreateMesh": {
         "name": a.name, "my_name": a.me, "max_members": a.max,
-        "cipher": a.cipher, "self_destruct": a.ephemeral}}
+        "cipher": a.cipher, "self_destruct": a.ephemeral,
+        "master_gated": a.master_gated}}
     r = call(sock, req)
     mid = r["MeshCreated"]["mesh"]
     print(f"created mesh #{mid} '{a.name}' — you are '{a.me}'.")
@@ -269,6 +270,8 @@ def build_parser():
     s.add_argument("--cipher", default=None, help="data-plane cipher (see `lattice ciphers`)")
     s.add_argument("--ephemeral", action="store_true",
                    help="self-destruct keys when the mesh loses live quorum (default off)")
+    s.add_argument("--master-gated", action="store_true", dest="master_gated",
+                   help="only the creator may invite (default: any member can — open-chain)")
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("id", help="mint an identity code to hand to a mesh host")

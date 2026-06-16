@@ -152,7 +152,8 @@ document.querySelectorAll(".nav-item").forEach((b) =>
   b.addEventListener("click", () => {
     const tab = b.dataset.tab;
     if (tab === "meshes") return setMode("user");
-    if (tab === "new-mesh") { populateCiphers(); return activateTab("new-mesh"); } // user-mode sibling page
+    if (tab === "create-mesh") { populateCiphers(); return activateTab("create-mesh"); }
+    if (tab === "join-mesh") { return activateTab("join-mesh"); }
     activateTab(tab);
     if (tab === "mesh-overview") return CURRENT_MESH != null ? renderOverview(CURRENT_MESH) : renderMeshPlain();
     if (CURRENT_MESH == null) return;
@@ -162,7 +163,7 @@ document.querySelectorAll(".nav-item").forEach((b) =>
 );
 
 // "＋ New mesh" button on the Meshes list → the New mesh page.
-el("goto-new-mesh")?.addEventListener("click", () => { populateCiphers(); activateTab("new-mesh"); });
+el("goto-new-mesh")?.addEventListener("click", () => { populateCiphers(); activateTab("create-mesh"); });
 
 // ---- New mesh page: join flow (§2b) ----
 el("join-getcode")?.addEventListener("click", async () => {
@@ -254,8 +255,9 @@ el("mesh-create").addEventListener("click", async () => {
   if (Number.isNaN(max) || max < 1 || max > 254) return toast("max must be 1–254");
   const cipher = el("mesh-cipher").value || null;
   const selfDestruct = el("mesh-selfdestruct").checked;
+  const masterGated = el("mesh-mastergated").checked;
   try {
-    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher, self_destruct: selfDestruct } });
+    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher, self_destruct: selfDestruct, master_gated: masterGated } });
     el("mesh-name").value = "";
     el("mesh-myname").value = "";
     toast(`mesh created (#${r.MeshCreated.mesh})`);

@@ -856,7 +856,16 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             max_members,
             cipher,
             self_destruct,
-        } => create_mesh(st, name, my_name, max_members, cipher, self_destruct),
+            master_gated,
+        } => create_mesh(
+            st,
+            name,
+            my_name,
+            max_members,
+            cipher,
+            self_destruct,
+            master_gated,
+        ),
 
         Request::Ciphers => (
             Response::Ciphers(
@@ -1479,6 +1488,7 @@ fn create_mesh(
     max_members: u8,
     cipher: Option<String>,
     self_destruct: Option<bool>,
+    master_gated: Option<bool>,
 ) -> (Response, Option<PostAction>) {
     let id = match (1u8..=255).find(|id| !st.meshes.contains_key(id)) {
         Some(id) => id,
@@ -1500,7 +1510,11 @@ fn create_mesh(
     let my_key = MemberKey::generate();
     let charter = GenesisCharter {
         master_pubkey: master.network(),
-        invite: InviteTopology::OpenChain,
+        invite: if master_gated == Some(true) {
+            InviteTopology::MasterGated
+        } else {
+            InviteTopology::OpenChain
+        },
         trigger: RecipherTrigger::Quorum { k: 2 },
         max_members,
         initial_cipher: cipher,

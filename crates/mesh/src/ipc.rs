@@ -35,6 +35,11 @@ pub enum Request {
         /// isolated); `None`/`Some(false)` = off (default — laptop-friendly).
         #[serde(default)]
         self_destruct: Option<bool>,
+        /// Invite policy (charter topology): `Some(true)` = MasterGated (only the
+        /// creator may invite); `None`/`Some(false)` = OpenChain (any member may invite,
+        /// the default).
+        #[serde(default)]
+        master_gated: Option<bool>,
     },
     /// List the data-plane ciphers a mesh can be created with (populates the dropbox).
     Ciphers,

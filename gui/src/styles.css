@@ -153,6 +153,23 @@ button.secondary:hover { border-color: var(--off); background: #1f2430; }
 .add-row { display: flex; gap: 8px; margin-top: 10px; }
 .add-row input { flex: 1; min-width: 0; }
 
+/* create-mesh form: labelled fields + condition toggles */
+.field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field > span { font-size: 12px; color: var(--muted); font-weight: 600; }
+.field > span small { font-weight: 400; }
+.field input, .field select {
+  background: #11141b; color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 10px; font-size: 13px; width: 100%;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.toggle-row {
+  display: flex; align-items: flex-start; gap: 9px; cursor: pointer;
+  font-size: 13px; padding: 7px 0; line-height: 1.45;
+}
+.toggle-row + .toggle-row { border-top: 1px solid var(--line); }
+.toggle-row input { width: auto; margin: 2px 0 0; flex-shrink: 0; }
+
 /* peers */
 .peers { list-style: none; padding: 0; margin: 0 0 16px; }
 .peers li {

@@ -47,8 +47,11 @@
             <button class="nav-item" data-tab="meshes" data-grp="user">
               <span class="nav-ico">⬢</span> Meshes
             </button>
-            <button class="nav-item" data-tab="new-mesh" data-grp="user">
-              <span class="nav-ico">＋</span> New mesh
+            <button class="nav-item" data-tab="create-mesh" data-grp="user">
+              <span class="nav-ico">＋</span> Create mesh
+            </button>
+            <button class="nav-item" data-tab="join-mesh" data-grp="user">
+              <span class="nav-ico">⤵</span> Join mesh
             </button>
             <!-- Mesh mode (scoped to the opened mesh) -->
             <button class="nav-item" data-tab="mesh-overview" data-grp="mesh">
@@ -76,30 +79,55 @@
             <ul id="mesh-list" class="peers"></ul>
           </section>
 
-          <!-- User mode: New mesh — create or join (docs/GUI_PAGES.md §2b) -->
-          <section data-panel="new-mesh" class="panel hidden">
-            <h1 class="panel-title">New mesh</h1>
-            <p class="panel-sub">Create a new mesh, or join an existing one by invite.</p>
+          <!-- User mode: Create mesh (docs/GUI_PAGES.md §2b) -->
+          <section data-panel="create-mesh" class="panel hidden">
+            <h1 class="panel-title">Create a mesh</h1>
+            <p class="panel-sub">You become member #1 and hold the mesh's root key. Set the
+              conditions below — they're fixed at creation.</p>
 
             <div class="card">
-              <div class="card-head"><h2 class="card-title">Create a mesh</h2></div>
-              <div class="add-row">
-                <input id="mesh-name" placeholder="mesh name — e.g. home" />
-                <input id="mesh-myname" placeholder="your name in it — e.g. alice" />
-                <input id="mesh-max" type="number" min="1" max="254" placeholder="max 254" style="max-width:90px" />
-                <select id="mesh-cipher" title="data-plane cipher — fixed at creation"></select>
-                <button id="mesh-create" class="secondary">Create</button>
+              <div class="card-head"><h2 class="card-title">Basics</h2></div>
+              <div class="field-grid">
+                <label class="field"><span>Mesh name</span>
+                  <input id="mesh-name" placeholder="e.g. home" /></label>
+                <label class="field"><span>Your name in it</span>
+                  <input id="mesh-myname" placeholder="e.g. alice" /></label>
+                <label class="field"><span>Max members <small class="muted">(1–254)</small></span>
+                  <input id="mesh-max" type="number" min="1" max="254" placeholder="254" /></label>
+                <label class="field"><span>Cipher <small class="muted">(permanent)</small></span>
+                  <select id="mesh-cipher" title="data-plane cipher — fixed at creation"></select></label>
               </div>
-              <label class="muted small" style="display:flex;align-items:center;gap:6px;margin:8px 0 0;cursor:pointer"
-                     title="When ON, the mesh keys self-destruct if too few members stay live (ephemeral). Leave OFF for a laptop that sleeps.">
-                <input id="mesh-selfdestruct" type="checkbox" style="width:auto;margin:0" />
-                Ephemeral — self-destruct when isolated (off by default; laptop-friendly)
-              </label>
               <p id="mesh-cipher-warn" class="muted small hidden" style="margin:8px 0 0;color:#e0a020">
                 ⚠ Experimental research cipher. The cipher is <b>permanent</b> — changing it later
                 needs ≥60% of nodes online. Pick the default unless you're testing the time-window cipher.
               </p>
             </div>
+
+            <div class="card">
+              <div class="card-head"><h2 class="card-title">Conditions</h2></div>
+              <label class="toggle-row"
+                     title="OpenChain (default): any member can invite others. Master-gated: only you, the creator, can invite.">
+                <input id="mesh-mastergated" type="checkbox" />
+                <span><b>Only I can invite</b> (master-gated). Off = any member can invite others
+                  <span class="muted">(open-chain, default)</span>.</span>
+              </label>
+              <label class="toggle-row"
+                     title="When ON, the mesh keys self-destruct if too few members stay live (ephemeral). Leave OFF for a laptop that sleeps.">
+                <input id="mesh-selfdestruct" type="checkbox" />
+                <span><b>Ephemeral</b> — self-destruct when isolated
+                  <span class="muted">(off by default; laptop-friendly)</span>.</span>
+              </label>
+            </div>
+
+            <div class="add-row">
+              <button id="mesh-create" class="secondary">Create mesh</button>
+            </div>
+          </section>
+
+          <!-- User mode: Join mesh (docs/GUI_PAGES.md §2b) -->
+          <section data-panel="join-mesh" class="panel hidden">
+            <h1 class="panel-title">Join a mesh</h1>
+            <p class="panel-sub">Join an existing mesh by invite.</p>
 
             <div class="card">
               <div class="card-head"><h2 class="card-title">Join a mesh</h2></div>
