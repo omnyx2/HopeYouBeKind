@@ -244,31 +244,55 @@ fn mesh_file(dir: &std::path::Path, id: MeshId) -> PathBuf {
     dir.join(format!("mesh-{id}.json"))
 }
 
+/// Snapshot one live mesh into its serializable persisted form. Shared by on-disk
+/// persistence and the `ExportState` update-migration backup.
+fn to_persisted(ms: &MeshState) -> PersistedMesh {
+    PersistedMesh {
+        mesh_id: ms.mesh.id,
+        mesh_name: ms.mesh.name.clone(),
+        charter: ms.mesh.charter.clone(),
+        certs: ms.certs.clone(),
+        secret: ms.secret,
+        epoch: ms.epoch,
+        cipher: ms.cipher.clone(),
+        member_seed: ms.my_key.to_seed(),
+        enc_bytes: ms.my_enc.to_bytes(),
+        master_seed: ms.master.as_ref().map(|m| m.to_seed()),
+        exit: *ms.exit_sel.lock().unwrap(),
+        peers: ms
+            .links
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(m, l)| (*m, l.endpoint.to_string()))
+            .collect(),
+    }
+}
+
+/// Where the update-migration backup lives: env `MESHD_IMPORT`, else
+/// `<tempdir>/lattice-mesh-backup.json`. `ExportState` writes it before an update and
+/// startup reads (then deletes) it, so a reinstall never drops a node from its meshes
+/// even if the persist dir is wiped.
+fn migration_backup_path() -> PathBuf {
+    std::env::var("MESHD_IMPORT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("lattice-mesh-backup.json"))
+}
+
+/// Read the update-migration backup (a JSON array of meshes) if present.
+fn load_backup(path: &std::path::Path) -> Vec<PersistedMesh> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<PersistedMesh>>(&b).ok())
+        .unwrap_or_default()
+}
+
 /// Save all current meshes and prune files for meshes that are gone (so a
 /// self-destruct / RemoveMesh erases the on-disk copy too).
 fn persist(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
     for ms in st.meshes.values() {
-        let p = PersistedMesh {
-            mesh_id: ms.mesh.id,
-            mesh_name: ms.mesh.name.clone(),
-            charter: ms.mesh.charter.clone(),
-            certs: ms.certs.clone(),
-            secret: ms.secret,
-            epoch: ms.epoch,
-            cipher: ms.cipher.clone(),
-            member_seed: ms.my_key.to_seed(),
-            enc_bytes: ms.my_enc.to_bytes(),
-            master_seed: ms.master.as_ref().map(|m| m.to_seed()),
-            exit: *ms.exit_sel.lock().unwrap(),
-            peers: ms
-                .links
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(m, l)| (*m, l.endpoint.to_string()))
-                .collect(),
-        };
+        let p = to_persisted(ms);
         if let Ok(json) = serde_json::to_vec_pretty(&p) {
             let f = mesh_file(dir, ms.mesh.id);
             if std::fs::write(&f, &json).is_ok() {
@@ -415,7 +439,30 @@ async fn main() -> anyhow::Result<()> {
     // P-S1: reload persisted meshes so a reboot / network change doesn't drop us from
     // them; bring each data plane back up at its live secret/epoch/cipher.
     if let Some(dir) = &pdir {
-        let persisted = load_persisted(dir);
+        let mut persisted = load_persisted(dir);
+        // Update migration: merge in the pre-update backup (ExportState) for any mesh the
+        // normal persist dir didn't carry over (e.g. a clean reinstall wiped it). The
+        // persist dir is authoritative for ids it already has; new ids come from backup.
+        // Then delete the backup — it's a one-shot hand-off across the update.
+        let backup_path = migration_backup_path();
+        let backup = load_backup(&backup_path);
+        if !backup.is_empty() {
+            let have: HashSet<MeshId> = persisted.iter().map(|p| p.mesh_id).collect();
+            let mut merged = 0;
+            for p in backup {
+                if !have.contains(&p.mesh_id) {
+                    persisted.push(p);
+                    merged += 1;
+                }
+            }
+            let _ = std::fs::remove_file(&backup_path);
+            if merged > 0 {
+                eprintln!(
+                    "meshd: imported {merged} mesh(es) from update backup {}",
+                    backup_path.display()
+                );
+            }
+        }
         let mut bringups = Vec::new();
         {
             let mut st = state.lock().unwrap();
@@ -434,6 +481,8 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        // Persist the merged set so the imported meshes land in the normal dir too.
+        persist(&state.lock().unwrap());
         for b in bringups {
             bringup_dataplane(b, Arc::clone(&state)).await;
         }
@@ -900,6 +949,34 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             (Response::Ok, None)
         }
 
+        Request::ExportState { path } => {
+            let target = path
+                .map(PathBuf::from)
+                .unwrap_or_else(migration_backup_path);
+            let snapshot: Vec<PersistedMesh> = st.meshes.values().map(to_persisted).collect();
+            match serde_json::to_vec_pretty(&snapshot) {
+                Ok(json) => match std::fs::write(&target, &json) {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                &target,
+                                std::fs::Permissions::from_mode(0o600),
+                            );
+                        }
+                        eprintln!(
+                            "meshd: exported {} mesh(es) to {}",
+                            snapshot.len(),
+                            target.display()
+                        );
+                        (Response::Ok, None)
+                    }
+                    Err(e) => (err(&format!("could not write backup: {e}")), None),
+                },
+                Err(e) => (err(&format!("could not serialize state: {e}")), None),
+            }
+        }
         Request::ListMeshes => {
             let cur = st.current;
             let now = now_ms();

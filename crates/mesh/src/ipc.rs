@@ -46,6 +46,14 @@ pub enum Request {
         #[serde(default)]
         cipher: Option<String>,
     },
+    /// Back up every mesh on this computer to a JSON file (the update-migration
+    /// snapshot). `path` defaults to `<tempdir>/lattice-mesh-backup.json`; meshd reads
+    /// + deletes it on next startup, so a reinstall never loses mesh membership even if
+    /// the persist dir is wiped. Call this right before launching an installer/update.
+    ExportState {
+        #[serde(default)]
+        path: Option<String>,
+    },
     /// Every mesh this node belongs to.
     ListMeshes,
     /// Full detail for one mesh.

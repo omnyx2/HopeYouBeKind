@@ -234,6 +234,14 @@ def cmd_policy(sock, a):
     print(f"current mesh:  {p['current_mesh']}")
 
 
+def cmd_backup(sock, a):
+    req = {"ExportState": {"path": a.path}}
+    call(sock, req)
+    where = a.path or "<tempdir>/lattice-mesh-backup.json"
+    print(f"backed up all meshes to {where} — meshd re-imports it on next start "
+          f"(then deletes it). Run this before updating/reinstalling.")
+
+
 def cmd_raw(sock, a):
     req = json.loads(a.json)
     print(json.dumps(call(sock, req), indent=2))
@@ -313,6 +321,11 @@ def build_parser():
     s.set_defaults(fn=cmd_algos)
     s = sub.add_parser("policy", help="show the current routing policy")
     s.set_defaults(fn=cmd_policy)
+
+    s = sub.add_parser("backup", help="snapshot meshes to a file for update migration")
+    s.add_argument("path", nargs="?", default=None,
+                   help="output path (default: <tempdir>/lattice-mesh-backup.json)")
+    s.set_defaults(fn=cmd_backup)
 
     s = sub.add_parser("raw", help="send a raw JSON request (escape hatch)")
     s.add_argument("json", help='e.g. \'{"ListMeshes":null}\'')
