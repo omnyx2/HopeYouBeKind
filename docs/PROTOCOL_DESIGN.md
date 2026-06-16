@@ -182,7 +182,7 @@
 | 단계 | 내용 | 기반 |
 |---|---|---|
 | ✅ **P-C1 본문 cipher seam** | 생성 시 메쉬별 cipher 확정 + `suite(name)` 실제 분기 + 두 번째 suite(`timewindow`) 등록. **연구용 시간창/manifold cipher가 여기 꽂힘** (crypto.rs `TimeWindowSuite` seal/open 배너 블록). GUI 드롭박스용 `Ciphers` IPC. *(commit 40b3fed)* | 이미 있는 `MeshSuite`/charter.initial_cipher |
-| **P-C2 헤더/본문 분리** | 헤더 = `f(mesh_id,time)` 2중 슬라이드 cipher, 본문 = P-C1 선택. 현재 평문 헤더(AAD)를 봉인으로. | wire_v2 + P-C1 |
+| ✅ **P-C2 헤더/본문 분리** | 헤더 = `HeaderCrypto`(mesh_secret+mesh_id+time-window, 인접창 슬라이드), 본문 = P-C1 dropbox suite. 프레임 = `seq‖sealed_header‖body_ct`, 평문 헤더 제거(지문화 차단), 릴레이는 헤더만 열어 dst 라우팅. *(commit 9bd7b39)* | wire_v2 + P-C1 |
 | **P-C3 재암호화 거버넌스** | 60% online 정족수 re-cipher, epoch 증가, 오프라인=암묵 퇴출(데이터평면 해독실패 처리). | charter `RecipherTrigger::Quorum` |
 | **P-C4 live-paired 자폭** | threshold(60%) 비밀 공유: t개 미만 live → secret 복원 불가 → 자가 폐기. | keydist + share 분배 |
 | **P-C5 헤더 순열** | 필수 헤더 요소를 per-mesh 비밀 순열로 MTU 내 배치 (안티-핑거프린트). | wire_v2 |
