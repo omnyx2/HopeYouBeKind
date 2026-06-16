@@ -74,6 +74,9 @@ struct MeshState {
     /// The OS interface name of this mesh's TUN (set at bringup) — needed to divert
     /// the default route for full-tunnel egress.
     tun_name: Option<String>,
+    /// This node's own advertised data-plane endpoint (`ip:port`), set at bringup.
+    /// Handed to joiners in the invite so they can reach us at once (P-D1).
+    my_endpoint: Option<SocketAddr>,
 }
 
 impl MeshState {
@@ -289,13 +292,34 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         }
     }
     exit::enable_nat();
+    // This node's own reachable address, advertised in the endpoint gossip so peers
+    // can reach us without a manual SetPeer (docs/DISCOVERY.md §2). A public node
+    // (the Oracle exit) pins it via MESHD_ADVERTISE=ip:port; otherwise advertise the
+    // primary LAN address on our bind port (good for same-router peers; WAN peers
+    // still re-learn us from the frames we send / via a relay).
+    let advertise: Option<SocketAddr> = std::env::var("MESHD_ADVERTISE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| local_ip().map(|ip| SocketAddr::new(ip, port)));
+    if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
+        ms.my_endpoint = advertise;
+    }
     eprintln!(
-        "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}",
+        "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}, advertise {advertise:?}",
         b.mesh_id
     );
     tokio::spawn(lattice_meshrun::run(
-        dp, tun, transport, b.links, b.exit_sel,
+        dp, tun, transport, b.links, b.exit_sel, b.my_id, advertise,
     ));
+}
+
+/// Best-effort primary local IP — the source address the OS picks to reach the
+/// internet (no packet is actually sent; `connect` on a UDP socket just selects the
+/// route). Used as our advertised gossip endpoint when MESHD_ADVERTISE is unset.
+fn local_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    s.connect(("8.8.8.8", 80)).ok()?;
+    s.local_addr().ok().map(|a| a.ip())
 }
 
 /// Kill-switch watchdog (from v1). Full tunnel diverts the host default route
@@ -603,6 +627,17 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             // Issue the cert and seal the mesh secret to the joiner's enc key.
             let cert = master.issue(member_pk, id, &name, now_ms());
             let sealed_secret = seal_secret(&enc_pk, &ms.secret);
+            // Bootstrap endpoints for the joiner (P-D1): our own advertised address
+            // first, then every peer we already reach. The joiner seeds its data
+            // plane with these so it can send to us (and them) before gossip
+            // converges — no manual SetPeer needed.
+            let mut endpoints: Vec<(MemberId, String)> = Vec::new();
+            if let Some(ep) = ms.my_endpoint {
+                endpoints.push((ms.my_id(), ep.to_string()));
+            }
+            for (m, link) in ms.links.lock().unwrap().iter() {
+                endpoints.push((*m, link.endpoint.to_string()));
+            }
             ms.certs.push(cert);
             let blob = InviteBlob {
                 mesh_id: ms.mesh.id,
@@ -611,6 +646,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 member_id: id,
                 certs: ms.certs.clone(),
                 sealed_secret,
+                endpoints,
             };
             (Response::Invite(blob), None)
         }
@@ -659,7 +695,19 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     }
     let prefix = invite.charter.overlay_prefix;
     let cipher = invite.charter.initial_cipher.clone();
-    let links = seed_links(HashMap::new());
+    // Seed the data plane with the bootstrap endpoints the inviter handed us (P-D1):
+    // we can reach the inviter (and any peers it knew) immediately, before gossip
+    // converges. Skip our own id and any unparseable address.
+    let mut seed: HashMap<MemberId, SocketAddr> = HashMap::new();
+    for (m, ep) in &invite.endpoints {
+        if *m == invite.member_id {
+            continue;
+        }
+        if let Ok(addr) = ep.parse() {
+            seed.insert(*m, addr);
+        }
+    }
+    let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
     let mesh = Mesh::new(
         invite.mesh_id,
@@ -688,6 +736,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             links,
             exit_sel,
             tun_name: None,
+            my_endpoint: None,
         },
     );
     (
@@ -753,6 +802,7 @@ fn create_mesh(
             links,
             exit_sel,
             tun_name: None,
+            my_endpoint: None,
         },
     );
     (

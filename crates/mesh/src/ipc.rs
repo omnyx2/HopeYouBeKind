@@ -116,6 +116,13 @@ pub struct InviteBlob {
     pub certs: Vec<Cert>,
     /// The mesh secret, sealed to the joiner's encryption public key.
     pub sealed_secret: SealedSecret,
+    /// Bootstrap endpoints (`member_id`, `ip:port`) the joiner seeds its data plane
+    /// with — at minimum the inviter's own address, plus any peers the inviter
+    /// already reaches. Lets the joiner send to them immediately, before gossip
+    /// converges (docs/DISCOVERY.md §1, P-D1). `#[serde(default)]` so older invites
+    /// (no field) still deserialize.
+    #[serde(default)]
+    pub endpoints: Vec<(MemberId, String)>,
 }
 
 /// One row in the global "all meshes on this computer" view (§7).

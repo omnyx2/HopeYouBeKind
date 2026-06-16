@@ -21,6 +21,9 @@ use crate::crypto::MeshSuite;
 pub enum Inbound {
     /// The decrypted inner packet is for us — write it to the TUN.
     Deliver(Vec<u8>),
+    /// A decrypted control-plane payload (endpoint gossip / keepalive) — for the run
+    /// loop, NOT the TUN.
+    Control(Vec<u8>),
     /// Not for us — relay the frame on to member `to` (the relay path, a later phase).
     Forward { to: MemberId },
 }
@@ -67,16 +70,26 @@ impl MeshDataPlane {
         None
     }
 
-    /// Frame an inner packet for member `dst`: `header ‖ seq ‖ seal(inner)`.
-    pub fn seal_to(&self, dst: MemberId, inner: &[u8]) -> Vec<u8> {
-        let header = Header::new(self.mesh_id, self.my_id, dst, FrameType::Transport);
+    /// Frame a payload for member `dst`: `header ‖ seq ‖ seal(payload)`.
+    fn seal_frame(&self, dst: MemberId, ft: FrameType, payload: &[u8]) -> Vec<u8> {
+        let header = Header::new(self.mesh_id, self.my_id, dst, ft);
         let aad = wire_v2::encode(header, &[]); // the 5 header bytes
         let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
-        let ct = self.suite.seal(seq, inner, &aad);
+        let ct = self.suite.seal(seq, payload, &aad);
         let mut body = Vec::with_capacity(8 + ct.len());
         body.extend_from_slice(&seq.to_be_bytes());
         body.extend_from_slice(&ct);
         wire_v2::encode(header, &body)
+    }
+
+    /// Frame an inner IP packet for member `dst` (the data path).
+    pub fn seal_to(&self, dst: MemberId, inner: &[u8]) -> Vec<u8> {
+        self.seal_frame(dst, FrameType::Transport, inner)
+    }
+
+    /// Frame a control payload (endpoint gossip / keepalive) for member `dst`.
+    pub fn seal_control(&self, dst: MemberId, payload: &[u8]) -> Vec<u8> {
+        self.seal_frame(dst, FrameType::Control, payload)
     }
 
     /// Parse + open an inbound frame. `None` if it isn't ours / fails to open.
@@ -95,7 +108,10 @@ impl MeshDataPlane {
         let seq = u64::from_be_bytes(rest[0..8].try_into().ok()?);
         let aad = wire_v2::encode(header, &[]);
         let pt = self.suite.open(seq, &rest[8..], &aad)?;
-        Some(Inbound::Deliver(pt))
+        Some(match header.frame_type {
+            FrameType::Control => Inbound::Control(pt),
+            _ => Inbound::Deliver(pt),
+        })
     }
 }
 

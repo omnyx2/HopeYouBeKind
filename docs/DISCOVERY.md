@@ -56,22 +56,59 @@ already forwards `Inbound::Forward`). Public nodes (the exit) are always reachab
 / NAT 뒤 노드는 **reflexive** 주소 광고; 직접 못 닿는 두 NAT 피어는 도달 가능한 멤버가 릴레이
 (데이터플레인 루프가 이미 `Inbound::Forward` 전달). 공인 노드(exit)는 항상 도달 가능.
 
+## 6. Roaming & address churn / 로밍·주소 변동
+A computer's underlay address changes often (Wi-Fi↔cellular, DHCP, NAT-port
+rebinding). The mesh tolerates this by **separating stable identity from the volatile
+endpoint**: routing is by **member id + pubkey** (and the fixed overlay IP); the
+**IP:port is a cache** of "how to reach right now". When it changes: / 컴퓨터의 언더레이
+주소는 자주 바뀐다(Wi-Fi↔셀룰러, DHCP, NAT 포트 재바인딩). mesh는 **불변 신원과 변동
+엔드포인트를 분리**해 견딘다: 라우팅은 **member id + pubkey**(+ 고정 overlay IP), **IP:port는
+"지금 어떻게 닿나" 캐시**. 바뀌면:
+
+1. **Re-learn from any authenticated frame (WireGuard-style roaming).** A node that
+   moved sends from a new address; the receiver updates that member's `Link.endpoint`
+   from the frame's source on the spot — one packet re-binds the route. (The data-plane
+   loop already learns `hdr.src → from`.) / **인증 프레임에서 재학습(WireGuard 로밍).**
+   옮긴 노드가 새 주소에서 보내면 수신자가 즉시 그 멤버의 `Link.endpoint`를 갱신 — 패킷 하나면
+   경로 재바인딩. (데이터플레인 루프가 이미 `hdr.src → from` 학습.)
+2. **Re-publish with a higher `seq`.** The node detects its endpoint changed and emits a
+   new `EndpointRecord (seq+1)`; gossip replaces older entries everywhere, including for
+   peers it isn't directly talking to. / **`seq` 올려 재발행.** 엔드포인트 변화를 감지해 새
+   레코드(seq+1) 발행; gossip이 직접 안 보내는 피어에게도 갱신 전파.
+3. **Keepalives keep NAT mappings alive.** UDP NAT mappings expire in ~30 s–2 min, which
+   *causes* the reflexive port to change. A **keepalive every ~20–25 s** (WireGuard's
+   persistent-keepalive value) holds the mapping open, so the endpoint mostly *doesn't*
+   change in the first place — and doubles as the liveness signal. / **Keepalive로 NAT
+   매핑 유지.** UDP NAT 매핑은 ~30초–2분이면 만료돼 reflexive 포트가 *바뀐다*. **~20–25초마다
+   keepalive**로 매핑을 열어둬 애초에 잘 안 바뀌게 — liveness 신호도 겸함.
+4. **Relay fallback during the gap.** In the brief window before a new endpoint
+   propagates, a reachable member (a public node like the exit) relays, then traffic
+   returns to the direct path once the update lands. / **틈새엔 릴레이.** 새 엔드포인트가
+   퍼지기 전 짧은 틈엔 도달 가능한 멤버(공인 노드/exit)가 릴레이, 갱신되면 직접 경로 복귀.
+
+So churn never breaks the mesh — the **identity is permanent; the endpoint is a
+self-healing cache** (re-learn + re-gossip + keepalive + relay). / 즉 churn은 mesh를 안
+깨뜨린다 — **신원은 영구, 엔드포인트는 자가치유 캐시**.
+
 ## What exists vs to build / 있는 것 vs 만들 것
 - ✅ `discovery.rs`: `EndpointRecord`, `EndpointBook`, `MemberKey::publish_endpoints`.
 - ✅ `wire_v2::FrameType::Control` (the gossip frame type) + per-mesh cipher (seal/open).
 - ✅ data-plane loop routes off `PeerLinks` + relays `Forward`.
-- ⏳ **invite carries** `inviter_endpoints` + endpoint book (ipc.rs `InviteBlob`, meshd
-  `CreateInvite`/`JoinMesh`).
-- ⏳ **reflexive address** per node (STUN; explicit for public nodes via env/flag).
-- ⏳ **gossip loop** in `meshrun::run`: emit a Control frame with the EndpointBook every
-  N s + on join; on recv Control, merge into the book and update `PeerLinks`.
+- ✅ **P-D1 invite carries endpoints** — `InviteBlob.endpoints: Vec<(MemberId, String)>`
+  (ipc.rs); meshd `CreateInvite` fills it (own advertised addr + known links), `JoinMesh`
+  seeds the joiner's `PeerLinks` from it → reach the inviter at once, no manual SetPeer.
+- ✅ **P-D2 gossip loop** in `meshrun::run` — a `Control` frame with the endpoint table
+  every `GOSSIP_INTERVAL_SECS` (20 s; first tick immediate) to each known peer + NAT
+  keepalive; on recv `Inbound::Control`, merge unknown members into `PeerLinks`. Own
+  advertised endpoint = `MESHD_ADVERTISE` (public nodes) else the primary LAN addr.
+- ⏳ **reflexive address** per node (STUN; explicit for public nodes via env/flag) — P-D3.
 - ⏳ retire the manual **SetPeer** UI once gossip lands (keep as a fallback/override).
 
 ## Phases / 단계
-1. **P-D1 invite-carries-endpoint** — joiner reaches the inviter immediately (smallest
+1. ✅ **P-D1 invite-carries-endpoint** — joiner reaches the inviter immediately (smallest
    win; unblocks 2-node joins without SetPeer). / 합류자가 초대자에 바로 닿음(가장 작은 성과).
-2. **P-D2 gossip Control frames** — EndpointBook emit/merge in `run`; full convergence.
-   / EndpointBook 송수신·병합; 완전 수렴.
+2. ✅ **P-D2 gossip Control frames** — endpoint table emit/merge in `run`; convergence.
+   / 엔드포인트 테이블 송수신·병합; 수렴.
 3. **P-D3 reflexive (STUN)** — auto public address; public nodes set it explicitly.
    / 자동 공인 주소; 공인 노드는 명시.
 4. **P-D4 LAN fast-path (mDNS)** — same-router peers find each other without the WAN.

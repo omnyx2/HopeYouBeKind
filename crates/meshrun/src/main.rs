@@ -60,7 +60,10 @@ async fn main() -> anyhow::Result<()> {
     let dp = MeshDataPlane::new(mesh, my, prefix, suite("default", &secret, 0));
     let links = lattice_meshrun::seed_links(endpoints);
     let exit = std::sync::Arc::new(std::sync::Mutex::new(exit));
-    lattice_meshrun::run(dp, tun, transport, links, exit).await;
+    // This node's own reachable address, advertised in the gossip (ADVERTISE= for a
+    // public node; otherwise peers learn us from the frames we send).
+    let advertise = std::env::var("ADVERTISE").ok().and_then(|s| s.parse().ok());
+    lattice_meshrun::run(dp, tun, transport, links, exit, my, advertise).await;
     Ok(())
 }
 

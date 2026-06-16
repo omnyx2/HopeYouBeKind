@@ -69,16 +69,44 @@ pub fn ipv4_dst(p: &[u8]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(p[16], p[17], p[18], p[19]))
 }
 
+/// Endpoint gossip / keepalive interval (also the NAT-keepalive cadence, docs/
+/// DISCOVERY.md §3,§6).
+const GOSSIP_INTERVAL_SECS: u64 = 20;
+
+/// Encode an endpoint table as `id ip:port` lines (the gossip payload, sealed).
+fn encode_gossip(table: &[(MemberId, SocketAddr)]) -> Vec<u8> {
+    let mut s = String::new();
+    for (m, a) in table {
+        s.push_str(&format!("{m} {a}\n"));
+    }
+    s.into_bytes()
+}
+
+fn decode_gossip(payload: &[u8]) -> Vec<(MemberId, SocketAddr)> {
+    String::from_utf8_lossy(payload)
+        .lines()
+        .filter_map(|line| {
+            let (m, a) = line.trim().split_once(' ')?;
+            Some((m.parse().ok()?, a.parse().ok()?))
+        })
+        .collect()
+}
+
 /// Run the data-plane loop until the TUN or transport closes. `links` maps a member
-/// id → where to reach it + liveness (seeded out-of-band, learned thereafter);
-/// `exit` is the egress member for non-mesh traffic (both shared, read/written live).
+/// id → where to reach it + liveness (seeded from the invite, learned + gossiped
+/// thereafter); `exit` is the egress member for non-mesh traffic. `my_endpoint` is
+/// this node's own reachable address, advertised in the gossip (docs/DISCOVERY.md).
+#[allow(clippy::too_many_arguments)]
 pub async fn run<X: Transport + 'static>(
     dp: MeshDataPlane,
     mut tun: Box<dyn TunDevice>,
     transport: X,
     links: PeerLinks,
     exit: SharedExit,
+    my_id: MemberId,
+    my_endpoint: Option<SocketAddr>,
 ) {
+    let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
     loop {
         tokio::select! {
             // App traffic out of the TUN → route to its member, else (internet-bound)
@@ -95,11 +123,11 @@ pub async fn run<X: Transport + 'static>(
                     }
                 }
             }
-            // A frame from a peer → open & deliver to the TUN, or relay it onward.
+            // A frame from a peer → deliver / relay / merge gossip.
             inbound = transport.recv_from() => {
                 let Ok((frame, from)) = inbound else { break };
-                // Discovery + liveness: learn the sender's endpoint and stamp it, so
-                // replies route back and the supervisor sees who's live (P6.3b/d).
+                // Roaming + liveness: re-learn the sender's endpoint from the frame's
+                // source on the spot, so a peer that moved is reachable again (§6).
                 if let Some((hdr, _)) = lattice_proto::wire_v2::decode(&frame) {
                     links
                         .lock()
@@ -108,6 +136,16 @@ pub async fn run<X: Transport + 'static>(
                 }
                 match dp.recv(&frame) {
                     Some(Inbound::Deliver(inner)) => { let _ = tun.write_packet(&inner).await; }
+                    // Endpoint gossip: add members we don't know yet (the sender's own
+                    // current address already came from the src-learn above).
+                    Some(Inbound::Control(payload)) => {
+                        let mut l = links.lock().unwrap();
+                        for (m, ep) in decode_gossip(&payload) {
+                            if m != my_id {
+                                l.entry(m).or_insert(Link { endpoint: ep, last_seen_ms: 0 });
+                            }
+                        }
+                    }
                     // P5 relay: we're a hop, not the destination — pass the frame on
                     // unchanged (we don't need to decrypt to forward).
                     Some(Inbound::Forward { to }) => {
@@ -117,6 +155,25 @@ pub async fn run<X: Transport + 'static>(
                         }
                     }
                     None => {}
+                }
+            }
+            // Every ~20s: gossip our endpoint table to each known peer (also the NAT
+            // keepalive + liveness ping). The first tick fires immediately → fast
+            // bootstrap from the invite-seeded links.
+            _ = gossip.tick() => {
+                let (peers, payload) = {
+                    let l = links.lock().unwrap();
+                    let mut table: Vec<(MemberId, SocketAddr)> =
+                        l.iter().map(|(m, lk)| (*m, lk.endpoint)).collect();
+                    if let Some(ep) = my_endpoint {
+                        table.push((my_id, ep));
+                    }
+                    let peers: Vec<(MemberId, SocketAddr)> =
+                        l.iter().map(|(m, lk)| (*m, lk.endpoint)).collect();
+                    (peers, encode_gossip(&table))
+                };
+                for (m, addr) in peers {
+                    let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
                 }
             }
         }
@@ -160,8 +217,8 @@ mod tests {
         let a_eps = seed_links(std::iter::once((2u8, b_addr)).collect());
         let b_eps = seed_links(std::iter::once((1u8, a_addr)).collect());
 
-        tokio::spawn(run(dp(1), Box::new(atun), ta, a_eps, exit(None))); // Alice (member 1)
-        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps, exit(None))); // Bob   (member 2)
+        tokio::spawn(run(dp(1), Box::new(atun), ta, a_eps, exit(None), 1, None)); // Alice (member 1)
+        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps, exit(None), 2, None)); // Bob   (member 2)
 
         // Inject an IP packet at Alice's TUN, destined for Bob's overlay IP.
         let packet = ipv4_to("100.80.3.2".parse().unwrap()); // mesh 3, member 2
@@ -187,8 +244,16 @@ mod tests {
         let a_eps = seed_links(std::iter::once((2u8, b_addr)).collect());
         let b_eps = seed_links(std::iter::once((1u8, a_addr)).collect());
 
-        tokio::spawn(run(dp(1), Box::new(atun), ta, a_eps, exit(Some(2)))); // exit = member 2
-        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps, exit(None)));
+        tokio::spawn(run(
+            dp(1),
+            Box::new(atun),
+            ta,
+            a_eps,
+            exit(Some(2)),
+            1,
+            None,
+        )); // exit = member 2
+        tokio::spawn(run(dp(2), Box::new(btun), tb, b_eps, exit(None), 2, None));
 
         // A real internet destination (not in the mesh /24) → goes to the exit.
         let packet = ipv4_to("1.1.1.1".parse().unwrap());
@@ -272,9 +337,33 @@ mod tests {
         let b_eps = seed_links(std::iter::once((3u8, c)).collect());
         let c_eps = seed_links(HashMap::new());
 
-        tokio::spawn(run(dp(1), Box::new(atun), net.node(a), a_eps, exit(None)));
-        tokio::spawn(run(dp(2), Box::new(btun), net.node(b), b_eps, exit(None))); // relay hop
-        tokio::spawn(run(dp(3), Box::new(ctun), net.node(c), c_eps, exit(None)));
+        tokio::spawn(run(
+            dp(1),
+            Box::new(atun),
+            net.node(a),
+            a_eps,
+            exit(None),
+            1,
+            None,
+        ));
+        tokio::spawn(run(
+            dp(2),
+            Box::new(btun),
+            net.node(b),
+            b_eps,
+            exit(None),
+            2,
+            None,
+        )); // relay hop
+        tokio::spawn(run(
+            dp(3),
+            Box::new(ctun),
+            net.node(c),
+            c_eps,
+            exit(None),
+            3,
+            None,
+        ));
 
         let packet = ipv4_to("100.80.3.3".parse().unwrap()); // member 3 = C
         ahandle.inject.send(packet.clone()).await.unwrap();
@@ -284,5 +373,77 @@ mod tests {
             .expect("timed out — relayed packet did not reach C")
             .expect("c's tun closed");
         assert_eq!(got, packet);
+    }
+
+    #[test]
+    fn gossip_payload_roundtrips() {
+        let table = vec![
+            (1u8, "10.0.0.1:42001".parse().unwrap()),
+            (7u8, "203.0.113.9:42007".parse().unwrap()),
+        ];
+        let bytes = encode_gossip(&table);
+        assert_eq!(decode_gossip(&bytes), table);
+        // Garbage lines are skipped, not fatal.
+        assert!(decode_gossip(b"not a line\n2 1.2.3.4:5\nbad").len() == 1);
+    }
+
+    /// A doesn't know C's endpoint at start; B knows both. After the first gossip
+    /// tick (fires immediately) B tells A about C, and A can then reach C directly.
+    #[tokio::test]
+    async fn gossip_propagates_an_unknown_members_endpoint() {
+        let net = hub::Hub::default();
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2".parse().unwrap();
+        let c: SocketAddr = "10.0.0.3:3".parse().unwrap();
+        let (atun, _ah) = MemoryTun::new();
+        let (btun, _bh) = MemoryTun::new();
+        let (ctun, _ch) = MemoryTun::new();
+
+        // A knows only B; B knows A and C; C knows only B. A has NO route to C.
+        let a_eps = seed_links(std::iter::once((2u8, b)).collect());
+        let b_eps = seed_links([(1u8, a), (3u8, c)].into_iter().collect());
+        let c_eps = seed_links(std::iter::once((2u8, b)).collect());
+        let a_view = Arc::clone(&a_eps);
+
+        tokio::spawn(run(
+            dp(1),
+            Box::new(atun),
+            net.node(a),
+            a_eps,
+            exit(None),
+            1,
+            Some(a),
+        ));
+        tokio::spawn(run(
+            dp(2),
+            Box::new(btun),
+            net.node(b),
+            b_eps,
+            exit(None),
+            2,
+            Some(b),
+        ));
+        tokio::spawn(run(
+            dp(3),
+            Box::new(ctun),
+            net.node(c),
+            c_eps,
+            exit(None),
+            3,
+            Some(c),
+        ));
+
+        // Poll A's link table until C (member 3) appears, learned via B's gossip.
+        let learned = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(l) = a_view.lock().unwrap().get(&3u8) {
+                    break l.endpoint;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("A never learned C's endpoint from gossip");
+        assert_eq!(learned, c);
     }
 }
