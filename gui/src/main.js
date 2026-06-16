@@ -597,6 +597,15 @@ async function checkForUpdate() {
 }
 checkForUpdate();
 
+// ---- App version (small, bottom-left of the sidebar — for the user to check) ----
+async function showAppVersion() {
+  const node = el("app-version");
+  if (!node) return;
+  if (!window.__TAURI__) { node.textContent = "dev"; return; }
+  try { node.textContent = "v" + (await invoke("app_version")); } catch { node.textContent = ""; }
+}
+showAppVersion();
+
 setMode("user");
 setInterval(refreshTopbar, 3000);
 // Live poll: keep the Peers/Topology connection state fresh while viewing them.

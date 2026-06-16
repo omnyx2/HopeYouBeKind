@@ -181,6 +181,12 @@ fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), Stri
         .map_err(|e| e.to_string())
 }
 
+/// The app version (from tauri.conf.json) — shown small in the GUI corner.
+#[tauri::command]
+fn app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -191,7 +197,8 @@ fn main() {
             meshd,
             check_update,
             open_url,
-            notify
+            notify,
+            app_version
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lattice GUI");
@@ -267,11 +274,16 @@ fn launch_meshd_elevated(meshd: &str) {
 }
 
 /// Windows: UAC elevation via PowerShell `Start-Process -Verb RunAs` (hidden window).
+/// The elevated process is spawned through a hidden `cmd` that sets `DATA_PLANE=1`
+/// **itself** — `-Verb RunAs` does NOT inherit our environment block, so setting it in
+/// this process (or via PowerShell's `$env:`) would be lost. Without it meshd comes up
+/// control-plane only (no TUN/UDP), and every peer stays "idle" forever.
 #[cfg(target_os = "windows")]
 fn launch_meshd_elevated(meshd: &str) {
-    let ps = format!(
-        "Start-Process -FilePath '{meshd}' -ArgumentList '{MESHD_SOCKET}' -Verb RunAs -WindowStyle Hidden"
+    let arg = format!(
+        "/c set DATA_PLANE=1&& \"{meshd}\" \"{MESHD_SOCKET}\" >\"%TEMP%\\lattice-meshd.log\" 2>&1"
     );
+    let ps = format!("Start-Process cmd.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '{arg}'");
     let _ = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .status();
