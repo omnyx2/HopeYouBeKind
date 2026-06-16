@@ -153,12 +153,13 @@
 2. **One-veto self-destruct = 채택.** 오판이어도 메쉬 파괴. fail-deadly, 거짓양성 위험 수용. (§7)
 3. **메쉬별 cipher, 생성 시 확정. 변경은 60% online 정족수. 오프라인 노드는 변경 시 자동 퇴출.**
    (§5-4)
+4. **해독 실패의 두 의미 = 컨텍스트로 분리 (DECIDED).** **데이터평면** 프레임 해독 실패 → 조용히
+   "재암호화됨, 나 퇴출" 처리(공격 카운트 X). **가입(초대코드)** 단계 해독 실패만 → 3-strike 공격 카운트.
+   → 잠깐 끊긴 노드가 실수로 메쉬를 폭파시키는 사고 방지.
+5. **Threshold t = 60% (DECIDED, 재암호화 정족수와 일치).** §5-2 live-paired 비밀 공유 임계값을 재암호화
+   정족수와 같은 60%로 둠. (필요시 메쉬별 튜닝 여지만 남김.)
 
 **남은 쟁점 (구현 시 명확히):**
-4. **Threshold t.** §5-2의 live-paired 비밀 공유 임계값. 60%(=재암호화 정족수)와 맞출지, 더 낮출지.
-5. **해독 실패의 두 의미 ⚠️ (신규).** 이제 "해독 실패"가 **(a) 재암호화로 내가 퇴출됨** vs **(b) 공격/손상**
-   둘 다를 뜻함 → §7의 공격 경보와 충돌 가능. 구분 규칙 필요: 예) 데이터평면 해독 실패 = 조용히 퇴출 처리,
-   가입(초대코드) 단계 해독 실패만 3-strike 공격 카운트. 컨텍스트로 분리.
 6. **생성자 override vs veto 타이밍.** override(안심)와 veto(파괴)가 동시 발생 시 우선순위/윈도우 규칙.
    (생성자 서명 all-clear 우선.)
 7. **헤더 배치 순열.** 필수 헤더 요소를 MTU 내 임의 위치로 흩으면 파싱·정렬 처리 필요 → 고정 슬롯 +
@@ -173,6 +174,22 @@
   §5-2 live-paired self-destruct(threshold), §7 공격 대응, ①의 time-expire 신원코드.
 
 ---
+
+## 10. 구현 순서 / Build order
+
+설계 잠금 후, 의존성·가치 순. 각 단계는 독립 배포 가능. / Design locked; by dependency + value.
+
+| 단계 | 내용 | 기반 |
+|---|---|---|
+| **P-C1 본문 cipher seam** | 생성 시 메쉬별 cipher 확정 + `suite(name)` 실제 분기 + 두 번째 suite 등록. **연구용 시간창/manifold cipher가 여기 꽂힘.** | 이미 있는 `MeshSuite`/charter.initial_cipher |
+| **P-C2 헤더/본문 분리** | 헤더 = `f(mesh_id,time)` 2중 슬라이드 cipher, 본문 = P-C1 선택. 현재 평문 헤더(AAD)를 봉인으로. | wire_v2 + P-C1 |
+| **P-C3 재암호화 거버넌스** | 60% online 정족수 re-cipher, epoch 증가, 오프라인=암묵 퇴출(데이터평면 해독실패 처리). | charter `RecipherTrigger::Quorum` |
+| **P-C4 live-paired 자폭** | threshold(60%) 비밀 공유: t개 미만 live → secret 복원 불가 → 자가 폐기. | keydist + share 분배 |
+| **P-C5 헤더 순열** | 필수 헤더 요소를 per-mesh 비밀 순열로 MTU 내 배치 (안티-핑거프린트). | wire_v2 |
+| **P-C6 초대코드 + 알고리즘 비공개** | time-expire 신원코드 → 초대코드(seed들+n), 대역외 알고리즘 공유. | 가입 플로우 재작업 |
+| **P-C7 공격 대응** | 3-strike 잠금/경보, one-veto 자폭, 생성자 override. | P-C6 |
+
+권장 시작 = **P-C1** (가장 작고, 이미 절반 구현됐고, 연구 cipher의 집).
 
 ## TL;DR (EN)
 Target protocol: a joiner's time-expiring random **identity code** → inviter turns it into an
