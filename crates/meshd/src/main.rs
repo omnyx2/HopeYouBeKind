@@ -170,6 +170,12 @@ async fn main() -> anyhow::Result<()> {
 async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(socket);
     let listener = tokio::net::UnixListener::bind(socket)?;
+    // meshd runs as root (for the TUN) but the desktop app connects as the logged-in
+    // user, so make the socket world-rw — otherwise the GUI can't reach it.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666));
+    }
     loop {
         let (stream, _) = listener.accept().await?;
         tokio::spawn(serve_conn(stream, Arc::clone(&state)));
