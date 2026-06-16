@@ -110,6 +110,14 @@ self-healing cache** (re-learn + re-gossip + keepalive + relay). / 즉 churn은 
   one peers actually use (no separate-socket port mismatch). `my_endpoint` is a shared
   handle so meshd's invites pick up the upgraded address. LIVE: a campus-NAT Mac learned
   `203.0.113.20:25459` reflected by the Oracle exit and re-advertised it.
+- ✅ **P-D4 LAN fast-path** (`meshrun::lan`) — a custom UDP **multicast beacon** (group
+  `239.255.42.99:42424`, TTL 1) every 7 s. Each beacon = `LAT1` magic + an **opaque
+  per-mesh tag** (`lattice_mesh::lan_tag` = Blake2s of the secret) + our member id + our
+  data-plane port. A receiver matches the tag against its meshes and seeds `PeerLinks`
+  with the sender's `src_ip:dp_port` — same-router peers connect directly, no WAN/exit/
+  reflexion, no NAT. The opaque tag reveals neither mesh id nor pubkey to non-members;
+  the sealed gossip is still the real membership gate. meshd runs one beacon for the
+  whole node (snapshots all live meshes). LIVE: real beacon observed on the wire.
 - ⏳ retire the manual **SetPeer** UI once gossip lands (keep as a fallback/override).
 
 ## Phases / 단계
@@ -121,5 +129,6 @@ self-healing cache** (re-learn + re-gossip + keepalive + relay). / 즉 churn은 
    the gossip (`self` line); we adopt it when the reporter's source is public. Our own
    exit doubles as the STUN reflector — no external server. / 공인 피어가 가십으로 우리
    공인 주소를 반사(`self` 줄), 보고자 출발지가 공인일 때 채택. exit이 STUN 역할 — 외부 서버 X.
-4. **P-D4 LAN fast-path (mDNS)** — same-router peers find each other without the WAN.
-   / 같은 공유기 피어를 WAN 없이.
+4. ✅ **P-D4 LAN fast-path** — a UDP multicast beacon (opaque per-mesh tag) lets
+   same-router peers find each other directly, no WAN. / UDP 멀티캐스트 비콘(불투명
+   per-mesh 태그)으로 같은 공유기 피어를 WAN 없이 직접 발견.

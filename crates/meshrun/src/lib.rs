@@ -18,6 +18,9 @@ use lattice_net::Transport;
 use lattice_proto::wire_v2::MemberId;
 use lattice_tun::TunDevice;
 
+pub mod lan;
+pub use lan::{run_lan_discovery, LanMesh};
+
 /// What we know about how to reach a peer, and when we last heard from it.
 #[derive(Clone, Copy, Debug)]
 pub struct Link {

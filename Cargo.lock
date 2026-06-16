@@ -640,6 +640,7 @@ dependencies = [
  "lattice-net",
  "lattice-proto",
  "lattice-tun",
+ "socket2 0.5.10",
  "tokio",
 ]
 

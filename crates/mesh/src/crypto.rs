@@ -100,6 +100,21 @@ pub fn suite(_name: &str, secret: &[u8; 32], epoch: u64) -> Box<dyn MeshSuite> {
     Box::new(MeshCipher::new(secret, epoch))
 }
 
+/// An opaque per-mesh LAN-discovery tag (docs/DISCOVERY.md P-D4): a domain-separated
+/// hash of the mesh secret, truncated to 8 bytes. Broadcast in the LAN beacon so
+/// same-mesh peers recognise each other without revealing the mesh id or any pubkey;
+/// a non-member sees only random-looking bytes. Derived from the secret (not an epoch
+/// key) so it survives re-ciphering — discovery shouldn't break on a rekey.
+pub fn lan_tag(secret: &[u8; 32]) -> [u8; 8] {
+    let mut h = Blake2s256::new();
+    h.update(b"lattice-mesh-lan-tag-v1");
+    h.update(secret);
+    let digest = h.finalize();
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&digest[..8]);
+    tag
+}
+
 fn epoch_key(secret: &[u8; 32], epoch: u64) -> [u8; 32] {
     let mut h = Blake2s256::new();
     h.update(b"lattice-mesh-epoch-v2");

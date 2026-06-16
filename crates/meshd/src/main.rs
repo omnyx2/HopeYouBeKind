@@ -78,6 +78,9 @@ struct MeshState {
     /// run loop. Set at bringup; the loop upgrades it to our public address when a
     /// public peer reflects it (P-D3). Read by CreateInvite to hand joiners (P-D1).
     my_endpoint: SharedEndpoint,
+    /// This mesh's local data-plane UDP port (set at bringup; 0 = not up). Advertised
+    /// in the LAN beacon so same-router peers reach us directly (P-D4).
+    dp_port: u16,
 }
 
 impl MeshState {
@@ -165,6 +168,26 @@ async fn main() -> anyhow::Result<()> {
             "off"
         }
     );
+    // P-D4: one LAN-discovery beacon for the whole node. Each round it snapshots the
+    // live meshes (those with a data plane up) and advertises/seeds them, so same-LAN
+    // peers find each other with no WAN. Best-effort; harmless when data plane is off.
+    if data_plane {
+        let st = Arc::clone(&state);
+        tokio::spawn(lattice_meshrun::run_lan_discovery(move || {
+            let st = st.lock().unwrap();
+            st.meshes
+                .values()
+                .filter(|m| m.dp_port != 0)
+                .map(|m| lattice_meshrun::LanMesh {
+                    tag: lattice_mesh::crypto::lan_tag(&m.secret),
+                    member_id: m.my_id(),
+                    dp_port: m.dp_port,
+                    links: Arc::clone(&m.links),
+                })
+                .collect()
+        }));
+    }
+
     eprintln!("meshd: listening on {socket}");
     accept_loop(&socket, state).await
 }
@@ -288,9 +311,10 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     // make this node able to serve as an exit for others — ip_forward + NAT, which
     // is idempotent and unused unless a peer routes through us (reuses v1 exit.rs).
     let tun_name = tun.name().map(|s| s.to_string());
-    if let Some(name) = tun_name.clone() {
+    {
         if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
-            ms.tun_name = Some(name);
+            ms.tun_name = tun_name.clone();
+            ms.dp_port = port; // local data-plane port — advertised in the LAN beacon
         }
     }
     exit::enable_nat();
@@ -747,6 +771,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             exit_sel,
             tun_name: None,
             my_endpoint,
+            dp_port: 0,
         },
     );
     (
@@ -815,6 +840,7 @@ fn create_mesh(
             exit_sel,
             tun_name: None,
             my_endpoint,
+            dp_port: 0,
         },
     );
     (
