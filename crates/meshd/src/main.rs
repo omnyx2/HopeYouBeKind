@@ -532,16 +532,53 @@ async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<(
 #[cfg(windows)]
 async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
-    // Named pipes are connection-instanced: create an instance, wait for a client,
-    // hand it off, then create the next instance for the following client.
-    let mut server = ServerOptions::new()
+    // A POOL of concurrent pipe instances. A single instance that is recreated only
+    // *after* a client connects leaves a window with zero listeners, so when the GUI
+    // fires several requests at once (topbar + attack + warnings polls) the extra
+    // clients get ERROR_PIPE_BUSY ("all pipe instances are busy", os error 231).
+    // Keeping many instances listening — and re-arming each before it serves — closes
+    // that window.
+    const POOL: usize = 16;
+    let pipe = pipe.to_string();
+    // The first instance claims the pipe name; the rest add concurrent instances.
+    let first = ServerOptions::new()
         .first_pipe_instance(true)
-        .create(pipe)?;
+        .max_instances(255)
+        .create(&pipe)?;
+    for _ in 1..POOL {
+        let s = ServerOptions::new().max_instances(255).create(&pipe)?;
+        tokio::spawn(pipe_worker(s, pipe.clone(), Arc::clone(&state)));
+    }
+    // Run the first worker inline so accept_loop never returns while serving.
+    pipe_worker(first, pipe, state).await;
+    Ok(())
+}
+
+/// One pipe-pool worker: wait for a client, immediately re-arm a fresh listening
+/// instance (so the pool's listener count never dips), then serve the connection.
+#[cfg(windows)]
+async fn pipe_worker(
+    mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+    pipe: String,
+    state: Arc<Mutex<State>>,
+) {
+    use tokio::net::windows::named_pipe::ServerOptions;
     loop {
-        server.connect().await?;
+        if server.connect().await.is_err() {
+            match ServerOptions::new().max_instances(255).create(&pipe) {
+                Ok(s) => {
+                    server = s;
+                    continue;
+                }
+                Err(_) => return,
+            }
+        }
         let connected = server;
-        server = ServerOptions::new().create(pipe)?;
-        tokio::spawn(serve_conn(connected, Arc::clone(&state)));
+        server = match ServerOptions::new().max_instances(255).create(&pipe) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        serve_conn(connected, Arc::clone(&state)).await;
     }
 }
 

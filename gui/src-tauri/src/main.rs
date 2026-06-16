@@ -58,11 +58,21 @@ async fn meshd(request: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
         use std::fs::OpenOptions;
         use std::io::{BufRead, BufReader, Write};
-        let pipe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(MESHD_SOCKET)
-            .map_err(|e| format!("meshd not running ({MESHD_SOCKET}): {e}"))?;
+        // ERROR_PIPE_BUSY (231): every server pipe instance is momentarily busy. The
+        // GUI polls several endpoints at once, so retry briefly instead of failing.
+        let pipe = {
+            let mut tries = 0;
+            loop {
+                match OpenOptions::new().read(true).write(true).open(MESHD_SOCKET) {
+                    Ok(p) => break p,
+                    Err(e) if e.raw_os_error() == Some(231) && tries < 40 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(e) => return Err(format!("meshd not running ({MESHD_SOCKET}): {e}")),
+                }
+            }
+        };
         let mut line = request;
         line.push('\n');
         (&pipe)
