@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-gui"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "lattice-ipc",
  "lattice-proto",
