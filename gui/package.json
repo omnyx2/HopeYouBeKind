@@ -1,6 +1,6 @@
 {
   "name": "lattice-gui",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Lattice mesh VPN — desktop GUI",
   "private": true,
   "type": "module",
