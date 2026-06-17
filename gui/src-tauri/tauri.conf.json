@@ -26,7 +26,7 @@
       "category": "Utility",
       "shortDescription": "Serverless mesh VPN",
       "longDescription": "Fuse every installed node into one private overlay network.",
-      "resources": ["resources/*"],
+      "resources": ["resources/meshd*", "resources/*.dll"],
       "windows": {
         "nsis": {
           "installMode": "both",
