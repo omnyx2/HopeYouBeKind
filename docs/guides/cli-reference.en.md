@@ -12,6 +12,54 @@ and [cookbook](cookbook.en.md). Two pieces:
 
 ---
 
+## 0. Copy-paste cheat sheet (TL;DR)
+
+Two machines: a **server** with a public IP (the seed/exit) and a **client** (laptop
+behind NAT). Replace `<PUBLIC_IP>` with the server's public IP. Sections 1–7 explain
+every line; this is the whole thing, copy-pasteable.
+
+**① SERVER — build once, run, create the mesh** *(open UDP 41000 + 41001 in your cloud firewall first)*
+
+```sh
+git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
+cargo build --release -p lattice-meshd
+sudo ln -sf "$PWD/scripts/lattice" /usr/local/bin/lattice
+
+sudo DATA_PLANE=1 MESHD_BIND_PORT=41000 MESHD_DHT_PORT=41001 \
+  MESHD_ADVERTISE=<PUBLIC_IP>:41000 \
+  ./target/release/meshd /tmp/meshd.sock &
+export LATTICE_SOCK=/tmp/meshd.sock
+
+lattice new corp --me seed          # you are member #1
+```
+
+**② CLIENT — build once, run, join** *(get the invite via the 3 steps below)*
+
+```sh
+git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
+cargo build --release -p lattice-meshd
+sudo ln -sf "$PWD/scripts/lattice" /usr/local/bin/lattice
+
+sudo DATA_PLANE=1 MESHD_DHT_BOOTSTRAP=<PUBLIC_IP>:41001 \
+  ./target/release/meshd &
+
+lattice id                          # 1) prints your identity code — send the line to the server
+#    server admin runs:  lattice invite corp laptop <that-id-code>   -> prints an invite code
+lattice join <INVITE_CODE>          # 2) paste the invite code here
+lattice info corp                   # 3) everyone should show 'live'
+```
+
+**③ FULL VPN — send all the client's internet through the server**
+
+```sh
+lattice exit corp seed              # pick the server as the exit
+lattice vpn corp                    # route everything through it
+curl -s https://ifconfig.co         # should print the SERVER's public IP
+lattice off                         # back to direct internet
+```
+
+---
+
 ## 1. Build & install
 
 ```sh

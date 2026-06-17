@@ -10,6 +10,53 @@
 
 ---
 
+## 0. 복붙 치트시트 (TL;DR)
+
+머신 2대: 공인 IP를 가진 **서버**(시드/출구)와 **클라이언트**(NAT 뒤 노트북). `<공인IP>`를
+서버의 공인 IP로 바꾸세요. 각 줄 설명은 1~7장에 있고, 이건 그냥 통째로 복붙하면 됩니다.
+
+**① 서버 — 한 번 빌드, 실행, 메쉬 생성** *(먼저 클라우드 방화벽에서 UDP 41000 + 41001 개방)*
+
+```sh
+git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
+cargo build --release -p lattice-meshd
+sudo ln -sf "$PWD/scripts/lattice" /usr/local/bin/lattice
+
+sudo DATA_PLANE=1 MESHD_BIND_PORT=41000 MESHD_DHT_PORT=41001 \
+  MESHD_ADVERTISE=<공인IP>:41000 \
+  ./target/release/meshd /tmp/meshd.sock &
+export LATTICE_SOCK=/tmp/meshd.sock
+
+lattice new corp --me seed          # 당신이 멤버 #1
+```
+
+**② 클라이언트 — 한 번 빌드, 실행, 가입** *(초대는 아래 3단계로)*
+
+```sh
+git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
+cargo build --release -p lattice-meshd
+sudo ln -sf "$PWD/scripts/lattice" /usr/local/bin/lattice
+
+sudo DATA_PLANE=1 MESHD_DHT_BOOTSTRAP=<공인IP>:41001 \
+  ./target/release/meshd &
+
+lattice id                          # 1) 신원 코드 출력 — 그 한 줄을 서버에 전달
+#    서버 관리자 실행:  lattice invite corp laptop <그-신원코드>   -> 초대 코드 출력
+lattice join <초대코드>             # 2) 초대 코드를 여기 붙여넣기
+lattice info corp                   # 3) 모두 'live'로 떠야 함
+```
+
+**③ 풀 VPN — 클라이언트의 모든 인터넷을 서버로**
+
+```sh
+lattice exit corp seed              # 서버를 출구로 지정
+lattice vpn corp                    # 모든 트래픽을 그쪽으로
+curl -s https://ifconfig.co         # 서버의 공인 IP가 나와야 함
+lattice off                         # 직접 인터넷으로 복귀
+```
+
+---
+
 ## 1. 빌드 & 설치
 
 ```sh
