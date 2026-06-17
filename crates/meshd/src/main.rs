@@ -71,17 +71,26 @@ fn quorum_threshold(n: usize) -> usize {
     (3 * n + 4) / 5
 }
 
-/// Append a diagnostic line to `<tempdir>/lattice-meshd.log`. On Windows the GUI runs
-/// meshd elevated + hidden with no console (RunAs can't redirect output), so this file
-/// is the only window into what happened. Best-effort — a no-op if temp isn't writable.
+/// Append a diagnostic line to a `lattice-meshd.log`. On Windows the GUI runs meshd
+/// elevated + hidden with no console (RunAs can't redirect output), so this file is the
+/// only window into what happened. Best-effort, written to EVERY candidate that opens —
+/// under RunAs the elevating account's `%TEMP%` may not exist, but `C:\Windows\Temp`
+/// always does — so the log is findable regardless of which account elevated.
 fn diag_log(msg: &str) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::env::temp_dir().join("lattice-meshd.log"))
-    {
-        let _ = writeln!(f, "{msg}");
+    let mut paths = vec![std::env::temp_dir().join("lattice-meshd.log")];
+    #[cfg(windows)]
+    paths.push(std::path::PathBuf::from(
+        r"C:\Windows\Temp\lattice-meshd.log",
+    ));
+    for p in paths {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
+            let _ = writeln!(f, "{msg}");
+        }
     }
 }
 

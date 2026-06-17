@@ -9,7 +9,7 @@
   },
   "package": {
     "productName": "Lattice",
-    "version": "0.2.9"
+    "version": "0.2.10"
   },
   "tauri": {
     "bundle": {
@@ -29,7 +29,7 @@
       "resources": ["resources/meshd*"],
       "windows": {
         "nsis": {
-          "installMode": "both",
+          "installMode": "perMachine",
           "displayLanguageSelector": true,
           "languages": ["English", "Korean"]
         }

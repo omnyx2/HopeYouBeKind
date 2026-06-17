@@ -274,20 +274,17 @@ fn launch_meshd_elevated(meshd: &str) {
 }
 
 /// Windows: UAC elevation via PowerShell `Start-Process -Verb RunAs` (hidden window).
-/// Elevate via a hidden `cmd` that sets `DATA_PLANE=1` itself — `-Verb RunAs` does NOT
-/// inherit our environment, and this cmd-based elevation is the form that reliably
-/// started meshd in 0.2.3/0.2.4. The redirect captures meshd's diagnostics to
-/// `%TEMP%\lattice-meshd.log` (meshd also writes there directly, as a backstop).
+/// Launch meshd.exe **directly** with clean args: the socket + `--data-plane`. No `cmd`
+/// wrapper, no env var, no output redirect, no extra quoting — every one of those was a
+/// failure mode under RunAs (the cmd redirect to an elevated `%TEMP%` that doesn't exist
+/// aborted the launch with "path not found"). `--data-plane` enables the data plane
+/// without needing an inherited env var; meshd writes its own log to a temp file.
 #[cfg(target_os = "windows")]
 fn launch_meshd_elevated(meshd: &str) {
-    // NO output redirect: under RunAs the elevated `%TEMP%` may point at a path that
-    // doesn't exist, so `>"%TEMP%\…"` fails with "path not found" and cmd dies BEFORE
-    // running meshd (the daemon then never starts). meshd writes its own log file
-    // instead (best-effort). The `cmd /c set DATA_PLANE=1 &&` is only to pass the env
-    // var, since RunAs doesn't inherit ours.
-    let arg = format!("/c set DATA_PLANE=1&& \"{meshd}\" \"{MESHD_SOCKET}\"");
-    let ps =
-        format!("Start-Process cmd.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '{arg}'");
+    let ps = format!(
+        "Start-Process -FilePath '{meshd}' -ArgumentList '{MESHD_SOCKET}','--data-plane' \
+         -Verb RunAs -WindowStyle Hidden"
+    );
     let _ = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .status();
