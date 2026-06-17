@@ -683,7 +683,10 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
             ms.dp_port = port; // local data-plane port — advertised in the LAN beacon
         }
     }
-    exit::enable_nat();
+    // enable_nat shells out (pfctl/sysctl on unix, several PowerShell cmdlets on
+    // Windows) — synchronous + slow, so run it off the async runtime to avoid stalling
+    // IPC while a mesh is brought up.
+    let _ = tokio::task::spawn_blocking(exit::enable_nat).await;
     // This node's own reachable address, advertised in the endpoint gossip so peers
     // can reach us without a manual SetPeer (docs/DISCOVERY.md §2). A public node
     // (the Oracle exit) PINS it via MESHD_ADVERTISE=ip:port — never overridden;

@@ -48,6 +48,16 @@ pub struct WinTun {
 
 impl WinTun {
     pub async fn open(config: TunConfig) -> Result<Self, TunError> {
+        // Wintun setup — load the embedded DLL, create the adapter (the driver work
+        // alone can take seconds), start the session, assign the address via `netsh` —
+        // is all SYNCHRONOUS BLOCKING work. Run it on a blocking task so it never stalls
+        // meshd's async runtime, which would freeze IPC (the whole daemon appears dead).
+        tokio::task::spawn_blocking(move || Self::open_blocking(config))
+            .await
+            .map_err(|e| TunError::Io(format!("wintun setup task panicked: {e}")))?
+    }
+
+    fn open_blocking(config: TunConfig) -> Result<Self, TunError> {
         let dll = ensure_wintun_dll()?;
         let wintun = unsafe { wintun::load_from_path(&dll) }
             .map_err(|e| TunError::Io(format!("load wintun.dll ({}): {e}", dll.display())))?;
