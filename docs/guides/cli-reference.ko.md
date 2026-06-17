@@ -261,6 +261,7 @@ CLI는 유닉스 소켓을 써서 **Windows 데몬을 직접 제어하지 못합
 |---|---|
 | `meshd not running (… )` | 데몬 미실행 또는 `LATTICE_SOCK` 잘못됨. `meshd` 실행, 소켓 경로 확인. |
 | `info`에 멤버 `unknown` / 엔드포인트 `—` | 피어 아직 도달 불가. 양쪽 데이터 플레인 포트 개방 확인; DHT/가십 ~30초 내 수렴. |
+| 멤버가 `unknown`에서 안 풀리고 **공개 노드**가 연결 안 됨 (특히 GUI로 만든 메쉬) | NAT 뒤 노드는 `meshd`를 `MESHD_DHT_BOOTSTRAP=<공인IP>:41001`로 띄우지 않으면 공개 피어를 자동으로 못 찾습니다. **GUI는 그 설정 없이 `meshd`를 띄우므로** 한 번 직접 지정: **Peers 탭 → `unknown` 멤버 → "set address" → `<공인IP>:41000`** (또는 Overview "Peer address" 카드). CLI 등가: `lattice raw '{"SetPeer":{"mesh":N,"member":M,"endpoint":"<공인IP>:41000"}}'`. 패킷 한 번 가면 reflexion + 가십이 이어받아 전원 수렴. **`MESHD_DHT_BOOTSTRAP`으로 띄운 CLI 클라이언트**는 이 단계가 불필요. |
 | GUI/`info`에 **data plane DOWN** | 메쉬 UDP 포트를 다른 프로세스(낡은/두 번째 `meshd`)가 점유. `meshd`가 몇 초간 bind 재시도; 낡은 데몬 종료하면 복구(단일-인스턴스 가드가 새 데몬이 살아있는 걸 빼앗지 않게 함). |
 | `cannot create pipe … (os error 5)` (Windows) | 다른 `meshd`가 파이프 점유. 먼저 종료(또는 리부트 — Lattice는 자동 시작 안 함). |
 | 두 노드가 인터넷 너머로 연결 안 됨 | 둘 다 NAT 뒤·공개 경로 없음 — 공개 시드 노드를 추가하고 `MESHD_DHT_BOOTSTRAP` + `exit`을 거기로. |

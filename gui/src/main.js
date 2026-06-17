@@ -142,10 +142,31 @@ async function renderPeersFor(id) {
     const st = m.state || "unknown";
     const badge = `<span class="state-badge state-${st}">${st}</span>`;
     const ep = m.endpoint ? `<span class="muted small mono"> ${esc(m.endpoint)}</span>` : "";
+    // Unreachable peer (not me, not live / no endpoint) → offer an inline "set address" right
+    // where the problem shows. A node behind NAT can't auto-find a public peer (e.g. an Oracle
+    // exit) unless its DHT was bootstrapped at launch; pointing it once lets reflexion + gossip
+    // take over. Same SetPeer the CLI uses; also on the Overview "Peer address" card.
+    const needsAddr = !m.is_me && (st !== "live" || !m.endpoint);
+    const action = needsAddr
+      ? `<div class="add-row" style="margin-top:6px"><input class="peer-ep-in" data-m="${m.id}" placeholder="ip:port — e.g. 203.0.113.10:41000" style="font-size:12px;flex:1" /><button class="small-btn peer-ep-set" data-m="${m.id}">set address</button></div>`
+      : "";
     return `<tr><td>${m.id}</td><td>${esc(m.name)}${m.is_me ? ' <span class="muted small">(me)</span>' : ""}</td>` +
-      `<td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}</td></tr>`;
+      `<td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}${action}</td></tr>`;
   }).join("");
-  el("peers-table").querySelector("tbody").innerHTML = rows;
+  const tbl = el("peers-table");
+  tbl.querySelector("tbody").innerHTML = rows;
+  // Wire the inline set-address buttons (reach a peer that discovery hasn't found yet).
+  tbl.querySelectorAll(".peer-ep-set").forEach((btn) => {
+    btn.onclick = async () => {
+      const m = parseInt(btn.dataset.m, 10);
+      const inp = tbl.querySelector(`.peer-ep-in[data-m="${m}"]`);
+      const ep = (inp?.value || "").trim();
+      if (!ep || !/^.+:\d+$/.test(ep)) return toast("enter ip:port");
+      try { await meshd({ SetPeer: { mesh: id, member: m, endpoint: ep } }); toast("peer address set — connecting…"); }
+      catch (e) { return toast(String(e)); }
+      setTimeout(() => renderPeersFor(id), 1500);
+    };
+  });
 }
 
 document.querySelectorAll(".nav-item").forEach((b) =>
