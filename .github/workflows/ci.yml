@@ -83,13 +83,11 @@ jobs:
           mkdir -p gui/src-tauri/resources
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp target/release/meshd.exe gui/src-tauri/resources/meshd.exe
-            # meshd's data plane loads wintun.dll at runtime (the Windows TUN driver);
-            # bundle it next to meshd.exe or every peer stays "idle".
-            curl -L -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
-            unzip -o -j wintun.zip 'wintun/bin/amd64/wintun.dll' -d gui/src-tauri/resources/
           else
             cp target/release/meshd gui/src-tauri/resources/meshd
           fi
+          # wintun.dll (the Windows TUN driver meshd loads at runtime) is committed at
+          # gui/src-tauri/resources/wintun.dll and bundled next to meshd.exe.
       - name: Bundle desktop app
         working-directory: gui
         run: npm run tauri build
