@@ -274,16 +274,16 @@ fn launch_meshd_elevated(meshd: &str) {
 }
 
 /// Windows: UAC elevation via PowerShell `Start-Process -Verb RunAs` (hidden window).
-/// The elevated process is spawned through a hidden `cmd` that sets `DATA_PLANE=1`
-/// **itself** — `-Verb RunAs` does NOT inherit our environment block, so setting it in
-/// this process (or via PowerShell's `$env:`) would be lost. Without it meshd comes up
-/// control-plane only (no TUN/UDP), and every peer stays "idle" forever.
+/// Launch meshd.exe **directly** with its socket + a `--data-plane` flag. We pass the
+/// flag as an argument, not an env var, because `-Verb RunAs` does NOT inherit our
+/// environment, and wrapping it in `cmd /c set DATA_PLANE=1 && …` through ShellExecute
+/// is brittle quoting that left meshd not starting at all.
 #[cfg(target_os = "windows")]
 fn launch_meshd_elevated(meshd: &str) {
-    let arg = format!(
-        "/c set DATA_PLANE=1&& \"{meshd}\" \"{MESHD_SOCKET}\" >\"%TEMP%\\lattice-meshd.log\" 2>&1"
+    let ps = format!(
+        "Start-Process -FilePath '{meshd}' -ArgumentList '\"{MESHD_SOCKET}\"','--data-plane' \
+         -Verb RunAs -WindowStyle Hidden"
     );
-    let ps = format!("Start-Process cmd.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '{arg}'");
     let _ = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .status();
