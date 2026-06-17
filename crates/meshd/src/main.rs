@@ -579,23 +579,40 @@ async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<(
 #[cfg(windows)]
 async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
-    // A POOL of concurrent pipe instances. A single instance that is recreated only
-    // *after* a client connects leaves a window with zero listeners, so when the GUI
-    // fires several requests at once (topbar + attack + warnings polls) the extra
-    // clients get ERROR_PIPE_BUSY ("all pipe instances are busy", os error 231).
-    // Keeping many instances listening — and re-arming each before it serves — closes
-    // that window.
-    const POOL: usize = 16;
+    // A POOL of concurrent pipe instances so several simultaneous GUI requests don't get
+    // ERROR_PIPE_BUSY (os error 231). The EXTRA instances are best-effort: if the OS
+    // won't grant more, we run with however many we got rather than exiting — exiting
+    // here was fatal (meshd kept starting, hitting "listening", then dying, so the GUI
+    // relaunched it in a loop).
+    const POOL: usize = 8;
     let pipe = pipe.to_string();
-    // The first instance claims the pipe name; the rest add concurrent instances.
-    let first = ServerOptions::new()
+    // The first instance claims the pipe name. If THIS fails another meshd already owns
+    // the pipe, so exit (don't run two).
+    let first = match ServerOptions::new()
         .first_pipe_instance(true)
         .max_instances(255)
-        .create(&pipe)?;
+        .create(&pipe)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            elog!("meshd: cannot create pipe {pipe} (another instance already running?): {e}");
+            return Err(e.into());
+        }
+    };
+    let mut instances = 1usize;
     for _ in 1..POOL {
-        let s = ServerOptions::new().max_instances(255).create(&pipe)?;
-        tokio::spawn(pipe_worker(s, pipe.clone(), Arc::clone(&state)));
+        match ServerOptions::new().max_instances(255).create(&pipe) {
+            Ok(s) => {
+                instances += 1;
+                tokio::spawn(pipe_worker(s, pipe.clone(), Arc::clone(&state)));
+            }
+            Err(e) => {
+                elog!("meshd: pipe pool stopped at {instances} instance(s): {e}");
+                break;
+            }
+        }
     }
+    elog!("meshd: pipe server ready ({instances} instance(s)) — accepting clients");
     // Run the first worker inline so accept_loop never returns while serving.
     pipe_worker(first, pipe, state).await;
     Ok(())
