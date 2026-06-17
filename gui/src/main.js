@@ -553,8 +553,18 @@ async function loadLists() {
   const ja = el("join-algo");
   if (ja && INVITE_ALGOS.length)
     ja.innerHTML = INVITE_ALGOS.map((a, i) => `<option${i === 0 ? " selected" : ""}>${esc(a)}</option>`).join("");
+  return CIPHERS.length && INVITE_ALGOS.length;
 }
-loadLists();
+// meshd is launched by the GUI at startup and isn't reachable the instant the webview
+// paints — so a one-shot fetch left the cipher/algorithm dropdowns permanently EMPTY
+// (the error was swallowed, never retried). Retry until the lists load, then fill the
+// create-mesh cipher select too.
+(async () => {
+  for (let i = 0; i < 40; i++) {
+    if (await loadLists()) { await populateCiphers(); break; }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+})();
 const optList = (list, sel) => list.map((x) => `<option${x === sel ? " selected" : ""}>${esc(x)}</option>`).join("");
 
 // ---- P-C7 attack banner (G-3): poll for any armed mesh; show countdown + all-clear ----
