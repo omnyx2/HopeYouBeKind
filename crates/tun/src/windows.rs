@@ -1,16 +1,39 @@
 //! Windows TUN device via the [Wintun](https://www.wintun.net/) driver.
 //!
-//! Loads `wintun.dll`, creates a Wintun adapter, and drives its send/receive
-//! rings. Wintun's API is blocking, so reads run on a blocking task. The adapter
-//! address is assigned with `netsh`. Requires Administrator and `wintun.dll`
-//! present next to the binary.
+//! `wintun.dll` is **embedded into the binary** (`include_bytes!`) and extracted to a
+//! temp path at runtime, so the installer never has to ship it as a separate file —
+//! Tauri's resource bundling proved unreliable for it, and a missing DLL silently
+//! left the Windows data plane down (every peer stuck "idle"). We then create a
+//! Wintun adapter and drive its send/receive rings. Wintun's API is blocking, so reads
+//! run on a blocking task. The adapter address is assigned with `netsh`. Requires
+//! Administrator.
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
 use crate::{TunConfig, TunDevice, TunError};
 
 const ADAPTER_NAME: &str = "Lattice";
+
+/// The Wintun userspace driver, embedded so meshd.exe is self-contained.
+const WINTUN_DLL: &[u8] = include_bytes!("../wintun.dll");
+
+/// Write the embedded `wintun.dll` to a stable temp path (idempotent — only rewrites
+/// if missing or a different size, so a DLL already mapped by another run isn't
+/// clobbered) and return that path for [`wintun::load_from_path`].
+fn ensure_wintun_dll() -> Result<PathBuf, TunError> {
+    let path = std::env::temp_dir().join("lattice-wintun.dll");
+    let stale = match std::fs::metadata(&path) {
+        Ok(m) => m.len() != WINTUN_DLL.len() as u64,
+        Err(_) => true,
+    };
+    if stale {
+        std::fs::write(&path, WINTUN_DLL)
+            .map_err(|e| TunError::Io(format!("extract wintun.dll to {}: {e}", path.display())))?;
+    }
+    Ok(path)
+}
 
 pub struct WinTun {
     // Keep the loaded library and adapter alive for the session's lifetime.
@@ -25,8 +48,9 @@ pub struct WinTun {
 
 impl WinTun {
     pub async fn open(config: TunConfig) -> Result<Self, TunError> {
-        let wintun =
-            unsafe { wintun::load() }.map_err(|e| TunError::Io(format!("load wintun.dll: {e}")))?;
+        let dll = ensure_wintun_dll()?;
+        let wintun = unsafe { wintun::load_from_path(&dll) }
+            .map_err(|e| TunError::Io(format!("load wintun.dll ({}): {e}", dll.display())))?;
         let adapter = wintun::Adapter::create(&wintun, ADAPTER_NAME, ADAPTER_NAME, None)
             .map_err(|e| TunError::Io(format!("create adapter: {e}")))?;
         let session = Arc::new(
