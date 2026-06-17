@@ -1690,13 +1690,19 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             for (m, link) in ms.links.lock().unwrap().iter() {
                 endpoints.push((*m, link.endpoint.to_string()));
             }
-            ms.certs.push(cert);
+            // Do NOT add the invitee to our OWN roster here: creating an invite must never
+            // make a node a "member" that never connected (that phantom then gossips
+            // mesh-wide). The joiner gets its cert in the blob below; once it actually JOINS
+            // and connects, its cert propagates back via roster gossip and it becomes a real
+            // member then — membership tracks connection, not a dangling invite.
+            let mut blob_certs = ms.certs.clone();
+            blob_certs.push(cert);
             let blob = InviteBlob {
                 mesh_id: ms.mesh.id,
                 mesh_name: ms.mesh.name.clone(),
                 charter: ms.mesh.charter.clone(),
                 member_id: id,
-                certs: ms.certs.clone(),
+                certs: blob_certs,
                 sealed_secret,
                 endpoints,
                 epoch: ms.epoch, // bring the joiner up at the live epoch (P-C3)
