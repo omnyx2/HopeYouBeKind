@@ -71,6 +71,29 @@ fn quorum_threshold(n: usize) -> usize {
     (3 * n + 4) / 5
 }
 
+/// Append a diagnostic line to `<tempdir>/lattice-meshd.log`. On Windows the GUI runs
+/// meshd elevated + hidden with no console (RunAs can't redirect output), so this file
+/// is the only window into what happened. Best-effort — a no-op if temp isn't writable.
+fn diag_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("lattice-meshd.log"))
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+/// Like `elog!`, but also mirrors the line to the diagnostic log file (above).
+macro_rules! elog {
+    ($($a:tt)*) => {{
+        let s = format!($($a)*);
+        eprintln!("{s}");
+        crate::diag_log(&s);
+    }};
+}
+
 /// One mesh plus the real trust state for it.
 struct MeshState {
     mesh: Mesh,
@@ -416,6 +439,14 @@ fn request_mutates(req: &Request) -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // First line in the log: proves meshd actually launched (vs the GUI's launcher
+    // failing before this point), and records the args we got.
+    let argv: Vec<String> = std::env::args().collect();
+    elog!(
+        "meshd: started pid={} args={:?}",
+        std::process::id(),
+        &argv[1..]
+    );
     // The socket is the first non-flag argument; flags (`--data-plane`) may come in any
     // order. Falling back to the platform default lets a bare `meshd` still work.
     let socket = std::env::args()
@@ -435,7 +466,7 @@ async fn main() -> anyhow::Result<()> {
         st.data_plane = data_plane;
         st.persist_dir.clone_from(&pdir);
     }
-    eprintln!(
+    elog!(
         "meshd: data-plane mode {}",
         if data_plane {
             "ON (per-mesh TUN+UDP loops; needs root)"
@@ -464,7 +495,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let _ = std::fs::remove_file(&backup_path);
             if merged > 0 {
-                eprintln!(
+                elog!(
                     "meshd: imported {merged} mesh(es) from update backup {}",
                     backup_path.display()
                 );
@@ -481,7 +512,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if !st.meshes.is_empty() {
-                eprintln!(
+                elog!(
                     "meshd: restored {} mesh(es) from {}",
                     st.meshes.len(),
                     dir.display()
@@ -514,7 +545,7 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
-    eprintln!("meshd: listening on {socket}");
+    elog!("meshd: listening on {socket}");
     accept_loop(&socket, state).await
 }
 
@@ -648,7 +679,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     {
         Ok(t) => t,
         Err(e) => {
-            eprintln!(
+            elog!(
                 "meshd: data-plane TUN open failed for mesh {} (need root?): {e}",
                 b.mesh_id
             );
@@ -666,7 +697,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     let transport = match UdpTransport::bind(bind).await {
         Ok(t) => t,
         Err(e) => {
-            eprintln!(
+            elog!(
                 "meshd: data-plane UDP bind {bind} failed for mesh {}: {e}",
                 b.mesh_id
             );
@@ -705,7 +736,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         .and_then(|s| s.parse().ok())
         .or_else(|| local_ip().map(|ip| SocketAddr::new(ip, port)));
     *b.my_endpoint.lock().unwrap() = advertise;
-    eprintln!(
+    elog!(
         "meshd: data-plane LIVE for mesh {} — overlay {overlay}/24, udp {bind}, iface {tun_name:?}, advertise {advertise:?} pinned={pinned}",
         b.mesh_id
     );
@@ -752,13 +783,13 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                 }
                 LoopEvent::Control(CTRL_ATTACK) => {
                     if ms.attack_armed_at.is_none() {
-                        eprintln!("meshd: mesh {mid} ATTACK ALERT received — destroy grace armed ({ATTACK_GRACE_SECS}s; creator can all-clear)");
+                        elog!("meshd: mesh {mid} ATTACK ALERT received — destroy grace armed ({ATTACK_GRACE_SECS}s; creator can all-clear)");
                         ms.attack_armed_at = Some(now_ms());
                     }
                 }
                 LoopEvent::Control(CTRL_ALLCLEAR) => {
                     if ms.attack_armed_at.take().is_some() {
-                        eprintln!("meshd: mesh {mid} ALL-CLEAR received — destroy grace cancelled");
+                        elog!("meshd: mesh {mid} ALL-CLEAR received — destroy grace cancelled");
                     }
                 }
                 LoopEvent::Control(_) => {}
@@ -832,7 +863,7 @@ fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<State>>) {
             } else {
                 format!("live {live}/{n} below threshold {threshold} for {SELF_DESTRUCT_GRACE_SECS}s (live-paired, P-C4)")
             };
-            eprintln!("meshd: mesh {mesh_id} SELF-DESTRUCT — {reason}");
+            elog!("meshd: mesh {mesh_id} SELF-DESTRUCT — {reason}");
             if let Some(mut gone) = st.meshes.remove(&mesh_id) {
                 gone.secret.iter_mut().for_each(|byte| *byte = 0); // wipe the secret
                 if let Some(t) = &gone.dp_task {
@@ -882,7 +913,7 @@ fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
             if !alive {
                 let mut st = state.lock().unwrap();
                 if st.current == Some(mesh) {
-                    eprintln!(
+                    elog!(
                         "meshd kill-switch: full-tunnel exit not passing traffic — reverting to direct internet"
                     );
                     exit::restore_routes();
@@ -982,7 +1013,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             if ms.attack_armed_at.is_none() {
                 ms.attack_armed_at = Some(now_ms());
             }
-            eprintln!(
+            elog!(
                 "meshd: mesh {mesh} ATTACK reported — alert broadcast, destroy grace armed ({ATTACK_GRACE_SECS}s)"
             );
             (Response::Ok, None)
@@ -1001,7 +1032,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 let _ = tx.send(LoopCmd::SendControl(CTRL_ALLCLEAR, Vec::new(), peers));
             }
             ms.attack_armed_at = None;
-            eprintln!("meshd: mesh {mesh} ALL-CLEAR issued by creator — destroy grace cancelled");
+            elog!("meshd: mesh {mesh} ALL-CLEAR issued by creator — destroy grace cancelled");
             (Response::Ok, None)
         }
 
@@ -1021,7 +1052,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                                 std::fs::Permissions::from_mode(0o600),
                             );
                         }
-                        eprintln!(
+                        elog!(
                             "meshd: exported {} mesh(es) to {}",
                             snapshot.len(),
                             target.display()
@@ -1206,7 +1237,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                         Some(PostAction::ArmKillSwitch(id))
                     }
                     _ => {
-                        eprintln!(
+                        elog!(
                             "meshd: full-tunnel not plumbed for mesh {id} — TUN or exit endpoint unknown (is the data plane up + exit reachable?)"
                         );
                         None

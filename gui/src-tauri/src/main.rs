@@ -280,9 +280,12 @@ fn launch_meshd_elevated(meshd: &str) {
 /// `%TEMP%\lattice-meshd.log` (meshd also writes there directly, as a backstop).
 #[cfg(target_os = "windows")]
 fn launch_meshd_elevated(meshd: &str) {
-    let arg = format!(
-        "/c set DATA_PLANE=1&& \"{meshd}\" \"{MESHD_SOCKET}\" >\"%TEMP%\\lattice-meshd.log\" 2>&1"
-    );
+    // NO output redirect: under RunAs the elevated `%TEMP%` may point at a path that
+    // doesn't exist, so `>"%TEMP%\…"` fails with "path not found" and cmd dies BEFORE
+    // running meshd (the daemon then never starts). meshd writes its own log file
+    // instead (best-effort). The `cmd /c set DATA_PLANE=1 &&` is only to pass the env
+    // var, since RunAs doesn't inherit ours.
+    let arg = format!("/c set DATA_PLANE=1&& \"{meshd}\" \"{MESHD_SOCKET}\"");
     let ps =
         format!("Start-Process cmd.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '{arg}'");
     let _ = std::process::Command::new("powershell")
