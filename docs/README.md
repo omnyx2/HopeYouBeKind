@@ -5,22 +5,32 @@ they self-assemble into one private, encrypted network — no coordination serve
 
 Start here, then dive into the feature guide you need.
 
-## Getting started
+> **Which stack?** The current product is the **v2 multi-mesh** stack (`meshd` +
+> the `lattice` CLI). The original **v1** single-mesh/CA stack has been archived
+> under [`../legacy/`](../legacy/README.md); its docs moved to `../legacy/docs/`
+> and are tagged _(v1 legacy)_ below.
 
-- **[USAGE.md](USAGE.md)** — build it, run a node, and drive every workflow from
-  the GUI and CLI. **Read this first.**
+## Getting started (v2 — current)
+
+- **[guides/getting-started.en.md](guides/getting-started.en.md)** ·
+  **[한국어](guides/getting-started.ko.md)** — zero to a working mesh VPN with the
+  friendly `lattice` CLI. **Read this first.**
+- **[guides/cookbook.en.md](guides/cookbook.en.md)** · **[한국어](guides/cookbook.ko.md)**
+  — feature recipes (private LAN, full tunnel, ephemeral meshes, re-cipher, …).
+- [MESH_V2.md](MESH_V2.md), [DATA_PLANE.md](DATA_PLANE.md),
+  [DISCOVERY.md](DISCOVERY.md), [PROTOCOL_DESIGN.md](PROTOCOL_DESIGN.md) — v2 internals.
 
 ## Feature guides
 
 | Guide | What it covers |
 | --- | --- |
 | [MEMBERSHIP.md](MEMBERSHIP.md) | Closed networks: network identity, the serverless CA, enrolling nodes (join tokens), and evicting them (revocation). |
-| [CRYPTO_SUITE.md](CRYPTO_SUITE.md) | The pluggable tunnel-crypto seam — swap the handshake/cipher (e.g. for research) without touching the engine. |
-| [TRAFFIC_MONITOR.md](TRAFFIC_MONITOR.md) | Live per-flow view of everything crossing the tunnel (GUI Traffic tab / `lattice flows`). |
 | [EXIT_NODE.md](EXIT_NODE.md) | Route a node's general internet traffic out through a chosen peer. |
-| [RELAY.md](RELAY.md) | Forward encrypted traffic through a third node when two peers can't connect directly (CGNAT). |
-| [HEALTH_CHECK.md](HEALTH_CHECK.md) | ⚠️ **Security-sensitive.** Dump every node's virtual IP at once, gated by a (weak) process-name allow-list. Read the security impact before enabling. |
-| [ADMIN_CONSOLE.md](ADMIN_CONSOLE.md) | Design/plan for the standalone mesh **admin console** (`gui-admin/`): membership & eviction, full packet-level traffic inspector, runtime crypto-suite swap lab. |
+| [../legacy/docs/CRYPTO_SUITE.md](../legacy/docs/CRYPTO_SUITE.md) | _(v1 legacy)_ The pluggable tunnel-crypto seam — swap the handshake/cipher without touching the engine. |
+| [../legacy/docs/TRAFFIC_MONITOR.md](../legacy/docs/TRAFFIC_MONITOR.md) | _(v1 legacy)_ Live per-flow view of everything crossing the tunnel (`lattice flows`). |
+| [../legacy/docs/RELAY.md](../legacy/docs/RELAY.md) | _(v1 legacy)_ Forward encrypted traffic through a third node when two peers can't connect directly (CGNAT). |
+| [../legacy/docs/HEALTH_CHECK.md](../legacy/docs/HEALTH_CHECK.md) | _(v1 legacy)_ ⚠️ **Security-sensitive.** Dump every node's virtual IP at once, gated by a (weak) process-name allow-list. |
+| [../legacy/docs/ADMIN_CONSOLE.md](../legacy/docs/ADMIN_CONSOLE.md) | _(v1 legacy)_ The standalone admin console (`legacy/gui-admin/`): membership & eviction, packet inspector, crypto-suite swap lab. |
 
 ## Design & reference
 
@@ -28,7 +38,7 @@ Start here, then dive into the feature guide you need.
 | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Crate layout and how the planes fit together. |
 | [SDN_DHT_ARCHITECTURE.md](SDN_DHT_ARCHITECTURE.md) | **Design** — the SDN×DHT control plane: a global admin-signed network map distributed serverlessly over the DHT (decentralized distribution, centralized admin authority). Auto full-mesh + programmable routing. |
-| [PROTOCOL.md](PROTOCOL.md) | The Lattice Tunnel Protocol — handshake, framing, sessions. |
+| [../legacy/docs/PROTOCOL.md](../legacy/docs/PROTOCOL.md) | _(v1 legacy)_ The Lattice Tunnel Protocol — handshake, framing, sessions. |
 | [SECURITY.md](SECURITY.md) | Threat model and cryptographic choices. |
 | [FEATURES.md](FEATURES.md) | Status table — what works today, what's partial, what's planned. |
 | [ROADMAP.md](ROADMAP.md) | What's next. |

@@ -370,8 +370,12 @@ const WIN_SAVED: &str = r"C:\Windows\Temp\lattice-saved-route.txt";
 
 #[cfg(target_os = "windows")]
 fn ps(script: &str) {
+    // Full path: meshd runs elevated (RunAs) with a possibly minimal PATH, so a bare
+    // "powershell" can fail with "path not found".
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let pwsh = format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe");
     run(
-        "powershell",
+        &pwsh,
         &["-NoProfile", "-NonInteractive", "-Command", script],
     );
 }

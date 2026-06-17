@@ -101,11 +101,19 @@ impl WinTun {
     }
 }
 
+/// Full path to a `System32` tool. meshd is launched elevated (RunAs), whose PATH can
+/// be minimal/missing — so `Command::new("netsh")` fails with "path not found". Build
+/// the absolute path from `%SystemRoot%` (always set) to be robust.
+fn system32(exe: &str) -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\{exe}")
+}
+
 /// Assign the overlay address to the adapter via `netsh`.
 fn configure_interface(config: &TunConfig) -> Result<(), TunError> {
     // /10 → mask 255.192.0.0.
     let mask = prefix_to_mask(config.prefix_len);
-    let status = Command::new("netsh")
+    let status = Command::new(system32("netsh.exe"))
         .args([
             "interface",
             "ip",

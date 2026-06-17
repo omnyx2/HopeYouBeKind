@@ -1,6 +1,6 @@
 [package]
 name = "lattice-gui"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 rust-version = "1.79"
 license = "MIT"
@@ -18,9 +18,10 @@ serde_json = "1"
 # Lightweight blocking HTTP for the GitHub-release update check (done in Rust, off
 # the webview, so the CSP/allowlist stays locked down).
 ureq = { version = "2", features = ["json"] }
-# Reuse the shared types and IPC client so the GUI talks to the daemon directly.
+# Shared wire types. NOTE: the v2 GUI talks to `meshd` via its own newline-JSON
+# bridge (see src/main.rs) — these are vestigial v1 deps, candidates for removal.
 lattice-proto = { path = "../../crates/proto" }
-lattice-ipc = { path = "../../crates/ipc" }
+lattice-ipc = { path = "../../legacy/crates/ipc" }
 
 [features]
 # Production builds use the bundled assets; dev uses the Vite server.

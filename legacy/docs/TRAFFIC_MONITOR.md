@@ -17,7 +17,7 @@ Each flow carries:
 - **protocol** — TCP, UDP, ICMP, or `IP/<n>` for others.
 - **local** ↔ **remote** — `ip:port` for TCP/UDP, `ip` otherwise. "Local" is this
   node; "remote" is the peer's virtual IP (mesh traffic) or a public address
-  (internet traffic carried through an [exit node](EXIT_NODE.md)).
+  (internet traffic carried through an [exit node](../../docs/EXIT_NODE.md)).
 - **tx / rx packets and bytes**.
 - **last active** — seconds since the flow last carried a packet.
 

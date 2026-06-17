@@ -24,7 +24,7 @@ no matter where they physically are. No central server to run, no accounts.
   across the internet via a DHT + NAT hole-punching. No coordination server.
 - **Custom encrypted tunnel** — the handshake/session protocol is our own
   design, built on *vetted* cryptographic primitives (the Noise framework via
-  the `snow` crate), not hand-rolled ciphers. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+  the `snow` crate), not hand-rolled ciphers. See [`legacy/docs/PROTOCOL.md`](legacy/docs/PROTOCOL.md).
 - **GUI-first** — a Tauri desktop app is the primary interface; a `lattice` CLI
   and a background daemon back it.
 - **Cross-platform** — macOS, Windows, Linux.
@@ -102,11 +102,15 @@ GUI setup lives in [`gui/README.md`](gui/README.md).
 
 ## Documentation
 
-Start with **[`docs/USAGE.md`](docs/USAGE.md)** (build & run, every workflow),
-then the per-feature guides indexed in **[`docs/README.md`](docs/README.md)**:
-[membership](docs/MEMBERSHIP.md), [pluggable crypto](docs/CRYPTO_SUITE.md),
-[traffic monitor](docs/TRAFFIC_MONITOR.md), [exit node](docs/EXIT_NODE.md),
-[relay](docs/RELAY.md). There's also a write-up of the design in
+Start with the **v2 beginner guides** —
+[getting started](docs/guides/getting-started.en.md) ·
+[cookbook](docs/guides/cookbook.en.md) ([한국어](docs/guides/getting-started.ko.md)) —
+then the index in **[`docs/README.md`](docs/README.md)**:
+[membership](docs/MEMBERSHIP.md), [exit node](docs/EXIT_NODE.md),
+[mesh v2 internals](docs/MESH_V2.md).
+The original **v1** stack (daemon/CLI, CA, DHT, crypto-swap lab) is archived under
+[`legacy/`](legacy/README.md) — its build/run guide is
+[`legacy/docs/USAGE.md`](legacy/docs/USAGE.md). There's also a design write-up in
 [`docs/blog/`](docs/blog/building-a-serverless-mesh-vpn.md).
 
 ## License

@@ -7,7 +7,7 @@ default and only production suite, but the seam exists so alternative schemes
 (post-quantum KEM handshakes, different AEADs, experimental framing) can be
 researched and swapped **without touching the node runtime**.
 
-This is deliberately separate from [membership](MEMBERSHIP.md): the suite secures
+This is deliberately separate from [membership](../../docs/MEMBERSHIP.md): the suite secures
 the channel and authenticates the peer's identity key; membership decides whether
 that identity is allowed in. You can change one without the other.
 

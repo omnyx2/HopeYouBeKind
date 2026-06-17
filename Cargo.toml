@@ -8,26 +8,31 @@
 [workspace]
 resolver = "2"
 members = [
+    # --- shared base (used by both the v2 product and the archived v1 stack) ---
     "crates/proto",
-    "crates/crypto",
     "crates/tun",
     "crates/net",
-    "crates/overlay",
+    # --- v2 mesh product (the current direction; what the GUI ships as `meshd`) ---
     "crates/mesh",
     "crates/meshd",
     "crates/meshrun",
-    "crates/engine",
-    "crates/membership",
-    "crates/dht",
-    "crates/ipc",
-    "crates/daemon",
-    "crates/cli",
+    # --- v1 (LEGACY, archived under legacy/) — kept as members so they still build
+    #     and don't rot; not part of the current product. See legacy/README.md. ---
+    "legacy/crates/crypto",
+    "legacy/crates/overlay",
+    "legacy/crates/engine",
+    "legacy/crates/membership",
+    "legacy/crates/dht",
+    "legacy/crates/ipc",
+    "legacy/crates/daemon",
+    "legacy/crates/cli",
 ]
-# The Tauri GUI (gui/) and the fuzz targets (fuzz/) are intentionally NOT
-# workspace members: the GUI pulls the heavy Tauri/webview toolchain and is built
-# via `cargo tauri`, and the fuzz crate depends on libfuzzer (nightly). Keeping
-# both out lets `cargo check` on the core stay fast and stable-only.
-exclude = ["gui", "gui-admin", "fuzz"]
+# The Tauri GUIs (gui/, legacy/gui-admin/) and the fuzz targets (fuzz/) are
+# intentionally NOT workspace members: the GUIs pull the heavy Tauri/webview
+# toolchain and are built via `cargo tauri`, and the fuzz crate depends on
+# libfuzzer (nightly). Keeping them out lets `cargo check` on the core stay fast
+# and stable-only.
+exclude = ["gui", "legacy/gui-admin", "fuzz"]
 
 [workspace.package]
 version = "0.7.0"
@@ -78,15 +83,17 @@ mdns-sd = "0.11"        # serverless LAN peer discovery
 # pinned Rust 1.79 toolchain does not support. Lift this when we bump the MSRV.
 clap = { version = ">=4.0.0, <4.5.0", features = ["derive"] }
 # --- internal crates (path deps, versions inherited from workspace) ---
+# Shared base + v2 product crates live under crates/; the v1 (legacy) crates were
+# archived under legacy/crates/ but remain path deps so the workspace still builds.
 lattice-proto   = { path = "crates/proto", version = "0.7.0" }
-lattice-crypto  = { path = "crates/crypto", version = "0.7.0" }
 lattice-tun     = { path = "crates/tun", version = "0.7.0" }
 lattice-net     = { path = "crates/net", version = "0.7.0" }
-lattice-overlay = { path = "crates/overlay", version = "0.7.0" }
-lattice-engine  = { path = "crates/engine", version = "0.7.0" }
-lattice-membership = { path = "crates/membership", version = "0.7.0" }
-lattice-dht     = { path = "crates/dht", version = "0.7.0" }
-lattice-ipc     = { path = "crates/ipc", version = "0.7.0" }
+lattice-crypto  = { path = "legacy/crates/crypto", version = "0.7.0" }
+lattice-overlay = { path = "legacy/crates/overlay", version = "0.7.0" }
+lattice-engine  = { path = "legacy/crates/engine", version = "0.7.0" }
+lattice-membership = { path = "legacy/crates/membership", version = "0.7.0" }
+lattice-dht     = { path = "legacy/crates/dht", version = "0.7.0" }
+lattice-ipc     = { path = "legacy/crates/ipc", version = "0.7.0" }
 
 # Release profile: optimized, but keep thin debug info for crash triage.
 [profile.release]

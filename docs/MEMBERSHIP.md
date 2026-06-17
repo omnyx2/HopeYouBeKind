@@ -79,7 +79,7 @@ A network has a name (its public id) that you remember and share; one node holds
 the network key and decides who is in (issue a cert) and who is out (revoke it).
 Everything is signed and gossiped peer-to-peer — there is no coordination server.
 
-This layer is **orthogonal to the tunnel crypto** ([CRYPTO_SUITE](CRYPTO_SUITE.md)):
+This layer is **orthogonal to the tunnel crypto** ([CRYPTO_SUITE](../legacy/docs/CRYPTO_SUITE.md)):
 a node proves it belongs by presenting a certificate, and that proof is checked
 no matter which cipher suite encrypts the session.
 

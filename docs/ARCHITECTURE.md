@@ -26,7 +26,7 @@ hostile input.
   packet destined for peer X, performs the session handshake with X (once), and
   produces an encrypted datagram; and the reverse. Built on the Noise framework
   (`snow`) so we design the *protocol* (handshake pattern, rekeying, framing)
-  without hand-rolling ciphers. Spec: [`PROTOCOL.md`](PROTOCOL.md).
+  without hand-rolling ciphers. Spec: [`PROTOCOL.md`](../legacy/docs/PROTOCOL.md).
 
 ### 2. Transport & discovery — "find peers, carry ciphertext"
 

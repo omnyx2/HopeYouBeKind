@@ -20,7 +20,7 @@ replay but never forge.
 
 > Written before implementation. It is the architecture spec; the per-phase build
 > plans follow it. See also [ARCHITECTURE.md](ARCHITECTURE.md) (current crates),
-> [MEMBERSHIP.md](MEMBERSHIP.md) (the CA), and [ADMIN_CONSOLE.md](ADMIN_CONSOLE.md)
+> [MEMBERSHIP.md](MEMBERSHIP.md) (the CA), and [ADMIN_CONSOLE.md](../legacy/docs/ADMIN_CONSOLE.md)
 > (the admin UI).
 
 ---
@@ -67,7 +67,7 @@ Consequences:
   version numbers + timestamps.
 - The **admin node is the only writer of the network's "program."** It is the SDN
   controller; the DHT is its distribution bus. The admin runs the controller from
-  the admin console ([ADMIN_CONSOLE.md](ADMIN_CONSOLE.md)).
+  the admin console ([ADMIN_CONSOLE.md](../legacy/docs/ADMIN_CONSOLE.md)).
 
 The admin key is the existing `--network-key` (the CA). No new trust root.
 
@@ -239,7 +239,7 @@ holds the CA (today's `"not an admin node"` check), and authoritative DHT record
 without a valid CA signature are ignored by every reader.
 
 > Defense in depth: the admin console's *local* sensitive readouts (packet
-> capture) keep their `--admin-allow` process gate ([ADMIN_CONSOLE.md](ADMIN_CONSOLE.md));
+> capture) keep their `--admin-allow` process gate ([ADMIN_CONSOLE.md](../legacy/docs/ADMIN_CONSOLE.md));
 > the *network* authority here is the CA signature. Two independent gates.
 
 ---

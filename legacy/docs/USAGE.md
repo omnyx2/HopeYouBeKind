@@ -2,7 +2,7 @@
 
 A practical guide: build it, run a node, and drive the common workflows from the
 GUI and the CLI. For what each feature *is*, see the per-feature guides linked
-from [docs/README.md](README.md).
+from [docs/README.md](../../docs/README.md).
 
 ## Mental model in 30 seconds
 
@@ -11,7 +11,7 @@ from [docs/README.md](README.md).
   identity. Reach a peer by that IP (`ping 100.x.y.z`, `ssh user@100.x.y.z`).
 - A **daemon** (root, owns the virtual NIC) does the work; a **GUI** and a **CLI**
   are thin clients that talk to it over a local socket.
-- Optionally close the mesh into a named network with [membership](MEMBERSHIP.md).
+- Optionally close the mesh into a named network with [membership](../../docs/MEMBERSHIP.md).
 
 ## Build
 
@@ -89,7 +89,7 @@ GUI **Peers → Add a peer**).
 
 ### Create a closed network and enroll a node
 
-See [MEMBERSHIP.md](MEMBERSHIP.md) for the full flow. Short version:
+See [MEMBERSHIP.md](../../docs/MEMBERSHIP.md) for the full flow. Short version:
 
 ```sh
 # Admin:
@@ -107,7 +107,7 @@ In the GUI this is the **Mesh** tab: Issue a token, the joiner pastes it into
 
 ### Route your internet through a peer (exit node)
 
-See [EXIT_NODE.md](EXIT_NODE.md). On the exit: turn on **Act as exit node**. On
+See [EXIT_NODE.md](../../docs/EXIT_NODE.md). On the exit: turn on **Act as exit node**. On
 the client: pick the exit under **Exit through**. Verify with
 `curl https://ifconfig.me`.
 

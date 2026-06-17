@@ -5,9 +5,9 @@ A snapshot of what Lattice does today. Legend: ✅ working & tested ·
 
 New since v0.7.0: a **pluggable crypto suite** seam, **mesh membership** (network
 CA + certs + revocation), and a **traffic monitor**. Per-feature guides:
-[USAGE](USAGE.md) · [MEMBERSHIP](MEMBERSHIP.md) · [CRYPTO_SUITE](CRYPTO_SUITE.md) ·
-[TRAFFIC_MONITOR](TRAFFIC_MONITOR.md) · [EXIT_NODE](EXIT_NODE.md) ·
-[RELAY](RELAY.md) (index: [docs/README.md](README.md)).
+[USAGE](../legacy/docs/USAGE.md) · [MEMBERSHIP](MEMBERSHIP.md) · [CRYPTO_SUITE](../legacy/docs/CRYPTO_SUITE.md) ·
+[TRAFFIC_MONITOR](../legacy/docs/TRAFFIC_MONITOR.md) · [EXIT_NODE](EXIT_NODE.md) ·
+[RELAY](../legacy/docs/RELAY.md) (index: [docs/README.md](README.md)).
 
 ## Data plane (moving the packets)
 
@@ -61,7 +61,7 @@ CA + certs + revocation), and a **traffic monitor**. Per-feature guides:
 | Privileged daemon hosting the engine | ✅ | `crates/daemon` |
 | Local IPC (newline-JSON over Unix socket) | ✅ | `crates/ipc` |
 | CLI: `status` / `peers` / `up` / `down` / `flows` / `health` | ✅ | `crates/cli` |
-| Mesh health check — all virtual IPs at once, process-name gated (⚠️ weakens security) | ✅ | `crates/daemon`, `crates/ipc`; [HEALTH_CHECK.md](HEALTH_CHECK.md) |
+| Mesh health check — all virtual IPs at once, process-name gated (⚠️ weakens security) | ✅ | `crates/daemon`, `crates/ipc`; [HEALTH_CHECK.md](../legacy/docs/HEALTH_CHECK.md) |
 | Desktop GUI (Tauri) | ✅ | `gui/` |
 | GUI: start/stop the daemon (admin prompt) | ✅ | `gui/` (bundles the daemon) |
 | GUI: live dashboard (status, mesh toggle, peers) | ✅ | `gui/` |
