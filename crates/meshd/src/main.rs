@@ -590,7 +590,7 @@ async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()>
     // the pipe, so exit (don't run two).
     let first = match ServerOptions::new()
         .first_pipe_instance(true)
-        .max_instances(255)
+        .max_instances(254)
         .create(&pipe)
     {
         Ok(s) => s,
@@ -601,7 +601,7 @@ async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()>
     };
     let mut instances = 1usize;
     for _ in 1..POOL {
-        match ServerOptions::new().max_instances(255).create(&pipe) {
+        match ServerOptions::new().max_instances(254).create(&pipe) {
             Ok(s) => {
                 instances += 1;
                 tokio::spawn(pipe_worker(s, pipe.clone(), Arc::clone(&state)));
@@ -629,7 +629,7 @@ async fn pipe_worker(
     use tokio::net::windows::named_pipe::ServerOptions;
     loop {
         if server.connect().await.is_err() {
-            match ServerOptions::new().max_instances(255).create(&pipe) {
+            match ServerOptions::new().max_instances(254).create(&pipe) {
                 Ok(s) => {
                     server = s;
                     continue;
@@ -638,7 +638,7 @@ async fn pipe_worker(
             }
         }
         let connected = server;
-        server = match ServerOptions::new().max_instances(255).create(&pipe) {
+        server = match ServerOptions::new().max_instances(254).create(&pipe) {
             Ok(s) => s,
             Err(_) => return,
         };
