@@ -30,7 +30,7 @@ use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, Link, LoopCmd, LoopEvent, PeerLinks, Recipher, SharedEndpoint, SharedExit,
-    CTRL_ALLCLEAR, CTRL_ATTACK,
+    CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::wire_v2::{MemberId, MeshId};
@@ -58,6 +58,9 @@ const UDP_BASE_PORT: u16 = 42000;
 /// DHT rendezvous (`MESHD_DHT=1`): how often to republish our own record and look up
 /// any mesh member we have no fresh endpoint for (docs/DHT_RENDEZVOUS.md).
 const DHT_RECONNECT_TICK_SECS: u64 = 25;
+/// How often to gossip our membership roster (signed certs) to peers so a member
+/// admitted via a third node propagates to everyone (the roster converges).
+const ROSTER_GOSSIP_TICK_SECS: u64 = 20;
 /// Overlay MTU for meshd-run data planes (matches meshrun's conservative default).
 const OVERLAY_MTU: u16 = 1280;
 /// Live-paired self-destruct (P-C4): how often to check liveness, and how long the
@@ -604,6 +607,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Roster gossip: propagate membership (signed certs) so a node admitted via one
+    // member converges to everyone — endpoints already gossiped, the roster didn't.
+    if data_plane {
+        spawn_roster_gossip(Arc::clone(&state));
+    }
+
     elog!("meshd: listening on {socket}");
     accept_loop(&socket, state).await
 }
@@ -916,6 +925,31 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                     }
                 }
                 LoopEvent::Control(_) => {}
+                // A peer gossiped its roster — merge any new cert for THIS mesh that we
+                // don't already hold; `roster()` re-validates the chain to the master, so
+                // pushing is safe (an invalid cert just never counts). This is what makes
+                // a member added via a third node propagate to everyone.
+                LoopEvent::Roster(bytes) => {
+                    if let Ok(incoming) = bincode::deserialize::<Vec<Cert>>(&bytes) {
+                        let net = ms.mesh.charter.master_pubkey;
+                        let before = ms.roster().len();
+                        for c in incoming {
+                            if c.network == net
+                                && !ms
+                                    .certs
+                                    .iter()
+                                    .any(|h| h.member == c.member && h.id == c.id)
+                            {
+                                ms.certs.push(c);
+                            }
+                        }
+                        let after = ms.roster().len();
+                        if after > before {
+                            elog!("meshd: mesh {mid} roster grew {before} -> {after} via gossip");
+                            persist_after = true;
+                        }
+                    }
+                }
             }
             if persist_after {
                 persist(&state);
@@ -924,6 +958,42 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     });
     // P-C4 live-paired self-destruct watchdog.
     spawn_self_destruct_watchdog(b.mesh_id, Arc::clone(&state));
+}
+
+/// Membership roster gossip. Every `ROSTER_GOSSIP_TICK_SECS`, send each mesh's validated
+/// roster (signed certs) to its peers; the receiver merges any new, valid cert. Endpoints
+/// already gossip (P-D2) but the **roster** did not — so a node admitted via one member
+/// never reached the others. This closes that: membership converges like endpoints do.
+/// (One UDP frame per mesh; fine for small meshes — large rosters would need chunking.)
+fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(ROSTER_GOSSIP_TICK_SECS)).await;
+            let sends: Vec<(Vec<u8>, Vec<MemberId>, UnboundedSender<LoopCmd>)> = {
+                let st = state.lock().unwrap();
+                st.meshes
+                    .values()
+                    .filter_map(|ms| {
+                        let tx = ms.loop_cmd.clone()?;
+                        let certs = ms.roster();
+                        if certs.len() < 2 {
+                            return None; // solo — nothing to propagate
+                        }
+                        let body = bincode::serialize(&certs).ok()?;
+                        let peers: Vec<MemberId> =
+                            ms.links.lock().unwrap().keys().copied().collect();
+                        if peers.is_empty() {
+                            return None;
+                        }
+                        Some((body, peers, tx))
+                    })
+                    .collect()
+            };
+            for (body, peers, tx) in sends {
+                let _ = tx.send(LoopCmd::SendControl(CTRL_ROSTER, body, peers));
+            }
+        }
+    });
 }
 
 /// DHT rendezvous reconnect loop (`MESHD_DHT=1`, docs/DHT_RENDEZVOUS.md). Every

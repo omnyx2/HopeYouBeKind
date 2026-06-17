@@ -162,6 +162,10 @@ pub enum LoopEvent {
     Recipher(Recipher),
     /// A control signal arrived (P-C7): the sub-tag (0x03 attack alert / 0x04 all-clear).
     Control(u8),
+    /// A peer gossiped its membership roster (`CTRL_ROSTER`): the sealed-then-opened
+    /// cert bytes. The supervisor merges any new, valid certs so the roster converges
+    /// across the mesh (a node added via a third member reaches everyone).
+    Roster(Vec<u8>),
 }
 
 /// meshd→loop command channel (re-cipher, attack signals).
@@ -172,6 +176,10 @@ pub type LoopEventTx = tokio::sync::mpsc::UnboundedSender<LoopEvent>;
 /// Control-frame sub-tags for the attack-response control plane (P-C7).
 pub const CTRL_ATTACK: u8 = 0x03;
 pub const CTRL_ALLCLEAR: u8 = 0x04;
+/// Membership roster gossip: the sender's cert set, so the roster converges across the
+/// mesh (a node admitted via one member propagates to all). Carried like other control
+/// frames; merged + re-validated by the supervisor.
+pub const CTRL_ROSTER: u8 = 0x05;
 
 /// Encode a re-cipher announce: `[epoch(8 BE)][cipher_len(1)][cipher][secret(32)]`.
 fn encode_recipher(r: &Recipher) -> Vec<u8> {
@@ -306,6 +314,12 @@ pub async fn run<X: Transport + 'static>(
                         // up so the supervisor arms / cancels the destroy grace.
                         Some(tag @ (CTRL_ATTACK | CTRL_ALLCLEAR)) => {
                             let _ = loop_event.send(LoopEvent::Control(tag));
+                        }
+                        // Membership roster gossip — hand the cert bytes up to the
+                        // supervisor to merge + re-validate (the frame already opened, so
+                        // it came from a member sharing this mesh's secret).
+                        Some(CTRL_ROSTER) => {
+                            let _ = loop_event.send(LoopEvent::Roster(payload[1..].to_vec()));
                         }
                         _ => {}
                     },
