@@ -39,8 +39,9 @@ use lattice_tun::{open as tun_open, TunConfig};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
+mod dht;
 #[allow(dead_code)] // ported from v1: some restore/disable paths aren't wired yet.
-mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1.
+mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1. // node-wide DHT rendezvous (re-find a moved peer by pubkey) — docs/DHT_RENDEZVOUS.md.
 
 /// Where meshd listens for the GUI/CLI. A unix domain socket on macOS/Linux; a
 /// named pipe on Windows — same newline-JSON protocol either way.
@@ -54,6 +55,9 @@ const FULL_TUNNEL_DNS: &str = "1.1.1.1";
 const LIVE_WINDOW_MS: u64 = 30_000;
 /// Per-mesh UDP base port (mesh id is added).
 const UDP_BASE_PORT: u16 = 42000;
+/// DHT rendezvous (`MESHD_DHT=1`): how often to republish our own record and look up
+/// any mesh member we have no fresh endpoint for (docs/DHT_RENDEZVOUS.md).
+const DHT_RECONNECT_TICK_SECS: u64 = 25;
 /// Overlay MTU for meshd-run data planes (matches meshrun's conservative default).
 const OVERLAY_MTU: u16 = 1280;
 /// Live-paired self-destruct (P-C4): how often to check liveness, and how long the
@@ -134,6 +138,10 @@ struct MeshState {
     /// This mesh's local data-plane UDP port (set at bringup; 0 = not up). Advertised
     /// in the LAN beacon so same-router peers reach us directly (P-D4).
     dp_port: u16,
+    /// Non-fatal data-plane bring-up error (e.g. the UDP port is held by another
+    /// process), surfaced in `MeshInfo` so the GUI can show "data plane DOWN" instead
+    /// of a mesh that looks joined but silently can't send or receive. `None` = healthy.
+    dp_error: Option<String>,
     /// Abort handle for this mesh's data-plane loop (set at bringup). `RemoveMesh`
     /// aborts it so the loop's future is dropped, freeing its TUN + UDP socket —
     /// otherwise the port leaks and a re-created mesh can't bind it.
@@ -193,6 +201,9 @@ struct State {
     /// state change, pruned on self-destruct/remove, reloaded at startup so a reboot
     /// (or a network change) doesn't drop the node from its meshes.
     persist_dir: Option<PathBuf>,
+    /// Node-wide DHT rendezvous (`MESHD_DHT=1`); `None` = off. Re-finds a peer whose
+    /// address changed with no overlapping live window — docs/DHT_RENDEZVOUS.md.
+    dht: Option<Arc<dht::DhtService>>,
 }
 
 /// Work the IPC handler defers to the async caller (it can't `.await` or spawn
@@ -421,6 +432,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         tun_name: None,
         my_endpoint,
         dp_port: 0,
+        dp_error: None,
         dp_task: None,
         cipher: p.cipher,
         epoch: p.epoch,
@@ -554,6 +566,44 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
+    // DHT rendezvous: a node-wide Kademlia overlay that re-finds a peer whose address
+    // changed with no overlapping live window (docs/DHT_RENDEZVOUS.md). ON by default
+    // whenever the data plane is up (3-platform live-verified); set `MESHD_DHT=0` to
+    // opt out. Availability-only — if the overlay is empty/unreachable, behaviour is
+    // exactly the pre-DHT first-contact discovery, so it can't destabilise the data plane.
+    let dht_enabled = std::env::var("MESHD_DHT").as_deref() != Ok("0");
+    if data_plane && dht_enabled {
+        let dht_port: u16 = std::env::var("MESHD_DHT_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(UDP_BASE_PORT.wrapping_add(900));
+        let bind = SocketAddr::from(([0, 0, 0, 0], dht_port));
+        // Bootstrap seeds: explicit MESHD_DHT_BOOTSTRAP (the always-on public node is the
+        // natural one), plus any peer endpoints we already know from persisted meshes.
+        let mut seeds: Vec<SocketAddr> = std::env::var("MESHD_DHT_BOOTSTRAP")
+            .ok()
+            .map(|s| s.split(',').filter_map(|a| a.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        {
+            let st = state.lock().unwrap();
+            for ms in st.meshes.values() {
+                for l in ms.links.lock().unwrap().values() {
+                    seeds.push(l.endpoint);
+                }
+            }
+        }
+        seeds.sort();
+        seeds.dedup();
+        match dht::DhtService::start(bind, seeds).await {
+            Ok(svc) => {
+                state.lock().unwrap().dht = Some(svc);
+                spawn_dht_reconnect(Arc::clone(&state));
+                elog!("meshd: DHT rendezvous ON (udp {bind})");
+            }
+            Err(e) => elog!("meshd: DHT rendezvous failed to start on {bind}: {e}"),
+        }
+    }
+
     elog!("meshd: listening on {socket}");
     accept_loop(&socket, state).await
 }
@@ -562,6 +612,17 @@ async fn main() -> anyhow::Result<()> {
 /// vs named pipe) but the per-connection protocol ([`serve_conn`]) is shared.
 #[cfg(unix)]
 async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
+    // Single-instance guard. Blindly `remove_file` + re-`bind` would steal the socket
+    // from a meshd that is ALREADY running — but that old instance keeps its TUNs and
+    // its already-bound data-plane UDP ports, turning into a zombie that blocks the new
+    // instance's data plane (`Address already in use`) while the GUI unknowingly talks
+    // to whichever won the socket. So: if a live meshd answers on this path, defer to it
+    // and exit cleanly instead of orphaning it.
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        elog!("meshd: another meshd already owns {socket} — deferring to it, exiting (no second instance)");
+        return Ok(());
+    }
+    // No live owner: a leftover socket file is stale — safe to remove and take over.
     let _ = std::fs::remove_file(socket);
     let listener = tokio::net::UnixListener::bind(socket)?;
     // meshd runs as root (for the TUN) but the desktop app connects as the logged-in
@@ -720,14 +781,49 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| UDP_BASE_PORT.wrapping_add(b.mesh_id as u16));
     let bind = SocketAddr::from(([0, 0, 0, 0], port));
-    let transport = match UdpTransport::bind(bind).await {
-        Ok(t) => t,
-        Err(e) => {
-            elog!(
-                "meshd: data-plane UDP bind {bind} failed for mesh {}: {e}",
-                b.mesh_id
-            );
-            return;
+    // Self-heal a busy port instead of silently leaving the data plane dead. EADDRINUSE
+    // here is almost always a just-removed mesh's socket still closing, or a zombie meshd
+    // exiting after the single-instance guard kicks in — both clear within a few seconds.
+    // Retry with backoff so the mesh comes up on its own once the port frees, and if it
+    // never does, log LOUDLY (the old behaviour failed open: the GUI showed the mesh as
+    // "joined" while nothing could send/receive — exactly the "joined but can't find each
+    // other" symptom).
+    let transport = {
+        let mut t = None;
+        for attempt in 1..=12u32 {
+            match UdpTransport::bind(bind).await {
+                Ok(tr) => {
+                    if attempt > 1 {
+                        elog!(
+                            "meshd: data-plane UDP {bind} bound for mesh {} on retry {attempt}",
+                            b.mesh_id
+                        );
+                    }
+                    t = Some(tr);
+                    break;
+                }
+                Err(e) => {
+                    elog!(
+                        "meshd: data-plane UDP bind {bind} busy for mesh {} (try {attempt}/12): {e} — retrying in 500ms",
+                        b.mesh_id
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        match t {
+            Some(tr) => tr,
+            None => {
+                elog!(
+                    "meshd: data-plane UDP bind {bind} FAILED for mesh {} after 12 tries — another process holds the port; mesh data plane is DOWN",
+                    b.mesh_id
+                );
+                if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
+                    ms.dp_error =
+                        Some(format!("data-plane port {port} is held by another process"));
+                }
+                return;
+            }
         }
     };
     let dp = MeshDataPlane::new(
@@ -745,6 +841,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
             ms.tun_name = tun_name.clone();
             ms.dp_port = port; // local data-plane port — advertised in the LAN beacon
+            ms.dp_error = None; // bound cleanly — clear any prior "port busy" error
         }
     }
     // enable_nat shells out (pfctl/sysctl on unix, several PowerShell cmdlets on
@@ -827,6 +924,100 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     });
     // P-C4 live-paired self-destruct watchdog.
     spawn_self_destruct_watchdog(b.mesh_id, Arc::clone(&state));
+}
+
+/// DHT rendezvous reconnect loop (`MESHD_DHT=1`, docs/DHT_RENDEZVOUS.md). Every
+/// `DHT_RECONNECT_TICK_SECS`: (1) **republish** our own signed endpoint record for each
+/// mesh so a moved peer can re-find us, and (2) for each roster member we have **no fresh
+/// endpoint** for, DHT-**look up** their record and seed the endpoint into the peer table
+/// — the same seam `SetPeer`/gossip use. This is what closes the "both moved with no
+/// overlap" gap that first-contact discovery (P-D1..D4) can't. All work is snapshotted
+/// under the lock and the network round-trips happen lock-free.
+fn spawn_dht_reconnect(state: Arc<Mutex<State>>) {
+    struct Work {
+        mesh: MeshId,
+        network: PubKey,
+        my_seed: [u8; 32],
+        my_endpoint: Option<SocketAddr>,
+        /// roster members with no fresh endpoint: (member id, their pubkey).
+        missing: Vec<(MemberId, PubKey)>,
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(DHT_RECONNECT_TICK_SECS)).await;
+            let Some(dht) = state.lock().unwrap().dht.clone() else {
+                continue;
+            };
+            let now = now_ms();
+            let work: Vec<Work> = {
+                let st = state.lock().unwrap();
+                st.meshes
+                    .values()
+                    .map(|ms| {
+                        let me = ms.my_id();
+                        let links = ms.links.lock().unwrap();
+                        let missing = ms
+                            .roster()
+                            .into_iter()
+                            .filter(|c| c.id != me)
+                            .filter(|c| match links.get(&c.id) {
+                                Some(l) => {
+                                    l.last_seen_ms == 0
+                                        || now.saturating_sub(l.last_seen_ms) >= LIVE_WINDOW_MS
+                                }
+                                None => true,
+                            })
+                            .map(|c| (c.id, c.member))
+                            .collect();
+                        Work {
+                            mesh: ms.mesh.id,
+                            network: ms.mesh.charter.master_pubkey,
+                            my_seed: ms.my_key.to_seed(),
+                            my_endpoint: *ms.my_endpoint.lock().unwrap(),
+                            missing,
+                        }
+                    })
+                    .collect()
+            };
+            for w in work {
+                // (1) Republish our current endpoint so peers that lost us can re-find it.
+                if let Some(ep) = w.my_endpoint {
+                    let key = MemberKey::from_seed(&w.my_seed);
+                    let rec = key.publish_endpoints(w.network, vec![ep], now, now);
+                    dht.publish(&rec).await;
+                }
+                // (2) Re-discover each member we can't currently reach.
+                for (mid, pk) in w.missing {
+                    let Some(rec) = dht.lookup(pk).await else {
+                        continue;
+                    };
+                    // verify() (sig + member) already passed inside lookup; require the
+                    // record to belong to THIS mesh before trusting its endpoint.
+                    if rec.network != w.network {
+                        continue;
+                    }
+                    if let Some(&ep) = rec.endpoints.first() {
+                        let st = state.lock().unwrap();
+                        if let Some(ms) = st.meshes.get(&w.mesh) {
+                            ms.links
+                                .lock()
+                                .unwrap()
+                                .entry(mid)
+                                .or_insert(Link {
+                                    endpoint: ep,
+                                    last_seen_ms: 0,
+                                })
+                                .endpoint = ep;
+                        }
+                        elog!(
+                            "meshd: DHT re-discovered mesh {} member {mid} at {ep}",
+                            w.mesh
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Live-paired self-destruct (P-C4, docs/PROTOCOL_DESIGN.md §5-2): once a mesh has
@@ -1570,6 +1761,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             tun_name: None,
             my_endpoint,
             dp_port: 0,
+            dp_error: None,
             dp_task: None,
             cipher,
             epoch,
@@ -1669,6 +1861,7 @@ fn create_mesh(
             tun_name: None,
             my_endpoint,
             dp_port: 0,
+            dp_error: None,
             dp_task: None,
             cipher,
             epoch: 0,
@@ -1746,6 +1939,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
         attack_armed_secs_left,
         is_creator: ms.master.is_some(),
         self_destruct: ch.self_destruct == lattice_mesh::charter::SelfDestruct::OnIsolation,
+        dp_error: ms.dp_error.clone(),
     }
 }
 

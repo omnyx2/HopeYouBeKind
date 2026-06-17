@@ -288,6 +288,7 @@ async function renderOverview(id) {
     <div class="kv"><span>cipher</span><b class="mono small">${esc(d.cipher)}</b></div>
     <div class="kv"><span>epoch</span><b>${d.epoch}</b></div>
     <div class="kv"><span>health</span><b>${d.live}/${d.members.length} live · floor ${d.threshold}${d.attack_armed_secs_left != null ? ` · <span style="color:#e44">⚠ ARMED ${d.attack_armed_secs_left}s</span>` : ""}</b></div>
+    ${d.dp_error ? `<div class="kv"><span>data plane</span><b style="color:#ff6477">⛔ DOWN — ${esc(d.dp_error)}</b></div>` : ""}
     <div class="kv"><span>my exit</span><b>${d.exit != null ? "#" + d.exit : "none"}</b></div>
     <h3 class="topo-h">Roster <span class="muted small">(${d.members.length})</span></h3>
     <table class="topo-table"><thead><tr><th>id</th><th>name</th><th>pubkey</th></tr></thead><tbody>${rows}</tbody></table>
@@ -416,6 +417,10 @@ function meshWarnings(d) {
   if (d.attack_armed_secs_left != null) {
     w.push({ kind: "attack", secs: d.attack_armed_secs_left, is_creator: d.is_creator });
   }
+  if (d.dp_error) {
+    w.push({ kind: "dataplane",
+      detail: `The data plane is DOWN: ${d.dp_error}. This mesh looks joined but cannot send or receive — peers will appear unreachable. Restart Lattice; if a stale daemon is holding the port it will free within seconds and the mesh recovers automatically.` });
+  }
   if (d.live < d.threshold) {
     w.push({ kind: "quorum",
       detail: `Only ${d.live}/${d.members.length} members are live; the live floor is ${d.threshold}.`
@@ -443,6 +448,9 @@ async function renderWarnings(id) {
           ${x.is_creator ? "You are the creator — call it off if this is a false alarm." : "Waiting for the creator to call it off."}</p>
         ${x.is_creator ? `<div class="add-row" style="margin-top:8px"><button class="small-btn" id="warn-allclear">All clear (cancel self-destruct)</button></div>` : ""}
       </div>`;
+    }
+    if (x.kind === "dataplane") {
+      return `<div class="warn-card"><h3>⛔ Data plane DOWN</h3><p>${x.detail}</p></div>`;
     }
     return `<div class="warn-card amber"><h3>⚠ Below live quorum</h3><p>${x.detail}</p></div>`;
   }).join("");

@@ -267,6 +267,11 @@ pub struct MeshDetail {
     /// default; shown in the overview so the choice is visible.
     #[serde(default)]
     pub self_destruct: bool,
+    /// `Some(reason)` if the data plane failed to come up (e.g. the UDP port is held by
+    /// another process) — the GUI shows "data plane DOWN" instead of a mesh that looks
+    /// joined but can't actually send or receive. `None` = healthy.
+    #[serde(default)]
+    pub dp_error: Option<String>,
 }
 
 /// The routing policy summary (§1).

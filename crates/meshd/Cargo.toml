@@ -16,6 +16,8 @@ lattice-meshrun = { path = "../meshrun", version = "0.7.0" }
 lattice-tun.workspace = true
 lattice-net.workspace = true
 lattice-proto.workspace = true
+lattice-dht.workspace = true
+bincode.workspace = true
 tokio = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

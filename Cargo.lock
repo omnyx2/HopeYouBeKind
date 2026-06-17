@@ -618,6 +618,8 @@ name = "lattice-meshd"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "bincode",
+ "lattice-dht",
  "lattice-mesh",
  "lattice-meshrun",
  "lattice-net",
