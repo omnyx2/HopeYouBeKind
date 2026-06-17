@@ -281,8 +281,13 @@ fn launch_meshd_elevated(meshd: &str) {
 /// without needing an inherited env var; meshd writes its own log to a temp file.
 #[cfg(target_os = "windows")]
 fn launch_meshd_elevated(meshd: &str) {
+    // Do NOT pass the pipe path as an argument: `\\.\pipe\…` backslashes get mangled
+    // going through PowerShell/ShellExecute, so meshd would create a DIFFERENTLY-named
+    // pipe than the one this GUI connects to (-> os error 2, and the GUI relaunches meshd
+    // forever). meshd falls back to its DEFAULT_SOCKET constant, which is byte-for-byte
+    // the same value as MESHD_SOCKET here — so the names always match.
     let ps = format!(
-        "Start-Process -FilePath '{meshd}' -ArgumentList '{MESHD_SOCKET}','--data-plane' \
+        "Start-Process -FilePath '{meshd}' -ArgumentList '--data-plane' \
          -Verb RunAs -WindowStyle Hidden"
     );
     let _ = std::process::Command::new("powershell")
