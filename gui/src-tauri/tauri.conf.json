@@ -9,7 +9,7 @@
   },
   "package": {
     "productName": "Lattice",
-    "version": "0.2.2"
+    "version": "0.2.3"
   },
   "tauri": {
     "bundle": {
@@ -26,7 +26,7 @@
       "category": "Utility",
       "shortDescription": "Serverless mesh VPN",
       "longDescription": "Fuse every installed node into one private overlay network.",
-      "resources": ["resources/meshd"],
+      "resources": ["resources/*"],
       "windows": {
         "nsis": {
           "installMode": "both",
