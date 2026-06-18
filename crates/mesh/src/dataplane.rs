@@ -16,9 +16,19 @@
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use lattice_proto::flow::{self, FlowAction, FlowKey, FlowRule, FlowScope};
 use lattice_proto::wire_v2::{self, FrameType, Header, MemberId, MeshId};
 
 use crate::crypto::{HeaderCrypto, MeshSuite, Scramble, TAG_LEN};
+
+/// What the flow table decided to do with an outbound overlay packet.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RouteDecision {
+    /// Send to in-mesh member `to`; `via_exit` = it's internet-bound through the exit.
+    Send { to: MemberId, via_exit: bool },
+    /// Drop it (no owner / no exit / explicit deny / unmatched).
+    Drop,
+}
 
 /// On the wire the header is sealed (P-C2): the 5 header bytes + the AEAD tag.
 const SEALED_HEADER_LEN: usize = wire_v2::HEADER_LEN + TAG_LEN;
@@ -50,6 +60,11 @@ pub struct MeshDataPlane {
     scramble: Scramble,
     /// The mesh's header-placement policy (charter), kept so a re-cipher preserves it.
     placement: crate::charter::HeaderPlacement,
+    /// SDN flow table — an ordered `match → action` program that decides where each
+    /// outbound packet goes (docs/FLOW_TABLE.md). The built-in [`flow::default_table`]
+    /// reproduces the classic behavior (overlay → owner, internet → exit); an admin can
+    /// later carry a custom table in the manifest.
+    flows: Vec<FlowRule>,
     /// Outbound counter — the per-message AEAD nonce. Atomic so the run loop can
     /// seal and recv concurrently behind a shared `&MeshDataPlane`.
     send_seq: AtomicU64,
@@ -72,7 +87,61 @@ impl MeshDataPlane {
             header: HeaderCrypto::new(secret, mesh_id),
             scramble: Scramble::new(secret, placement),
             placement,
+            flows: flow::default_table(),
             send_seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Replace the SDN flow table (a future admin-programmed table from the manifest).
+    /// Pass [`flow::default_table`] to restore the classic overlay/exit behavior.
+    pub fn set_flows(&mut self, flows: Vec<FlowRule>) {
+        self.flows = flows;
+    }
+
+    /// Decide where an outbound inner IPv4 packet goes, per the flow table. `exit` is the
+    /// node's currently-selected exit (for the `ToExit(None)` rule). The default table
+    /// reproduces the classic behavior: overlay → the VIP's owner, internet → the exit.
+    pub fn decide(&self, inner: &[u8], exit: Option<MemberId>) -> RouteDecision {
+        if inner.len() < 20 || (inner[0] >> 4) != 4 {
+            return RouteDecision::Drop; // we only carry IPv4 overlay packets
+        }
+        let dst = Ipv4Addr::new(inner[16], inner[17], inner[18], inner[19]);
+        let ihl = ((inner[0] & 0x0f) as usize) * 4;
+        let proto = inner[9];
+        let dport = if (proto == 6 || proto == 17) && inner.len() >= ihl + 4 {
+            u16::from_be_bytes([inner[ihl + 2], inner[ihl + 3]])
+        } else {
+            0
+        };
+        let owner = self.route(dst);
+        let scope = if owner.is_some() {
+            FlowScope::Overlay
+        } else {
+            FlowScope::Internet
+        };
+        let key = FlowKey {
+            scope,
+            dst,
+            proto,
+            dport,
+        };
+        match flow::first_match(&self.flows, &key).map(|r| &r.action) {
+            Some(FlowAction::ToOverlayOwner) => match owner {
+                Some(to) => RouteDecision::Send {
+                    to,
+                    via_exit: false,
+                },
+                None => RouteDecision::Drop,
+            },
+            Some(FlowAction::ToExit(None)) => match exit {
+                Some(to) => RouteDecision::Send { to, via_exit: true },
+                None => RouteDecision::Drop,
+            },
+            // Phase 2: ToExit(Some)/ToPeer carry a NodeId (pubkey) that must be resolved to
+            // a MemberId via the roster; until then, drop rather than misroute.
+            Some(FlowAction::ToExit(Some(_))) | Some(FlowAction::ToPeer(_)) => RouteDecision::Drop,
+            // Local-deliver is an inbound-side action; on the outbound path it's a no-op.
+            Some(FlowAction::Local) | Some(FlowAction::Drop) | None => RouteDecision::Drop,
         }
     }
 
@@ -196,6 +265,73 @@ mod tests {
 
     fn node_p(my_id: MemberId, p: crate::charter::HeaderPlacement) -> MeshDataPlane {
         MeshDataPlane::new(3, my_id, PREFIX, suite("default", &SECRET, 0), &SECRET, p)
+    }
+
+    /// A minimal IPv4 packet (20B header) to `dst`, proto `p`, dport `dp`.
+    fn ipv4(dst: [u8; 4], p: u8, dp: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 24];
+        pkt[0] = 0x45; // version 4, IHL 5
+        pkt[9] = p;
+        pkt[16..20].copy_from_slice(&dst);
+        pkt[22..24].copy_from_slice(&dp.to_be_bytes()); // dport at ihl(20)+2
+        pkt
+    }
+
+    #[test]
+    fn flow_table_default_routes_overlay_and_exit() {
+        let a = node(1);
+        // Overlay dst owned by member 2 (mesh 3, prefix 100.80) → send to owner, not exit.
+        let over = ipv4([100, 80, 3, 2], 6, 22);
+        assert_eq!(
+            a.decide(&over, Some(9)),
+            RouteDecision::Send {
+                to: 2,
+                via_exit: false
+            }
+        );
+        // Internet dst → send to the configured exit, marked via_exit.
+        let inet = ipv4([1, 1, 1, 1], 6, 443);
+        assert_eq!(
+            a.decide(&inet, Some(9)),
+            RouteDecision::Send {
+                to: 9,
+                via_exit: true
+            }
+        );
+        // Internet dst but no exit configured → drop.
+        assert_eq!(a.decide(&inet, None), RouteDecision::Drop);
+        // Non-IPv4 → drop.
+        assert_eq!(a.decide(&[0u8; 4], Some(9)), RouteDecision::Drop);
+    }
+
+    #[test]
+    fn flow_table_custom_rule_overrides() {
+        use lattice_proto::flow::{FlowAction, FlowMatch, FlowRule};
+        let mut a = node(1);
+        // Program a deny for udp/53 to the internet, above the generic exit rule.
+        let mut t = lattice_proto::flow::default_table();
+        t.push(FlowRule {
+            priority: 90,
+            match_: FlowMatch {
+                proto: Some(17),
+                dport: Some(53),
+                ..Default::default()
+            },
+            action: FlowAction::Drop,
+        });
+        a.set_flows(t);
+        assert_eq!(
+            a.decide(&ipv4([9, 9, 9, 9], 17, 53), Some(9)),
+            RouteDecision::Drop
+        );
+        // non-DNS internet still exits.
+        assert_eq!(
+            a.decide(&ipv4([1, 1, 1, 1], 6, 443), Some(9)),
+            RouteDecision::Send {
+                to: 9,
+                via_exit: true
+            }
+        );
     }
 
     #[test]

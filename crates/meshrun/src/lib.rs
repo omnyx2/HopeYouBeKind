@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_mesh::dataplane::{Inbound, MeshDataPlane};
+use lattice_mesh::dataplane::{Inbound, MeshDataPlane, RouteDecision};
 use lattice_net::Transport;
 use lattice_proto::wire_v2::MemberId;
 use lattice_tun::TunDevice;
@@ -361,16 +361,14 @@ pub async fn run<X: Transport + 'static>(
             // to the exit member, which NATs it out (P4; NAT is OS-side, exit.rs).
             outbound = tun.read_packet() => {
                 let Ok(p) = outbound else { break };
-                if let Some(dst) = ipv4_dst(&p) {
-                    let routed = dp.route(dst);
-                    let via_exit = routed.is_none();
-                    let member = routed.or_else(|| *exit.lock().unwrap());
-                    if let Some(member) = member {
-                        let endpoint = links.lock().unwrap().get(&member).map(|l| l.endpoint);
-                        if let Some(addr) = endpoint {
-                            traffic.lock().unwrap().record(member, true, &p, via_exit);
-                            let _ = transport.send_to(&dp.seal_to(member, &p), addr).await;
-                        }
+                // Route via the SDN flow table (docs/FLOW_TABLE.md): the default table is
+                // overlay → owner, internet → exit, but an admin can program any policy.
+                let exit_now = *exit.lock().unwrap();
+                if let RouteDecision::Send { to, via_exit } = dp.decide(&p, exit_now) {
+                    let endpoint = links.lock().unwrap().get(&to).map(|l| l.endpoint);
+                    if let Some(addr) = endpoint {
+                        traffic.lock().unwrap().record(to, true, &p, via_exit);
+                        let _ = transport.send_to(&dp.seal_to(to, &p), addr).await;
                     }
                 }
             }
