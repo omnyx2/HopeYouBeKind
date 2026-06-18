@@ -29,8 +29,8 @@ use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey};
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
-    seed_links, Link, LoopCmd, LoopEvent, PeerLinks, Recipher, SharedEndpoint, SharedExit,
-    CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_ROSTER,
+    seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
+    SharedEndpoint, SharedExit, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::wire_v2::{MemberId, MeshId};
@@ -53,6 +53,10 @@ const DEFAULT_SOCKET: &str = r"\\.\pipe\lattice-meshd";
 const FULL_TUNNEL_DNS: &str = "1.1.1.1";
 /// A member is "live" if heard from within this window.
 const LIVE_WINDOW_MS: u64 = 30_000;
+/// A decrypt-fail (a frame from a known endpoint that didn't open) is "recent" — and so
+/// worth surfacing as a split-brain warning — if it happened within this window. Wider
+/// than the live window so a transient mismatch lingers long enough to be seen + acted on.
+const DECRYPT_FAIL_WINDOW_MS: u64 = 120_000;
 /// Per-mesh UDP base port (mesh id is added).
 const UDP_BASE_PORT: u16 = 42000;
 /// DHT rendezvous (`MESHD_DHT=1`): how often to republish our own record and look up
@@ -160,6 +164,11 @@ struct MeshState {
     /// `ReportAttack` / a received alert, cleared by the creator's all-clear; the
     /// self-destruct watchdog wipes the mesh once the grace elapses.
     attack_armed_at: Option<u64>,
+    /// Frames that arrived on this mesh's socket but failed to decrypt, keyed by source
+    /// IP — shared with the data-plane loop. A nonzero count from a known peer's
+    /// endpoint IP is the "peer is on a different mesh/epoch" signal, surfaced as a
+    /// health warning + per-member reason in `MeshInfo` instead of a silent drop.
+    decrypt_fails: DecryptFails,
 }
 
 impl MeshState {
@@ -229,6 +238,7 @@ struct Bringup {
     links: PeerLinks,
     exit_sel: SharedExit,
     my_endpoint: SharedEndpoint,
+    decrypt_fails: DecryptFails,
 }
 
 fn now_ms() -> u64 {
@@ -412,6 +422,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
     let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(p.exit));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
+    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let bringup = Bringup {
         mesh_id: p.mesh_id,
         my_id,
@@ -422,6 +433,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
         my_endpoint: Arc::clone(&my_endpoint),
+        decrypt_fails: Arc::clone(&decrypt_fails),
     };
     let ms = MeshState {
         mesh,
@@ -441,6 +453,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         epoch: p.epoch,
         loop_cmd: None,
         attack_armed_at: None,
+        decrypt_fails,
     };
     (ms, bringup)
 }
@@ -888,6 +901,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         pinned,
         cmd_rx,
         applied_tx,
+        b.decrypt_fails,
     ));
     // Record the loop's abort handle (RemoveMesh stops it) + the command sender.
     if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
@@ -1805,6 +1819,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
+    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let mut mesh = Mesh::new(
         invite.mesh_id,
         invite.mesh_name.clone(),
@@ -1822,6 +1837,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
         my_endpoint: Arc::clone(&my_endpoint),
+        decrypt_fails: Arc::clone(&decrypt_fails),
     });
     st.meshes.insert(
         invite.mesh_id,
@@ -1843,6 +1859,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             epoch,
             loop_cmd: None,
             attack_armed_at: None,
+            decrypt_fails,
         },
     );
     (
@@ -1862,6 +1879,27 @@ fn create_mesh(
     self_destruct: Option<bool>,
     master_gated: Option<bool>,
 ) -> (Response, Option<PostAction>) {
+    // The mesh id is the real key, but a human picks a mesh by NAME and the GUI lists
+    // meshes by name — so two same-named meshes render as indistinguishable "peer" rows
+    // and any name-based lookup becomes ambiguous. Keep names non-empty + unique on this
+    // computer at creation. (JoinMesh is a separate path: joining someone else's mesh that
+    // happens to share a name is still allowed; the UI disambiguates those by #id.)
+    let want = name.trim();
+    if want.is_empty() {
+        return (err("mesh name cannot be empty"), None);
+    }
+    if let Some((eid, _)) = st
+        .meshes
+        .iter()
+        .find(|(_, m)| m.mesh.name.trim().eq_ignore_ascii_case(want))
+    {
+        return (
+            err(&format!(
+                "a mesh named \"{want}\" already exists on this computer (#{eid}) — pick another name"
+            )),
+            None,
+        );
+    }
     let id = match (1u8..=255).find(|id| !st.meshes.contains_key(id)) {
         Some(id) => id,
         None => return (err("too many meshes on this computer (max 255)"), None),
@@ -1909,6 +1947,7 @@ fn create_mesh(
     let links = seed_links(HashMap::new());
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
+    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let mesh = Mesh::new(id, name, charter, 1);
     // If data-plane mode is on, ask the async caller to bring up this mesh's loop
     // (sharing the same links/exit handles we store below).
@@ -1922,6 +1961,7 @@ fn create_mesh(
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
         my_endpoint: Arc::clone(&my_endpoint),
+        decrypt_fails: Arc::clone(&decrypt_fails),
     });
     st.meshes.insert(
         id,
@@ -1943,6 +1983,7 @@ fn create_mesh(
             epoch: 0,
             loop_cmd: None,
             attack_armed_at: None,
+            decrypt_fails,
         },
     );
     (
@@ -1954,6 +1995,16 @@ fn create_mesh(
 fn detail(ms: &MeshState) -> MeshDetail {
     let me = ms.my_key.pubkey();
     let now = now_ms();
+    // Snapshot decrypt-fail stats (frames from a known endpoint that didn't open). A
+    // recent fail from a member's endpoint IP is the "different mesh / different epoch"
+    // signal — it turns an opaque `idle` into an explained one and raises a warning.
+    let fails = ms.decrypt_fails.lock().unwrap().clone();
+    let recent_fail = |ip: std::net::IpAddr| -> Option<u64> {
+        fails.get(&ip).and_then(|s: &DecryptFailStat| {
+            (s.count > 0 && now.saturating_sub(s.last_ms) < DECRYPT_FAIL_WINDOW_MS)
+                .then_some(s.count)
+        })
+    };
     let links = ms.links.lock().unwrap();
     let members: Vec<MemberView> = ms
         .roster()
@@ -1962,18 +2013,37 @@ fn detail(ms: &MeshState) -> MeshDetail {
             let is_me = c.member == me;
             let link = links.get(&c.id).copied();
             let endpoint = link.map(|l| l.endpoint.to_string());
-            let state = if is_me {
-                "me".to_string()
+            // `state` is the legacy badge ({me,live,idle,unknown}); `reason` explains an
+            // idle/unknown peer in plain language so the user isn't left guessing why.
+            let (state, reason): (String, Option<String>) = if is_me {
+                ("me".into(), None)
             } else {
                 match link {
                     Some(l)
                         if l.last_seen_ms != 0
                             && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS =>
                     {
-                        "live".into()
+                        ("live".into(), None)
                     }
-                    Some(_) => "idle".into(),
-                    None => "unknown".into(),
+                    Some(l) => {
+                        let why = if let Some(n) = recent_fail(l.endpoint.ip()) {
+                            format!(
+                                "이 주소에서 온 프레임 {n}건이 복호 실패 — 상대가 다른 mesh이거나 \
+                                 epoch 불일치일 수 있음 (재초대 필요)"
+                            )
+                        } else if l.last_seen_ms == 0 {
+                            "주소만 알고 아직 한 번도 수신 못함 — 상대 데몬이 꺼졌거나 방화벽/NAT가 \
+                             막는 중일 수 있음"
+                                .into()
+                        } else {
+                            "최근 30초간 수신 없음 — 상대가 오프라인이거나 IP가 바뀌었을 수 있음".into()
+                        };
+                        ("idle".into(), Some(why))
+                    }
+                    None => (
+                        "unknown".into(),
+                        Some("엔드포인트 미상 — 아직 상대 위치를 모름 (discovery/DHT 대기)".into()),
+                    ),
                 }
             };
             MemberView {
@@ -1983,6 +2053,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
                 is_me,
                 endpoint,
                 state,
+                reason,
             }
         })
         .collect();
@@ -1992,8 +2063,42 @@ fn detail(ms: &MeshState) -> MeshDetail {
         .values()
         .filter(|l| l.last_seen_ms != 0 && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS)
         .count();
+    // Known peer endpoint IPs (name, ip) — captured while `links` is held, for warnings.
+    let known_eps: Vec<(String, std::net::IpAddr)> = ms
+        .roster()
+        .iter()
+        .filter(|c| c.member != me)
+        .filter_map(|c| links.get(&c.id).map(|l| (c.name.clone(), l.endpoint.ip())))
+        .collect();
     drop(links);
     let threshold = quorum_threshold(ms.roster().len().max(1));
+    // Mesh-level warnings: the daemon SAYS what it already knows instead of dropping it.
+    let mut warnings: Vec<String> = Vec::new();
+    let mut warned_ips: std::collections::HashSet<std::net::IpAddr> =
+        std::collections::HashSet::new();
+    for (name, ip) in &known_eps {
+        if let Some(n) = recent_fail(*ip) {
+            if warned_ips.insert(*ip) {
+                warnings.push(format!(
+                    "⚠ '{name}'({ip})에서 온 프레임 {n}건이 복호 실패 — 다른 mesh이거나 epoch \
+                     불일치 의심. 양쪽의 network id(net {})가 같은지 확인하세요.",
+                    fp(&ms.mesh.charter.master_pubkey)
+                ));
+            }
+        }
+    }
+    if ms.attack_armed_at.is_none()
+        && ms.mesh.charter.self_destruct == lattice_mesh::charter::SelfDestruct::OnIsolation
+        && live < threshold
+    {
+        warnings.push(format!(
+            "⚠ 온라인 {live} < floor {threshold} — ephemeral mesh가 임계 미만입니다. \
+             멤버가 더 떨어지면 self-destruct로 mesh가 사라질 수 있습니다."
+        ));
+    }
+    if let Some(e) = &ms.dp_error {
+        warnings.push(format!("⛔ data plane DOWN: {e}"));
+    }
     let attack_armed_secs_left = ms.attack_armed_at.map(|armed| {
         let elapsed = now.saturating_sub(armed) / 1000;
         ATTACK_GRACE_SECS.saturating_sub(elapsed)
@@ -2016,6 +2121,8 @@ fn detail(ms: &MeshState) -> MeshDetail {
         is_creator: ms.master.is_some(),
         self_destruct: ch.self_destruct == lattice_mesh::charter::SelfDestruct::OnIsolation,
         dp_error: ms.dp_error.clone(),
+        warnings,
+        network_fp: fp(&ch.master_pubkey),
     }
 }
 

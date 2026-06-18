@@ -9,7 +9,7 @@
 //! writes the exit live. This is the seam P6.3c/d builds the daemon + GUI on.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +33,23 @@ pub struct Link {
 
 /// The mesh's live peer table, shared between the run loop and its supervisor.
 pub type PeerLinks = Arc<Mutex<HashMap<MemberId, Link>>>;
+
+/// One source IP's record of frames that arrived but **failed to open** (decrypt).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecryptFailStat {
+    /// How many frames from this IP failed to decrypt.
+    pub count: u64,
+    /// Unix-ms of the most recent failure.
+    pub last_ms: u64,
+}
+
+/// Frames received on a mesh's socket that did NOT open under our key — keyed by source
+/// IP. A frame that fails to decrypt is normally just internet noise on the UDP port and
+/// is dropped silently; but if the source IP matches a peer we *know how to reach* (a
+/// roster member's endpoint), the far more likely cause is that the peer is on a
+/// **different mesh** or a **different epoch**. Recording it lets the supervisor turn a
+/// silent drop into an actionable health warning instead (the split-brain signal).
+pub type DecryptFails = Arc<Mutex<HashMap<IpAddr, DecryptFailStat>>>;
 
 /// The member that internet-bound traffic egresses through (the exit). Shared so a
 /// supervisor can change egress live (the GUI's egress toggle) without a respawn.
@@ -229,6 +246,7 @@ pub async fn run<X: Transport + 'static>(
     endpoint_pinned: bool,
     mut loop_cmd: LoopCmdRx,
     loop_event: LoopEventTx,
+    fails: DecryptFails,
 ) {
     let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
     loop {
@@ -253,7 +271,24 @@ pub async fn run<X: Transport + 'static>(
                 // Open the frame first: post-P-C5 the wire header is sealed + floated, so
                 // the only trustworthy sender id is the AUTHENTICATED one `recv` returns
                 // (a raw plaintext parse recovers nothing). `None` ⇒ not ours / unopenable.
-                let Some((src, msg)) = dp.recv(&frame) else { continue };
+                let Some((src, msg)) = dp.recv(&frame) else {
+                    // The frame did not open under our key. If its source IP matches a
+                    // peer we know how to reach, this is the split-brain signal — the
+                    // peer is on a different mesh or epoch — so record it for the
+                    // supervisor to warn on. Otherwise it's internet noise: drop quietly.
+                    let known = links
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|l| l.endpoint.ip() == from.ip());
+                    if known {
+                        let mut f = fails.lock().unwrap();
+                        let e = f.entry(from.ip()).or_default();
+                        e.count += 1;
+                        e.last_ms = now_ms();
+                    }
+                    continue;
+                };
                 // Roaming + liveness: re-learn the sender's endpoint from the UDP source
                 // on the spot, so a NAT'd / moved peer is reachable again (§6) — this is
                 // what lets the exit reply to a client's real public address instead of a
@@ -431,6 +466,9 @@ mod tests {
     fn dummy_applied() -> LoopEventTx {
         tokio::sync::mpsc::unbounded_channel().0
     }
+    fn no_fails() -> DecryptFails {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     fn ipv4_to(dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0u8; 28]; // 20B IPv4 header + 8B payload
@@ -462,6 +500,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         )); // Alice (member 1)
         tokio::spawn(run(
             dp(2),
@@ -474,6 +513,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         )); // Bob   (member 2)
 
         // Inject an IP packet at Alice's TUN, destined for Bob's overlay IP.
@@ -511,6 +551,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         )); // exit = member 2
         tokio::spawn(run(
             dp(2),
@@ -523,6 +564,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         ));
 
         // A real internet destination (not in the mesh /24) → goes to the exit.
@@ -618,6 +660,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -630,6 +673,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         )); // relay hop
         tokio::spawn(run(
             dp(3),
@@ -642,6 +686,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         ));
 
         let packet = ipv4_to("100.80.3.3".parse().unwrap()); // member 3 = C
@@ -700,6 +745,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -712,6 +758,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         ));
         tokio::spawn(run(
             dp(3),
@@ -724,6 +771,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         ));
 
         // Poll A's link table until C (member 3) appears, learned via B's gossip.
@@ -785,6 +833,7 @@ mod tests {
             true,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -797,6 +846,7 @@ mod tests {
             false,
             dummy_cmd(),
             dummy_applied(),
+            no_fails(),
         ));
 
         // B should adopt the public address A reflected (the `self` line in A's gossip).
@@ -854,6 +904,7 @@ mod tests {
             false,
             a_cmd_rx,
             dummy_applied(),
+            no_fails(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -866,6 +917,7 @@ mod tests {
             false,
             dummy_cmd(),
             b_applied_tx,
+            no_fails(),
         ));
 
         // Baseline: a packet flows on the original cipher.

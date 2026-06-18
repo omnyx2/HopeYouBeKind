@@ -74,24 +74,32 @@ def unb64(s):
 
 
 def resolve_mesh(sock, ref):
-    """Accept a mesh id (number) or a mesh name; return the numeric id."""
+    """Accept a mesh id (number) or a mesh name; return the numeric id. Refuses to guess
+    when a name is ambiguous (duplicate names) — pick the numeric id instead."""
     if ref.isdigit():
         return int(ref)
     meshes = call(sock, "ListMeshes").get("Meshes", [])
-    for m in meshes:
-        if m["name"] == ref:
-            return m["id"]
+    matches = [m for m in meshes if m["name"] == ref]
+    if len(matches) > 1:
+        ids = ", ".join(f"#{m['id']}" for m in matches)
+        die(f"ambiguous: {len(matches)} meshes named '{ref}' ({ids}) — use the numeric id")
+    if matches:
+        return matches[0]["id"]
     die(f"no mesh named '{ref}' (try `lattice ls`)")
 
 
 def resolve_member(sock, mesh_id, ref):
-    """Accept a member id (number) or an in-mesh name; return the numeric id."""
+    """Accept a member id (number) or an in-mesh name; return the numeric id. Refuses to
+    guess when a name is ambiguous (duplicate names) — pick the numeric id instead."""
     if ref.isdigit():
         return int(ref)
     detail = call(sock, {"MeshInfo": {"mesh": mesh_id}})["Mesh"]
-    for mb in detail["members"]:
-        if mb["name"] == ref:
-            return mb["id"]
+    matches = [mb for mb in detail["members"] if mb["name"] == ref]
+    if len(matches) > 1:
+        ids = ", ".join(f"#{mb['id']}" for mb in matches)
+        die(f"ambiguous: {len(matches)} members named '{ref}' ({ids}) — use the numeric id")
+    if matches:
+        return matches[0]["id"]
     die(f"no member named '{ref}' in mesh {mesh_id} (try `lattice info {mesh_id}`)")
 
 
@@ -114,7 +122,7 @@ def cmd_info(sock, a):
     mid = resolve_mesh(sock, a.mesh)
     d = call(sock, {"MeshInfo": {"mesh": mid}})["Mesh"]
     sd = "ephemeral (self-destruct when isolated)" if d.get("self_destruct") else "persistent"
-    print(f"mesh #{d['id']}  {d['name']}")
+    print(f"mesh #{d['id']}  {d['name']}    net {d.get('network_fp', '?')}")
     print(f"  cipher     {d['cipher']}   epoch {d['epoch']}")
     print(f"  charter    {d['invite']} · {d['trigger']} · max {d['max_members']} · {sd}")
     print(f"  health     {d['live']}/{len(d['members'])} live · floor {d['threshold']}")
@@ -127,6 +135,14 @@ def cmd_info(sock, a):
         me = " (me)" if mb["is_me"] else ""
         ep = mb.get("endpoint") or "—"
         print(f"    #{mb['id']:<3} {mb['name']:<14} {mb['state']:<8} {ep}{me}")
+        if mb.get("reason"):
+            print(f"         └ {mb['reason']}")
+    warns = d.get("warnings") or []
+    if warns:
+        print("  warnings:")
+        for w in warns:
+            print(f"    {w}")
+        print("  → `lattice doctor` for a diagnosis + suggested fix.")
 
 
 def cmd_new(sock, a):
@@ -243,6 +259,60 @@ def cmd_backup(sock, a):
           f"(then deletes it). Run this before updating/reinstalling.")
 
 
+def cmd_doctor(sock, a):
+    """Diagnose mesh health and suggest a fix — surfaces what the daemon already knows
+    (idle reasons, decrypt-fail warnings) and turns it into actionable advice."""
+    meshes = call(sock, "ListMeshes").get("Meshes", [])
+    if a.mesh:
+        want = resolve_mesh(sock, a.mesh)
+        meshes = [m for m in meshes if m["id"] == want]
+    if not meshes:
+        print("no meshes to diagnose — create one with `lattice new <name>`.")
+        return
+    any_issue = False
+    for summ in meshes:
+        d = call(sock, {"MeshInfo": {"mesh": summ["id"]}})["Mesh"]
+        issues = []   # (symptom, suggested fix)
+        if d.get("dp_error"):
+            issues.append((f"data plane DOWN: {d['dp_error']}",
+                           "다른 프로세스가 UDP 포트를 잡고 있을 수 있음 — 좀비 meshd 종료 후 재시작."))
+        for mb in d["members"]:
+            if mb["is_me"] or mb["state"] == "live":
+                continue
+            r = mb.get("reason") or f"state={mb['state']}"
+            name = mb["name"]
+            if "복호 실패" in r:
+                fix = (f"'{name}'이 다른 mesh/epoch일 가능성 큼. 양쪽 `lattice info`의 net 지문이 "
+                       f"같은지 확인하고, 다르면 한쪽을 기준으로 재초대(invite→join)하세요.")
+            elif "한 번도 수신" in r:
+                fix = (f"'{name}'의 데몬이 켜져 있는지, 방화벽이 UDP를 막는지 확인. 공용 노드면 "
+                       f"포트 개방, 아니면 상대가 먼저 이쪽으로 한 번 보내야 NAT가 열립니다.")
+            elif "오프라인이거나 IP" in r:
+                fix = (f"'{name}'이 잠들었거나 IP가 바뀐 듯. DHT가 켜져 있으면 자동 재발견됩니다 "
+                       f"(MESHD_DHT≠0). 계속이면 상대 노드가 꺼진 상태.")
+            else:  # unknown
+                fix = (f"'{name}'의 주소를 아직 모름. DHT/부트스트랩이 동작 중인지 확인하거나 "
+                       f"`lattice` SetPeer로 주소를 직접 줄 수 있습니다.")
+            issues.append((f"member '{name}' [{mb['state']}] — {r}", fix))
+        for w in (d.get("warnings") or []):
+            # warnings already carry the symptom; only add ones not already covered.
+            if not any(w[:12] in sym for sym, _ in issues):
+                issues.append((w, "위 항목 참고."))
+
+        live, total = d["live"], len(d["members"])
+        head = f"mesh #{d['id']} '{d['name']}'  net {d.get('network_fp','?')}  ({live}/{total} live)"
+        if not issues:
+            print(f"✅ {head} — 정상.")
+            continue
+        any_issue = True
+        print(f"🩺 {head} — {len(issues)}건 발견:")
+        for i, (sym, fix) in enumerate(issues, 1):
+            print(f"  {i}. {sym}")
+            print(f"     ↳ 조치: {fix}")
+    if not any_issue:
+        print("\n모든 mesh 정상입니다.")
+
+
 def cmd_raw(sock, a):
     req = json.loads(a.json)
     print(json.dumps(call(sock, req), indent=2))
@@ -329,6 +399,11 @@ def build_parser():
     s.add_argument("path", nargs="?", default=None,
                    help="output path (default: <tempdir>/lattice-mesh-backup.json)")
     s.set_defaults(fn=cmd_backup)
+
+    s = sub.add_parser("doctor", help="diagnose mesh health + suggest fixes")
+    s.add_argument("mesh", nargs="?", default=None,
+                   help="mesh id or name (default: check every mesh)")
+    s.set_defaults(fn=cmd_doctor)
 
     s = sub.add_parser("raw", help="send a raw JSON request (escape hatch)")
     s.add_argument("json", help='e.g. \'{"ListMeshes":null}\'')

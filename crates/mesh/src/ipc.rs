@@ -233,6 +233,12 @@ pub struct MemberView {
     pub endpoint: Option<String>,
     /// Live connection state for the UI: `me` | `live` | `idle` | `unknown`.
     pub state: String,
+    /// Plain-language explanation of a non-`live` `state` — WHY this peer is idle/unknown
+    /// (e.g. "frames arriving but failing to decrypt — likely a different mesh/epoch",
+    /// "address known but never heard from", "no endpoint yet"). `None` for live/self, so
+    /// the UI shows a reason exactly when there's a problem to explain.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// The per-mesh detail view (§7).
@@ -272,6 +278,17 @@ pub struct MeshDetail {
     /// joined but can't actually send or receive. `None` = healthy.
     #[serde(default)]
     pub dp_error: Option<String>,
+    /// Mesh-level health warnings the daemon surfaces instead of silently dropping the
+    /// underlying signal — e.g. "frames from peer X fail to decrypt (different mesh/epoch?)"
+    /// or "online below the self-destruct floor". Empty = nothing to flag. Drives the
+    /// GUI banner and `lattice doctor`.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Short fingerprint of the mesh's network id (= master public key). Two daemons that
+    /// think they're "in the same mesh" but show DIFFERENT `network_fp` are a split-brain;
+    /// surfacing it lets the user (and `doctor`) catch that at a glance.
+    #[serde(default)]
+    pub network_fp: String,
 }
 
 /// The routing policy summary (§1).
