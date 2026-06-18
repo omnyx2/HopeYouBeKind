@@ -104,6 +104,11 @@ pub enum Request {
     ExpelMember { mesh: MeshId, member: MemberId },
     /// Wipe one mesh locally — the §5 compromise response.
     RemoveMesh { mesh: MeshId },
+    /// Cleanly stop the daemon: restore any diverted routes/DNS, abort every mesh's
+    /// data-plane loop (freeing its TUN + UDP ports), and exit. The IPC socket is
+    /// world-writable, so the GUI/CLI can stop the root daemon WITHOUT sudo — no orphaned
+    /// meshd. (Mesh state on disk is untouched; a later start restores it.)
+    Shutdown,
     /// The current routing policy.
     GetPolicy,
 

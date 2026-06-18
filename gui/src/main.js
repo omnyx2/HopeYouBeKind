@@ -174,6 +174,9 @@ async function renderPeersFor(id) {
       setTimeout(() => renderPeersFor(id), 1500);
     };
   });
+  // Invite a member now lives here on the Peers tab (moved from Configs).
+  const extra = el("peers-extra");
+  if (extra) { extra.innerHTML = inviteCardHtml(); wireInviteCard(id); }
   // Wire the expel buttons (revoke a member per the mesh's expel policy).
   tbl.querySelectorAll(".peer-expel").forEach((btn) => {
     btn.onclick = async () => {
@@ -401,6 +404,68 @@ async function renderOverview(id) {
 }
 
 // ---- Mesh mode: Configs — this mesh's settings + controls ----
+// ---- Reusable cards: Invite (lives on Peers) and Danger zone (lives on Warnings) ----
+function inviteCardHtml() {
+  return `<div class="card">
+    <div class="card-head"><h2 class="card-title">Invite a member</h2></div>
+    <p class="muted small">Paste the joiner's <b>join code</b> + a name → get an <b>invite code</b> to send back.</p>
+    <div class="add-row">
+      <input id="ov-inv-name" placeholder="their name in this mesh" />
+      <label class="muted small" style="display:flex;align-items:center;gap:6px">algorithm
+        <select id="ov-inv-algo" class="select">${optList(INVITE_ALGOS, INVITE_ALGOS[0])}</select>
+      </label>
+    </div>
+    <textarea id="ov-inv-code" class="code" rows="2" placeholder="paste their join code" style="margin-top:8px"></textarea>
+    <div class="add-row" style="margin-top:8px"><button class="small-btn" id="ov-invite">create invite</button></div>
+    <div id="ov-inv-out" class="hidden" style="margin-top:10px">
+      <p class="muted small">Invite code — send it back to them:</p>
+      <textarea id="ov-inv-result" class="code" readonly rows="3"></textarea>
+      <button class="small-btn" id="ov-inv-copy">Copy</button>
+      <p class="small" style="color:#e0a020;margin-top:8px">Tell them the algorithm <b id="ov-inv-algo-out" class="mono"></b> — over a <i>different</i> channel than the code.</p>
+    </div>
+  </div>`;
+}
+function wireInviteCard(id) {
+  el("ov-invite").onclick = async () => {
+    const name = el("ov-inv-name").value.trim();
+    const ident = decodeIdentity(el("ov-inv-code").value);
+    const algo = el("ov-inv-algo").value || null;
+    if (!name) return toast("name required");
+    if (!ident) return toast("invalid join code");
+    try {
+      const r = await meshd({ CreateInvite: { mesh: id, name, member_pubkey_hex: ident.m, enc_pubkey_hex: ident.e, issued_at: ident.t || 0, algo } });
+      el("ov-inv-result").value = encodeInvite(r.Invite);
+      el("ov-inv-algo-out").textContent = algo || "(default)";
+      el("ov-inv-out").classList.remove("hidden");
+      toast("invite created — send the code AND the algorithm");
+    } catch (e) { toast(String(e)); }
+  };
+  el("ov-inv-copy").onclick = () => { navigator.clipboard.writeText(el("ov-inv-result").value); toast("copied"); };
+}
+function dangerCardHtml(d) {
+  return `<div class="card">
+    <div class="card-head"><h2 class="card-title" style="color:#e44">Danger zone</h2></div>
+    <div class="add-row">
+      <button class="small-btn" id="ov-report-attack" style="background:#7a1020;color:#fff;border-color:#a33">Report attack</button>
+      <button class="small-btn" id="ov-wipe">wipe mesh</button>
+    </div>
+    <p class="muted small"><b>Report attack</b> alerts every member and self-destructs the mesh in 30s unless ${d.is_creator ? "you" : "the creator"} call(s) it off — keys wiped everywhere. <b>Wipe</b> removes this mesh from this computer only.</p>
+  </div>`;
+}
+function wireDangerCard(id, d) {
+  el("ov-report-attack").onclick = async () => {
+    const typed = prompt(`⚠ This ALERTS every member and DESTROYS mesh "${d.name}" in 30s unless ${d.is_creator ? "you" : "the creator"} call(s) it off — keys wiped everywhere.\n\nType the mesh name to confirm:`);
+    if (typed !== d.name) return toast("cancelled");
+    try { await meshd({ ReportAttack: { mesh: id } }); toast("attack reported — mesh armed"); } catch (e) { toast(String(e)); }
+    refreshAttackBanner();
+  };
+  el("ov-wipe").onclick = async () => {
+    if (!confirm(`Wipe mesh "${d.name}" locally? (the §5 compromise response)`)) return;
+    try { await meshd({ RemoveMesh: { mesh: id } }); toast("mesh wiped"); } catch (e) { toast(String(e)); }
+    CURRENT_MESH = null; setMode("user");
+  };
+}
+
 async function renderConfigs(id) {
   let d;
   try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
@@ -430,24 +495,6 @@ async function renderConfigs(id) {
       </div>
     </div>
     <div class="card">
-      <div class="card-head"><h2 class="card-title">Invite a member</h2></div>
-      <p class="muted small">Paste the joiner's <b>join code</b> + a name → get an <b>invite code</b> to send back.</p>
-      <div class="add-row">
-        <input id="ov-inv-name" placeholder="their name in this mesh" />
-        <label class="muted small" style="display:flex;align-items:center;gap:6px">algorithm
-          <select id="ov-inv-algo" class="select">${optList(INVITE_ALGOS, INVITE_ALGOS[0])}</select>
-        </label>
-      </div>
-      <textarea id="ov-inv-code" class="code" rows="2" placeholder="paste their join code" style="margin-top:8px"></textarea>
-      <div class="add-row" style="margin-top:8px"><button class="small-btn" id="ov-invite">create invite</button></div>
-      <div id="ov-inv-out" class="hidden" style="margin-top:10px">
-        <p class="muted small">Invite code — send it back to them:</p>
-        <textarea id="ov-inv-result" class="code" readonly rows="3"></textarea>
-        <button class="small-btn" id="ov-inv-copy">Copy</button>
-        <p class="small" style="color:#e0a020;margin-top:8px">Tell them the algorithm <b id="ov-inv-algo-out" class="mono"></b> — over a <i>different</i> channel than the code.</p>
-      </div>
-    </div>
-    <div class="card">
       <div class="card-head"><h2 class="card-title">Security <span class="muted small">(re-cipher — P-C3)</span></h2></div>
       <div class="add-row">
         <select id="ov-recipher-cipher" class="select">${optList(CIPHERS, d.cipher)}</select>
@@ -455,20 +502,8 @@ async function renderConfigs(id) {
       </div>
       <p class="muted small">Rotates this mesh's key (and the cipher, if changed). Needs ≥60% of members online; anyone offline now is evicted and must be re-invited.</p>
     </div>
-    <div class="card">
-      <div class="card-head"><h2 class="card-title" style="color:#e44">Danger zone</h2></div>
-      <div class="add-row">
-        <button class="small-btn" id="ov-report-attack" style="background:#7a1020;color:#fff;border-color:#a33">Report attack</button>
-        <button class="small-btn" id="ov-wipe">wipe mesh</button>
-      </div>
-      <p class="muted small"><b>Report attack</b> alerts every member and self-destructs the mesh in 30s unless ${d.is_creator ? "you" : "the creator"} call(s) it off — keys wiped everywhere. <b>Wipe</b> removes this mesh from this computer only.</p>
-    </div>`;
+    <p class="muted small" style="margin-top:6px">Invite a member is on the <b>Peers</b> tab; Report attack / Wipe are on the <b>Warnings</b> tab.</p>`;
   el("ov-egress").onclick = async () => { try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); } refreshMode(); };
-  el("ov-wipe").onclick = async () => {
-    if (!confirm(`Wipe mesh "${d.name}" locally? (the §5 compromise response)`)) return;
-    try { await meshd({ RemoveMesh: { mesh: id } }); toast("mesh wiped"); } catch (e) { toast(String(e)); }
-    CURRENT_MESH = null; setMode("user");
-  };
   el("ov-exit-set").onclick = async () => {
     const v = el("ov-exit").value;
     try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("exit set"); } catch (e) { toast(String(e)); }
@@ -481,33 +516,12 @@ async function renderConfigs(id) {
     try { await meshd({ SetPeer: { mesh: id, member: m, endpoint: ep } }); toast("peer address set"); } catch (e) { toast(String(e)); }
     el("ov-peer-ep").value = "";
   };
-  el("ov-invite").onclick = async () => {
-    const name = el("ov-inv-name").value.trim();
-    const ident = decodeIdentity(el("ov-inv-code").value);
-    const algo = el("ov-inv-algo").value || null;
-    if (!name) return toast("name required");
-    if (!ident) return toast("invalid join code");
-    try {
-      const r = await meshd({ CreateInvite: { mesh: id, name, member_pubkey_hex: ident.m, enc_pubkey_hex: ident.e, issued_at: ident.t || 0, algo } });
-      el("ov-inv-result").value = encodeInvite(r.Invite);
-      el("ov-inv-algo-out").textContent = algo || "(default)";
-      el("ov-inv-out").classList.remove("hidden");
-      toast("invite created — send the code AND the algorithm");
-    } catch (e) { toast(String(e)); }
-  };
-  el("ov-inv-copy").onclick = () => { navigator.clipboard.writeText(el("ov-inv-result").value); toast("copied"); };
   el("ov-recipher").onclick = async () => {
     const cipher = el("ov-recipher-cipher").value;
     const changed = cipher !== d.cipher;
     if (!confirm(`Re-cipher "${d.name}"?\n\nRotates the key${changed ? ` and switches the cipher to "${cipher}"` : ""}. Needs ≥60% of members online; anyone offline now is evicted and must be re-invited.`)) return;
     try { await meshd({ Recipher: { mesh: id, cipher: changed ? cipher : null } }); toast("re-ciphered"); } catch (e) { toast(String(e)); }
     renderConfigs(id);
-  };
-  el("ov-report-attack").onclick = async () => {
-    const typed = prompt(`⚠ This ALERTS every member and DESTROYS mesh "${d.name}" in 30s unless ${d.is_creator ? "you" : "the creator"} call(s) it off — keys wiped everywhere.\n\nType the mesh name to confirm:`);
-    if (typed !== d.name) return toast("cancelled");
-    try { await meshd({ ReportAttack: { mesh: id } }); toast("attack reported — mesh armed"); } catch (e) { toast(String(e)); }
-    refreshAttackBanner();
   };
 }
 
@@ -534,7 +548,12 @@ async function renderWarnings(id) {
   catch (e) { toast(String(e)); return setMode("user"); }
   const w = meshWarnings(d);
   const body = el("mesh-warn-body");
-  if (!w.length) { body.innerHTML = `<div class="card"><p class="warn-ok">✓ No warnings — this mesh is healthy.</p></div>`; return; }
+  const danger = dangerCardHtml(d); // Danger zone (report attack / wipe) moved here from Configs
+  if (!w.length) {
+    body.innerHTML = `<div class="card"><p class="warn-ok">✓ No warnings — this mesh is healthy.</p></div>` + danger;
+    wireDangerCard(id, d);
+    return;
+  }
   body.innerHTML = w.map((x) => {
     if (x.kind === "attack") {
       return `<div class="warn-card">
@@ -550,9 +569,10 @@ async function renderWarnings(id) {
     // A daemon-reported warning (data-plane down, below-floor, decrypt-fail/split-brain).
     const dp = x.detail.startsWith("⛔");
     return `<div class="warn-card${dp ? "" : " amber"}"><h3>${dp ? "⛔ Data plane" : "⚠ Health"}</h3><p>${esc(x.detail)}</p></div>`;
-  }).join("");
+  }).join("") + danger;
   const ac = el("warn-allclear");
   if (ac) ac.onclick = async () => { try { await meshd({ AllClear: { mesh: id } }); toast("all-clear sent"); } catch (e) { toast(String(e)); } renderWarnings(id); };
+  wireDangerCard(id, d);
 }
 
 // ---- top widget bar (§1): status (left) + view toggle + egress dropdown ----

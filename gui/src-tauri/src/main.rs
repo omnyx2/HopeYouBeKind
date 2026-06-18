@@ -200,8 +200,39 @@ fn main() {
             notify,
             app_version
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Lattice GUI");
+        .build(tauri::generate_context!())
+        .expect("error while running Lattice GUI")
+        .run(|_app, event| {
+            // Quitting the app cleanly stops the daemon (the Shutdown IPC) so we never
+            // orphan a root meshd holding the TUN + UDP ports — the cause of the
+            // zombie/stale-daemon issues. Leave the app open to keep the mesh running.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                send_shutdown();
+            }
+        });
+}
+
+/// Tell the running `meshd` to stop itself (the `Shutdown` IPC). Best-effort: if the
+/// daemon isn't up, do nothing. The socket is world-writable, so no elevation is needed.
+#[cfg(unix)]
+fn send_shutdown() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    if let Ok(mut s) = UnixStream::connect(MESHD_SOCKET) {
+        let _ = s.write_all(b"\"Shutdown\"\n");
+        let _ = s.flush();
+        std::thread::sleep(std::time::Duration::from_millis(250)); // let meshd ack + exit
+    }
+}
+
+#[cfg(windows)]
+fn send_shutdown() {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    if let Ok(pipe) = OpenOptions::new().read(true).write(true).open(MESHD_SOCKET) {
+        let _ = (&pipe).write_all(b"\"Shutdown\"\n");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 /// On startup make sure the privileged `meshd` daemon is running. If it isn't,

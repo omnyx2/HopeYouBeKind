@@ -251,6 +251,8 @@ enum PostAction {
     Bringup(Bringup),
     /// Full tunnel just went up for this mesh — start the kill-switch.
     ArmKillSwitch(MeshId),
+    /// Cleanly stop the whole daemon (after the response is sent to the client).
+    Shutdown,
 }
 
 /// Everything `bringup_dataplane` needs to spawn a mesh's live loop — built inside
@@ -806,6 +808,7 @@ where
         if line.trim().is_empty() {
             continue;
         }
+        let mut shutdown = false;
         let resp = match serde_json::from_str::<Request>(&line) {
             Ok(req) => {
                 // Handle under the lock; do any async data-plane bringup AFTER
@@ -820,6 +823,7 @@ where
                     Some(PostAction::ArmKillSwitch(mesh)) => {
                         arm_kill_switch(mesh, Arc::clone(&state))
                     }
+                    Some(PostAction::Shutdown) => shutdown = true,
                     None => {}
                 }
                 if mutates {
@@ -834,10 +838,44 @@ where
         let mut out = serde_json::to_string(&resp)
             .unwrap_or_else(|_| "{\"Error\":{\"message\":\"encode failed\"}}".to_string());
         out.push('\n');
-        if wr.write_all(out.as_bytes()).await.is_err() {
+        let wrote = wr.write_all(out.as_bytes()).await.is_ok();
+        // Acknowledge the request first, THEN tear the daemon down cleanly.
+        if shutdown {
+            shutdown_daemon(&state).await;
+        }
+        if !wrote {
             break;
         }
     }
+}
+
+/// Cleanly stop the daemon (the `Shutdown` request): if a full tunnel is up, restore the
+/// host's routes/DNS first so closing the TUN doesn't strand the default route on a dead
+/// interface; otherwise just clear any stale exit pin. Then abort every mesh's data-plane
+/// loop (dropping its TUN + freeing its UDP ports) and exit. On-disk mesh state is left
+/// intact — a later start restores it.
+async fn shutdown_daemon(state: &Arc<Mutex<State>>) {
+    elog!("meshd: shutdown requested — restoring routes, aborting data plane, exiting");
+    let full_tunnel = state.lock().unwrap().current.is_some();
+    let _ = tokio::task::spawn_blocking(move || {
+        if full_tunnel {
+            exit::restore_routes();
+            exit::restore_dns();
+        } else {
+            exit::clear_exit_pin();
+        }
+    })
+    .await;
+    {
+        let st = state.lock().unwrap();
+        for ms in st.meshes.values() {
+            if let Some(t) = &ms.dp_task {
+                t.abort();
+            }
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    std::process::exit(0);
 }
 
 /// Open the per-mesh TUN + UDP and spawn the data-plane loop. Failures (e.g. no
@@ -1751,6 +1789,8 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 (no_mesh(mesh), None)
             }
         }
+
+        Request::Shutdown => (Response::Ok, Some(PostAction::Shutdown)),
 
         Request::GetPolicy => {
             let default = match st.current.and_then(|id| st.meshes.get(&id)) {

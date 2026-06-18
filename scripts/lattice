@@ -273,6 +273,15 @@ def cmd_rm(sock, a):
     print(f"mesh {mid} wiped from this computer.")
 
 
+def cmd_shutdown(sock, a):
+    # The root daemon stops itself (the socket is world-writable) — no sudo needed.
+    try:
+        call(sock, "Shutdown")
+    except SystemExit:
+        pass  # the daemon may close the connection as it exits — that's expected
+    print("daemon shutdown requested — meshd is exiting (data-plane TUN/ports freed).")
+
+
 def cmd_ciphers(sock, a):
     for c in call(sock, "Ciphers").get("Ciphers", []):
         print(c)
@@ -437,6 +446,9 @@ def build_parser():
     s = sub.add_parser("rm", help="wipe a mesh from this computer")
     s.add_argument("mesh", help="mesh id or name")
     s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("shutdown", help="cleanly stop the daemon (no sudo)")
+    s.set_defaults(fn=cmd_shutdown)
 
     s = sub.add_parser("ciphers", help="list available data-plane ciphers")
     s.set_defaults(fn=cmd_ciphers)
