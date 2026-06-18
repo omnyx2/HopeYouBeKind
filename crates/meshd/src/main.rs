@@ -19,18 +19,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use lattice_mesh::charter::{GenesisCharter, InviteTopology, RecipherTrigger};
+use lattice_mesh::charter::{ExpelPolicy, GenesisCharter, InviteTopology, RecipherTrigger};
 use lattice_mesh::crypto::suite;
 use lattice_mesh::dataplane::MeshDataPlane;
 use lattice_mesh::ipc::{
     InviteBlob, MemberView, MeshDetail, MeshSummary, PolicyView, Request, Response,
 };
 use lattice_mesh::keydist::{seal_secret, EncKey};
-use lattice_mesh::membership::{valid_members, Cert, MasterKey, MemberKey, PubKey};
+use lattice_mesh::membership::{
+    effective_members, valid_members, Cert, MasterKey, MemberKey, PubKey, Revocation,
+};
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
-    SharedEndpoint, SharedExit, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_ROSTER,
+    SharedEndpoint, SharedExit, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_REVOKE, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::wire_v2::{MemberId, MeshId};
@@ -53,6 +55,9 @@ const DEFAULT_SOCKET: &str = r"\\.\pipe\lattice-meshd";
 const FULL_TUNNEL_DNS: &str = "1.1.1.1";
 /// A member is "live" if heard from within this window.
 const LIVE_WINDOW_MS: u64 = 30_000;
+/// How long an invited-but-not-yet-joined member id stays reserved (so back-to-back
+/// invites get distinct ids). After this, an unused reservation is reclaimed.
+const INVITE_RESERVE_MS: u64 = 3_600_000; // 1 hour
 /// A decrypt-fail (a frame from a known endpoint that didn't open) is "recent" — and so
 /// worth surfacing as a split-brain warning — if it happened within this window. Wider
 /// than the live window so a transient mismatch lingers long enough to be seen + acted on.
@@ -125,8 +130,18 @@ struct MeshState {
     /// This node's encryption key in this mesh (receives sealed secrets — rekeys).
     #[allow(dead_code)]
     my_enc: EncKey,
-    /// Every known cert. The roster = those that validly chain to the master.
+    /// Every known cert. The roster = those that validly chain to the master, minus any
+    /// that carry an authorized revocation (see `revocations`).
     certs: Vec<Cert>,
+    /// Known membership revocations (signed expulsions), gossiped + merged like certs.
+    /// `roster()` drops a member that carries one authorized under the charter's
+    /// `ExpelPolicy` — this is what actually removes a member (re-cipher only denies keys).
+    revocations: Vec<Revocation>,
+    /// Member ids handed out in invites that have **not yet joined** (id, invitee pubkey,
+    /// issued-at ms). Reserved so inviting several people in a row — before any of them
+    /// connect and gossip back — assigns DISTINCT ids instead of all reusing the next free
+    /// slot. Pruned once the invitee appears in the roster, or after `INVITE_RESERVE_MS`.
+    invited: Vec<(MemberId, PubKey, u64)>,
     /// The mesh's shared symmetric secret (epoch 0) — keys the data-plane cipher.
     /// Held for rekey / re-bringup / sealing to joiners (keydist).
     secret: [u8; 32],
@@ -175,12 +190,15 @@ impl MeshState {
     fn topology(&self) -> InviteTopology {
         self.mesh.charter.invite
     }
-    /// The validated roster (certs chaining to the master), id-sorted.
+    /// The effective roster (certs chaining to the master, minus authorized
+    /// revocations), id-sorted.
     fn roster(&self) -> Vec<Cert> {
-        let mut v: Vec<Cert> = valid_members(
+        let mut v: Vec<Cert> = effective_members(
             &self.mesh.charter.master_pubkey,
             &self.certs,
             self.topology(),
+            &self.revocations,
+            self.mesh.charter.expel,
         )
         .into_iter()
         .cloned()
@@ -261,6 +279,9 @@ struct PersistedMesh {
     mesh_name: String,
     charter: GenesisCharter,
     certs: Vec<Cert>,
+    /// Signed expulsions (P-revoke). `#[serde(default)]` so older state files load.
+    #[serde(default)]
+    revocations: Vec<Revocation>,
     secret: [u8; 32],
     epoch: u64,
     cipher: String,
@@ -308,6 +329,7 @@ fn to_persisted(ms: &MeshState) -> PersistedMesh {
         mesh_name: ms.mesh.name.clone(),
         charter: ms.mesh.charter.clone(),
         certs: ms.certs.clone(),
+        revocations: ms.revocations.clone(),
         secret: ms.secret,
         epoch: ms.epoch,
         cipher: ms.cipher.clone(),
@@ -441,6 +463,8 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         my_key,
         my_enc,
         certs: p.certs,
+        revocations: p.revocations,
+        invited: Vec::new(),
         secret: p.secret,
         links,
         exit_sel,
@@ -471,6 +495,7 @@ fn request_mutates(req: &Request) -> bool {
             | Request::RemoveMesh { .. }
             | Request::Recipher { .. }
             | Request::AllClear { .. }
+            | Request::ExpelMember { .. }
     )
 }
 
@@ -964,6 +989,35 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                         }
                     }
                 }
+                // A peer gossiped revocations — merge new ones (and fold co-signers into an
+                // existing one, so a quorum expulsion accumulates votes). `roster()`
+                // re-checks authorization, so an unauthorized revocation simply never bites.
+                LoopEvent::Revoke(bytes) => {
+                    if let Ok(incoming) = bincode::deserialize::<Vec<Revocation>>(&bytes) {
+                        let net = ms.mesh.charter.master_pubkey;
+                        let before = ms.roster().len();
+                        let mut changed = false;
+                        for r in incoming {
+                            if r.network != net {
+                                continue;
+                            }
+                            match ms.revocations.iter_mut().find(|e| e.member == r.member) {
+                                Some(existing) => changed |= existing.merge_signers(&r),
+                                None => {
+                                    ms.revocations.push(r);
+                                    changed = true;
+                                }
+                            }
+                        }
+                        let after = ms.roster().len();
+                        if changed {
+                            persist_after = true;
+                            if after < before {
+                                elog!("meshd: mesh {mid} roster shrank {before} -> {after} via revocation gossip");
+                            }
+                        }
+                    }
+                }
             }
             if persist_after {
                 persist(&state);
@@ -983,28 +1037,39 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(ROSTER_GOSSIP_TICK_SECS)).await;
-            let sends: Vec<(Vec<u8>, Vec<MemberId>, UnboundedSender<LoopCmd>)> = {
+            let sends: Vec<(u8, Vec<u8>, Vec<MemberId>, UnboundedSender<LoopCmd>)> = {
                 let st = state.lock().unwrap();
                 st.meshes
                     .values()
-                    .filter_map(|ms| {
-                        let tx = ms.loop_cmd.clone()?;
-                        let certs = ms.roster();
-                        if certs.len() < 2 {
-                            return None; // solo — nothing to propagate
-                        }
-                        let body = bincode::serialize(&certs).ok()?;
+                    .flat_map(|ms| {
+                        let mut out = Vec::new();
+                        let Some(tx) = ms.loop_cmd.clone() else {
+                            return out;
+                        };
                         let peers: Vec<MemberId> =
                             ms.links.lock().unwrap().keys().copied().collect();
                         if peers.is_empty() {
-                            return None;
+                            return out;
                         }
-                        Some((body, peers, tx))
+                        // Roster (signed certs) — converges membership across the mesh.
+                        let certs = ms.roster();
+                        if certs.len() >= 2 {
+                            if let Ok(body) = bincode::serialize(&certs) {
+                                out.push((CTRL_ROSTER, body, peers.clone(), tx.clone()));
+                            }
+                        }
+                        // Revocations (signed expulsions) — converges expulsions the same way.
+                        if !ms.revocations.is_empty() {
+                            if let Ok(body) = bincode::serialize(&ms.revocations) {
+                                out.push((CTRL_REVOKE, body, peers, tx));
+                            }
+                        }
+                        out
                     })
                     .collect()
             };
-            for (body, peers, tx) in sends {
-                let _ = tx.send(LoopCmd::SendControl(CTRL_ROSTER, body, peers));
+            for (tag, body, peers, tx) in sends {
+                let _ = tx.send(LoopCmd::SendControl(tag, body, peers));
             }
         }
     });
@@ -1236,6 +1301,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             cipher,
             self_destruct,
             master_gated,
+            expel,
         } => create_mesh(
             st,
             name,
@@ -1244,7 +1310,10 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             cipher,
             self_destruct,
             master_gated,
+            expel,
         ),
+
+        Request::ExpelMember { mesh, member } => expel_member(st, mesh, member),
 
         Request::Ciphers => (
             Response::Ciphers(
@@ -1674,11 +1743,31 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             if roster.iter().any(|c| c.member == member_pk) {
                 return (err("already a member"), None);
             }
-            let used: HashSet<MemberId> = roster.iter().map(|c| c.id).collect();
-            let id = match (1u8..=254).find(|i| !used.contains(i)) {
-                Some(i) => i,
-                None => return (err("no free member id"), None),
-            };
+            // Pick the joiner's id, reserving ids already handed out in invites that have
+            // not yet joined — otherwise inviting several people in a row (before any of
+            // them connect and gossip back) would assign them all the same "next free" id.
+            // First prune reservations that have since joined, or expired.
+            let now = now_ms();
+            ms.invited.retain(|(iid, pk, at)| {
+                now.saturating_sub(*at) < INVITE_RESERVE_MS
+                    && !roster.iter().any(|c| c.id == *iid || &c.member == pk)
+            });
+            // Re-inviting the same pubkey reuses its reserved id (idempotent); else take the
+            // lowest id free in BOTH the roster and the outstanding reservations.
+            let id =
+                if let Some((iid, _, _)) = ms.invited.iter().find(|(_, pk, _)| *pk == member_pk) {
+                    *iid
+                } else {
+                    let mut used: HashSet<MemberId> = roster.iter().map(|c| c.id).collect();
+                    used.extend(ms.invited.iter().map(|(iid, _, _)| *iid));
+                    match (1u8..=254).find(|i| !used.contains(i)) {
+                        Some(i) => {
+                            ms.invited.push((i, member_pk, now));
+                            i
+                        }
+                        None => return (err("no free member id"), None),
+                    }
+                };
             // Issue the cert: the master signs it if we're the creator; otherwise we (a
             // member) sign an open-chain invite cert with our own key — either way it
             // chains to the master. Then seal the mesh secret to the joiner's enc key.
@@ -1847,6 +1936,8 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             my_key,
             my_enc,
             certs: invite.certs,
+            revocations: Vec::new(),
+            invited: Vec::new(),
             secret,
             links,
             exit_sel,
@@ -1878,6 +1969,7 @@ fn create_mesh(
     cipher: Option<String>,
     self_destruct: Option<bool>,
     master_gated: Option<bool>,
+    expel: Option<String>,
 ) -> (Response, Option<PostAction>) {
     // The mesh id is the real key, but a human picks a mesh by NAME and the GUI lists
     // meshes by name — so two same-named meshes render as indistinguishable "peer" rows
@@ -1916,6 +2008,11 @@ fn create_mesh(
             None,
         );
     }
+    // Expulsion (membership-revocation) policy — chosen at genesis, fixed for life.
+    let expel = match parse_expel(expel.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return (err(&e), None),
+    };
     let master = MasterKey::generate();
     let my_key = MemberKey::generate();
     let charter = GenesisCharter {
@@ -1934,6 +2031,7 @@ fn create_mesh(
         } else {
             lattice_mesh::charter::SelfDestruct::Off
         },
+        expel,
     };
     if let Err(e) = charter.validate() {
         return (err(&e.to_string()), None);
@@ -1971,6 +2069,8 @@ fn create_mesh(
             my_key,
             my_enc,
             certs: vec![cert],
+            revocations: Vec::new(),
+            invited: Vec::new(),
             secret,
             links,
             exit_sel,
@@ -1990,6 +2090,104 @@ fn create_mesh(
         Response::MeshCreated { mesh: id },
         bringup.map(PostAction::Bringup),
     )
+}
+
+/// Expel (revoke) a member under the mesh's `ExpelPolicy`. Builds or co-signs a signed
+/// revocation, records it locally (so `roster()` drops the member once it is authorized),
+/// and gossips it. Returns an info message noting whether it took effect now or needs more
+/// quorum co-signers. Re-cipher only denies keys; THIS is what removes a member.
+fn expel_member(st: &mut State, mesh: MeshId, member: MemberId) -> (Response, Option<PostAction>) {
+    let Some(ms) = st.meshes.get_mut(&mesh) else {
+        return (no_mesh(mesh), None);
+    };
+    let net = ms.mesh.charter.master_pubkey;
+    let policy = ms.mesh.charter.expel;
+    if policy == ExpelPolicy::None {
+        return (
+            err("this mesh does not allow expulsion (expel policy = none, fixed at creation)"),
+            None,
+        );
+    }
+    // Resolve the target's pubkey + inviter from the current roster.
+    let Some(target) = ms.roster().into_iter().find(|c| c.id == member) else {
+        return (err(&format!("no member #{member} in this mesh")), None);
+    };
+    let (target_pk, target_inviter, target_name) = (target.member, target.inviter, target.name);
+    if target_pk == ms.my_key.pubkey() {
+        return (
+            err("can't expel yourself — use Remove/wipe to leave the mesh"),
+            None,
+        );
+    }
+    let now = now_ms();
+    let am_master = ms.master.is_some();
+    let my_pub = ms.my_key.pubkey();
+    // Produce this node's signature iff it is authorized to contribute one.
+    let sig = match policy {
+        ExpelPolicy::None => unreachable!(),
+        ExpelPolicy::CreatorOnly => {
+            if !am_master {
+                return (
+                    err("only the mesh creator may expel here (policy = creator-only)"),
+                    None,
+                );
+            }
+            ms.master.as_ref().unwrap().revoke_sig(&target_pk)
+        }
+        ExpelPolicy::InviterChain => {
+            if am_master {
+                ms.master.as_ref().unwrap().revoke_sig(&target_pk)
+            } else if my_pub == target_inviter {
+                ms.my_key.revoke_sig(&net, &target_pk)
+            } else {
+                return (
+                    err(&format!(
+                        "only the master or the member who invited '{target_name}' may expel it (policy = inviter-chain)"
+                    )),
+                    None,
+                );
+            }
+        }
+        // Any member contributes one co-signature; effective at k (policy = quorum).
+        ExpelPolicy::Quorum { .. } => ms.my_key.revoke_sig(&net, &target_pk),
+    };
+    // Fold into an existing revocation for this member (reuse its issued_at so co-signers
+    // accumulate over gossip), else start a new one.
+    match ms.revocations.iter_mut().find(|r| r.member == target_pk) {
+        Some(existing) => {
+            if !existing.signers.iter().any(|s| s.signer == sig.signer) {
+                existing.signers.push(sig);
+            }
+        }
+        None => ms
+            .revocations
+            .push(Revocation::new(net, target_pk, now, sig)),
+    }
+    // Gossip the updated revocation set now (it is also re-gossiped periodically).
+    if let Some(tx) = ms.loop_cmd.clone() {
+        let peers: Vec<MemberId> = ms.links.lock().unwrap().keys().copied().collect();
+        if !peers.is_empty() {
+            if let Ok(body) = bincode::serialize(&ms.revocations) {
+                let _ = tx.send(LoopCmd::SendControl(CTRL_REVOKE, body, peers));
+            }
+        }
+    }
+    let gone = !ms.roster().iter().any(|c| c.member == target_pk);
+    let message = if gone {
+        format!("expelled '{target_name}' (#{member}) — removed from the roster.")
+    } else if let ExpelPolicy::Quorum { k } = policy {
+        let have = ms
+            .revocations
+            .iter()
+            .find(|r| r.member == target_pk)
+            .map(|r| r.valid_signers().len())
+            .unwrap_or(0);
+        format!("expel of '{target_name}' proposed — {have}/{k} co-signers; each other member runs the same `expel` to reach {k}.")
+    } else {
+        format!("expel of '{target_name}' recorded.")
+    };
+    elog!("meshd: {message}");
+    (Response::Info { message }, None)
 }
 
 fn detail(ms: &MeshState) -> MeshDetail {
@@ -2123,6 +2321,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
         dp_error: ms.dp_error.clone(),
         warnings,
         network_fp: fp(&ch.master_pubkey),
+        expel: expel_name(ch.expel),
     }
 }
 
@@ -2140,6 +2339,40 @@ fn err(message: &str) -> Response {
 
 fn fp(pk: &PubKey) -> String {
     pk[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parse the `expel` policy name (CreateMesh) into an [`ExpelPolicy`]. `None`/"" ⇒
+/// `CreatorOnly` (the default); `quorum` ⇒ k=2, or `quorum:N` for an explicit threshold.
+fn parse_expel(s: Option<&str>) -> Result<ExpelPolicy, String> {
+    let s = s.map(|x| x.trim().to_ascii_lowercase()).unwrap_or_default();
+    Ok(match s.as_str() {
+        "" | "creator" | "creator-only" | "creatoronly" => ExpelPolicy::CreatorOnly,
+        "inviter" | "inviter-chain" | "inviterchain" => ExpelPolicy::InviterChain,
+        "none" | "no" | "never" => ExpelPolicy::None,
+        "quorum" => ExpelPolicy::Quorum { k: 2 },
+        other => match other
+            .strip_prefix("quorum:")
+            .and_then(|n| n.parse::<u8>().ok())
+        {
+            Some(0) => return Err("expel quorum k must be >= 1".into()),
+            Some(k) => ExpelPolicy::Quorum { k },
+            None => {
+                return Err(format!(
+                    "unknown expel policy '{other}' (creator|inviter|quorum[:k]|none)"
+                ))
+            }
+        },
+    })
+}
+
+/// Human name of an expel policy (MeshInfo display).
+fn expel_name(p: ExpelPolicy) -> String {
+    match p {
+        ExpelPolicy::CreatorOnly => "creator-only".into(),
+        ExpelPolicy::InviterChain => "inviter-chain".into(),
+        ExpelPolicy::Quorum { k } => format!("quorum(k={k})"),
+        ExpelPolicy::None => "none".into(),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

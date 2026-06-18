@@ -125,6 +125,16 @@
                 <span><b>Ephemeral</b> — self-destruct when isolated
                   <span class="muted">(off by default; laptop-friendly)</span>.</span>
               </label>
+              <label style="display:block;margin-top:10px"
+                     title="Who may expel (kick) a member. Fixed at creation.">
+                <span><b>Who can expel a member</b></span>
+                <select id="mesh-expel" class="select" style="margin-top:6px">
+                  <option value="creator">Creator only (you) — default</option>
+                  <option value="inviter">Inviter chain — whoever invited them, or you</option>
+                  <option value="quorum">Quorum vote — ≥2 members must agree</option>
+                  <option value="none">No expulsion — membership is permanent</option>
+                </select>
+              </label>
             </div>
 
             <div class="add-row">

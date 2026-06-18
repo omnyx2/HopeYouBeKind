@@ -7,6 +7,42 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ---
 
+## 2026-06-18 — two bugs found while building membership expulsion
+
+Both surfaced during live testing of the new expulsion feature (docs/EXPULSION.md).
+
+### Bug A — back-to-back invites collide on the member id
+`CreateInvite` picked the joiner's 1-byte id from the **current roster only**
+(`used = roster ids`). Since the bedb9c0 fix, an invitee is NOT added to the roster until
+it joins + gossips back — so inviting `b` then `c` before either connects gave **both id
+#2** (the roster was still just `{a}` both times). The roster then showed two members at
+`#2` sharing one link/endpoint, and `expel #3` hit nothing.
+- **Fix:** the daemon **reserves** ids handed out in not-yet-joined invites
+  (`MeshState.invited`, pruned on join or after `INVITE_RESERVE_MS`); id selection excludes
+  roster ids ∪ reserved ids. Belt-and-suspenders: `effective_members` de-duplicates by id
+  deterministically (earliest `issued_at`, then lowest pubkey) so any collision that slips
+  through (cross-node) converges to the same single member everywhere. Live-verified:
+  back-to-back invites now yield `#2`,`#3`.
+
+### Bug B — quorum expel co-signers didn't accumulate
+A quorum revocation signed over `(network, member, issued_at)`. Two members proposing the
+same expulsion independently used **different `issued_at`** (each `now_ms()`), so their
+revocations never merged — each stayed at 1 signer and `k` was never reached. Live test:
+both A and B reported "1/2", member not removed.
+- **Fix:** sign over **`(network, member)` only** — no timestamp. All signatures for "expel
+  X from N" are now over identical bytes, so independent proposals merge and co-signers
+  accumulate regardless of timing/order. Revocation is monotonic (re-admit = fresh keypair),
+  so dropping the nonce is safe. `issued_at` stays as unsigned metadata. Live-verified:
+  A proposes (1/2, stays) → B co-signs (2/2, removed).
+
+**Lesson (the user's framing):** the daemon is the single authoritative actor — it performs
+all logic; the GUI only visualizes it. A related cleanup this session: the GUI's
+`meshWarnings()` was **re-deriving** health warnings client-side instead of showing the
+daemon's authoritative `MeshDetail.warnings` (which is the only place the decrypt-fail /
+split-brain warning lives). Now the GUI renders `d.warnings` verbatim.
+
+---
+
 ## 2026-06-18 — "Oracle shows idle" was a silent split-brain
 
 ### Incident

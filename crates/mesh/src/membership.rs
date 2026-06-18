@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::charter::InviteTopology;
+use crate::charter::{ExpelPolicy, InviteTopology};
 use lattice_proto::wire_v2::MemberId;
 
 /// A 32-byte ed25519 public key (the master's, or a member's, identity).
@@ -213,6 +213,190 @@ pub fn valid_members<'a>(
         .collect()
 }
 
+// ---- membership revocation (expulsion) -------------------------------------------
+// A member's cert chains to the master forever, so re-cipher (key rotation) can deny it
+// the live secret but never drops it from the roster. A **revocation** is a signed
+// statement that expels a member; `effective_members` removes a member that carries an
+// *authorized* revocation under the charter's [`ExpelPolicy`]. Who is authorized to sign
+// is the whole policy choice (creator-only / inviter / quorum / none).
+
+/// One signer's signature over a revocation's canonical bytes.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct RevSig {
+    /// The pubkey that signed (the master, or a member co-signing for quorum/inviter).
+    pub signer: PubKey,
+    #[serde(with = "sig_serde")]
+    pub sig: [u8; 64],
+}
+
+/// A signed expulsion of `member` from `network`. Carries one or more signatures so a
+/// quorum revocation can accumulate co-signers via gossip (all sign the same bytes).
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Revocation {
+    pub network: PubKey,
+    /// The expelled member's pubkey.
+    pub member: PubKey,
+    pub issued_at: u64,
+    pub signers: Vec<RevSig>,
+}
+
+/// Canonical bytes every signer of a revocation signs over. Deliberately covers only
+/// `(network, member)` — NOT a timestamp — so signatures from different members (and at
+/// different times) all sign the SAME message and merge into one revocation. A quorum
+/// thus accumulates co-signers regardless of who proposed first or gossip timing.
+/// Revocation is monotonic (a re-admit uses a fresh keypair), so no anti-replay nonce is
+/// needed.
+fn revoke_signing_bytes(network: &PubKey, member: &PubKey) -> Vec<u8> {
+    let mut b = Vec::with_capacity(6 + 32 + 32);
+    b.extend_from_slice(b"REVOKE");
+    b.extend_from_slice(network);
+    b.extend_from_slice(member);
+    b
+}
+
+impl MasterKey {
+    /// Sign a revocation of `member` as the master (the `CreatorOnly` signature).
+    pub fn revoke_sig(&self, member: &PubKey) -> RevSig {
+        let network = self.network();
+        let msg = revoke_signing_bytes(&network, member);
+        RevSig {
+            signer: network,
+            sig: self.0.sign(&msg).to_bytes(),
+        }
+    }
+}
+
+impl MemberKey {
+    /// Co-sign a revocation of `member` as this member (quorum / inviter signature).
+    pub fn revoke_sig(&self, network: &PubKey, member: &PubKey) -> RevSig {
+        let msg = revoke_signing_bytes(network, member);
+        RevSig {
+            signer: self.pubkey(),
+            sig: self.0.sign(&msg).to_bytes(),
+        }
+    }
+}
+
+impl Revocation {
+    /// Start a revocation from one signature.
+    pub fn new(network: PubKey, member: PubKey, issued_at: u64, first: RevSig) -> Self {
+        Self {
+            network,
+            member,
+            issued_at,
+            signers: vec![first],
+        }
+    }
+
+    /// The distinct signer pubkeys whose signatures actually verify over our bytes.
+    pub fn valid_signers(&self) -> Vec<PubKey> {
+        let msg = revoke_signing_bytes(&self.network, &self.member);
+        let mut out: Vec<PubKey> = Vec::new();
+        for s in &self.signers {
+            if out.contains(&s.signer) {
+                continue;
+            }
+            if let Ok(vk) = VerifyingKey::from_bytes(&s.signer) {
+                if vk.verify(&msg, &Signature::from_bytes(&s.sig)).is_ok() {
+                    out.push(s.signer);
+                }
+            }
+        }
+        out
+    }
+
+    /// Fold another revocation's signatures into this one when they target the same
+    /// `(network, member)` — how a quorum revocation accumulates co-signers as it gossips.
+    /// Timing-independent (the timestamp is not signed). Returns whether anything new was
+    /// added.
+    pub fn merge_signers(&mut self, other: &Revocation) -> bool {
+        if self.network != other.network || self.member != other.member {
+            return false;
+        }
+        let mut grew = false;
+        for s in &other.signers {
+            if !self.signers.iter().any(|e| e.signer == s.signer) {
+                self.signers.push(s.clone());
+                grew = true;
+            }
+        }
+        grew
+    }
+}
+
+/// Is a revocation **authorized** to expel its target under `expel`, given the current
+/// rooted roster (so quorum signers / the inviter can be checked)?
+fn revocation_authorized(
+    r: &Revocation,
+    master: &PubKey,
+    rooted: &[&Cert],
+    expel: ExpelPolicy,
+) -> bool {
+    let signers = r.valid_signers();
+    match expel {
+        ExpelPolicy::None => false,
+        ExpelPolicy::CreatorOnly => signers.contains(master),
+        ExpelPolicy::InviterChain => {
+            if signers.contains(master) {
+                return true;
+            }
+            // the master, or the pubkey that invited the target.
+            rooted
+                .iter()
+                .find(|c| c.member == r.member)
+                .is_some_and(|c| signers.contains(&c.inviter))
+        }
+        ExpelPolicy::Quorum { k } => {
+            // distinct signers that are themselves current members (or the master),
+            // never counting the target signing its own expulsion.
+            let count = signers
+                .iter()
+                .filter(|s| **s != r.member)
+                .filter(|s| *s == master || rooted.iter().any(|c| &c.member == *s))
+                .count();
+            count >= k as usize
+        }
+    }
+}
+
+/// The roster after applying revocations: members that chain to the master AND do not
+/// carry an authorized revocation under the charter's `expel` policy.
+pub fn effective_members<'a>(
+    master: &PubKey,
+    certs: &'a [Cert],
+    topology: InviteTopology,
+    revocations: &[Revocation],
+    expel: ExpelPolicy,
+) -> Vec<&'a Cert> {
+    let rooted = valid_members(master, certs, topology);
+    let revoked: std::collections::HashSet<PubKey> = if expel == ExpelPolicy::None {
+        std::collections::HashSet::new()
+    } else {
+        revocations
+            .iter()
+            .filter(|r| &r.network == master)
+            .filter(|r| revocation_authorized(r, master, &rooted, expel))
+            .map(|r| r.member)
+            .collect()
+    };
+    let mut kept: Vec<&Cert> = rooted
+        .into_iter()
+        .filter(|c| !revoked.contains(&c.member))
+        .collect();
+    // Defensive: a roster must have UNIQUE ids. If two valid certs collide on one id
+    // (e.g. two members invited at the same instant from different nodes, before either
+    // gossiped), keep one deterministically — earliest `issued_at`, then lowest member
+    // pubkey — so every node converges on the SAME member for that id instead of showing
+    // a phantom duplicate.
+    kept.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then(a.issued_at.cmp(&b.issued_at))
+            .then(a.member.cmp(&b.member))
+    });
+    kept.dedup_by_key(|c| c.id);
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +480,200 @@ mod tests {
             InviteTopology::OpenChain
         )
         .is_empty());
+    }
+
+    fn has(eff: &[&Cert], pk: PubKey) -> bool {
+        eff.iter().any(|c| c.member == pk)
+    }
+
+    #[test]
+    fn creator_only_revocation_removes_member() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let alice = MemberKey::from_seed(&[2u8; 32]);
+        let bob = MemberKey::from_seed(&[3u8; 32]);
+        let certs = vec![
+            master.issue(alice.pubkey(), 1, "alice", at()),
+            alice.invite(net, bob.pubkey(), 2, "bob", at()),
+        ];
+        let rev = Revocation::new(net, bob.pubkey(), at(), master.revoke_sig(&bob.pubkey()));
+        let eff = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            std::slice::from_ref(&rev),
+            ExpelPolicy::CreatorOnly,
+        );
+        assert!(has(&eff, alice.pubkey()));
+        assert!(!has(&eff, bob.pubkey()));
+    }
+
+    #[test]
+    fn creator_only_ignores_a_member_signer() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let alice = MemberKey::from_seed(&[2u8; 32]);
+        let bob = MemberKey::from_seed(&[3u8; 32]);
+        let certs = vec![
+            master.issue(alice.pubkey(), 1, "alice", at()),
+            alice.invite(net, bob.pubkey(), 2, "bob", at()),
+        ];
+        // alice is a member, not the master → her revocation does not count under CreatorOnly.
+        let rev = Revocation::new(
+            net,
+            bob.pubkey(),
+            at(),
+            alice.revoke_sig(&net, &bob.pubkey()),
+        );
+        let eff = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            std::slice::from_ref(&rev),
+            ExpelPolicy::CreatorOnly,
+        );
+        assert!(has(&eff, bob.pubkey()));
+    }
+
+    #[test]
+    fn inviter_chain_lets_the_inviter_but_not_a_stranger() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let alice = MemberKey::from_seed(&[2u8; 32]);
+        let bob = MemberKey::from_seed(&[3u8; 32]);
+        let carol = MemberKey::from_seed(&[4u8; 32]);
+        let certs = vec![
+            master.issue(alice.pubkey(), 1, "alice", at()),
+            alice.invite(net, bob.pubkey(), 2, "bob", at()),
+            alice.invite(net, carol.pubkey(), 3, "carol", at()),
+        ];
+        // alice invited bob → alice may revoke bob.
+        let rev = Revocation::new(
+            net,
+            bob.pubkey(),
+            at(),
+            alice.revoke_sig(&net, &bob.pubkey()),
+        );
+        let eff = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            std::slice::from_ref(&rev),
+            ExpelPolicy::InviterChain,
+        );
+        assert!(!has(&eff, bob.pubkey()));
+        // carol did NOT invite bob → her revocation is not authorized.
+        let rev2 = Revocation::new(
+            net,
+            bob.pubkey(),
+            at(),
+            carol.revoke_sig(&net, &bob.pubkey()),
+        );
+        let eff2 = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            std::slice::from_ref(&rev2),
+            ExpelPolicy::InviterChain,
+        );
+        assert!(has(&eff2, bob.pubkey()));
+    }
+
+    #[test]
+    fn quorum_needs_k_member_co_signers() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let a = MemberKey::from_seed(&[2u8; 32]);
+        let b = MemberKey::from_seed(&[3u8; 32]);
+        let c = MemberKey::from_seed(&[4u8; 32]);
+        let certs = vec![
+            master.issue(a.pubkey(), 1, "a", at()),
+            a.invite(net, b.pubkey(), 2, "b", at()),
+            a.invite(net, c.pubkey(), 3, "c", at()),
+        ];
+        // one signer (a) < k=2 → c stays.
+        let mut rev = Revocation::new(net, c.pubkey(), at(), a.revoke_sig(&net, &c.pubkey()));
+        let eff = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            std::slice::from_ref(&rev),
+            ExpelPolicy::Quorum { k: 2 },
+        );
+        assert!(has(&eff, c.pubkey()));
+        // b co-signs (gossip merge) → 2 ≥ k → c removed.
+        rev.merge_signers(&Revocation::new(
+            net,
+            c.pubkey(),
+            at(),
+            b.revoke_sig(&net, &c.pubkey()),
+        ));
+        let eff2 = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            std::slice::from_ref(&rev),
+            ExpelPolicy::Quorum { k: 2 },
+        );
+        assert!(!has(&eff2, c.pubkey()));
+    }
+
+    #[test]
+    fn duplicate_id_keeps_one_deterministically() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let b = MemberKey::from_seed(&[3u8; 32]);
+        let c = MemberKey::from_seed(&[4u8; 32]);
+        // both certs claim id 2 (a collision); b was issued earlier than c.
+        let cb = master.issue(b.pubkey(), 2, "b", 100);
+        let cc = master.issue(c.pubkey(), 2, "c", 200);
+        let certs = vec![cc, cb]; // out of order on purpose
+        let eff = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            &[],
+            ExpelPolicy::CreatorOnly,
+        );
+        let ids: Vec<MemberId> = eff.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![2]); // exactly one member at id 2
+        assert_eq!(eff[0].member, b.pubkey()); // earliest issued_at wins, on every node
+    }
+
+    #[test]
+    fn none_policy_never_expels_and_tamper_is_ignored() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let a = MemberKey::from_seed(&[2u8; 32]);
+        let b = MemberKey::from_seed(&[3u8; 32]);
+        let certs = vec![
+            master.issue(a.pubkey(), 1, "a", at()),
+            a.invite(net, b.pubkey(), 2, "b", at()),
+        ];
+        // None → even a valid master revocation is ignored.
+        let rev = Revocation::new(net, b.pubkey(), at(), master.revoke_sig(&b.pubkey()));
+        assert!(has(
+            &effective_members(
+                &net,
+                &certs,
+                InviteTopology::OpenChain,
+                std::slice::from_ref(&rev),
+                ExpelPolicy::None,
+            ),
+            b.pubkey()
+        ));
+        // CreatorOnly but the signature is tampered → not authorized.
+        let mut bad = Revocation::new(net, b.pubkey(), at(), master.revoke_sig(&b.pubkey()));
+        bad.signers[0].sig[0] ^= 0xff;
+        assert!(has(
+            &effective_members(
+                &net,
+                &certs,
+                InviteTopology::OpenChain,
+                std::slice::from_ref(&bad),
+                ExpelPolicy::CreatorOnly,
+            ),
+            b.pubkey()
+        ));
     }
 }

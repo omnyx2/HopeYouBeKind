@@ -40,6 +40,11 @@ pub enum Request {
         /// the default).
         #[serde(default)]
         master_gated: Option<bool>,
+        /// Membership-revocation (expulsion) policy, fixed at genesis: who may expel a
+        /// member. One of `creator`(default) | `inviter` | `quorum[:k]` | `none`.
+        /// `None` ⇒ `creator-only`.
+        #[serde(default)]
+        expel: Option<String>,
     },
     /// List the data-plane ciphers a mesh can be created with (populates the dropbox).
     Ciphers,
@@ -86,6 +91,11 @@ pub enum Request {
     /// Select the current mesh for egress (its exit must be set), or `None` for
     /// idle / untouched (the §1 default).
     SetCurrent { mesh: Option<MeshId> },
+    /// Expel (revoke) a member from a mesh under its `ExpelPolicy` (who may sign is set
+    /// at genesis). Records + gossips a signed revocation; the member leaves the roster
+    /// once the revocation is authorized (immediately for creator/inviter, at `k`
+    /// co-signers for quorum). Distinct from `RemoveMesh` (which wipes the mesh locally).
+    ExpelMember { mesh: MeshId, member: MemberId },
     /// Wipe one mesh locally — the §5 compromise response.
     RemoveMesh { mesh: MeshId },
     /// The current routing policy.
@@ -164,6 +174,10 @@ pub enum Response {
     /// invite-wrap transforms).
     Ciphers(Vec<String>),
     Ok,
+    /// A success carrying a human message (e.g. expel result / quorum progress).
+    Info {
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -289,6 +303,10 @@ pub struct MeshDetail {
     /// surfacing it lets the user (and `doctor`) catch that at a glance.
     #[serde(default)]
     pub network_fp: String,
+    /// The mesh's expulsion policy (who may expel a member), e.g. "creator-only" /
+    /// "quorum(k=2)" / "none". Fixed at genesis; shown so members know the rule.
+    #[serde(default)]
+    pub expel: String,
 }
 
 /// The routing policy summary (§1).

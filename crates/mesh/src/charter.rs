@@ -46,6 +46,31 @@ pub enum SelfDestruct {
     OnIsolation,
 }
 
+/// **Who may expel (revoke) a member** — the membership-revocation policy, chosen by
+/// the creator at genesis and fixed for the mesh's life. A revocation is a signed
+/// statement that drops a member from the roster even though its cert still chains to
+/// the master; this policy decides whose signature(s) make that revocation count.
+///
+/// Distinct from `RecipherTrigger`: re-cipher rotates the key (denies the *current*
+/// secret to those offline), but the member's cert stays valid so it never leaves the
+/// roster. Expulsion is what actually removes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ExpelPolicy {
+    /// Only the master (creator) may sign a revocation — the simple admin model
+    /// (default). Pairs with `MasterGated`. If the creator is offline, nobody can expel.
+    #[default]
+    CreatorOnly,
+    /// The master, OR the member that invited the target (its cert's `inviter`) — "you
+    /// can remove whoever you brought in". Pairs with `OpenChain`.
+    InviterChain,
+    /// Any member, but a revocation needs `k` distinct co-signing members — democratic,
+    /// works even when the creator is away. Mirrors `RecipherTrigger::Quorum`.
+    Quorum { k: u8 },
+    /// No expulsion: once admitted, a member only leaves voluntarily. Re-cipher still
+    /// denies the key, but the roster never drops anyone. Maximally stable.
+    None,
+}
+
 /// The 1-byte id space caps any mesh at 254 members (`0`/`255` reserved).
 pub const MAX_MEMBERS_CEILING: u8 = 254;
 
@@ -68,6 +93,10 @@ pub struct GenesisCharter {
     /// older charters (invites/persisted state) still deserialize.
     #[serde(default)]
     pub self_destruct: SelfDestruct,
+    /// Membership-revocation policy — who may expel a member. `#[serde(default)]` ⇒
+    /// `CreatorOnly` for older charters that predate the field.
+    #[serde(default)]
+    pub expel: ExpelPolicy,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -90,6 +119,11 @@ impl GenesisCharter {
                 return Err(CharterError::QuorumZero);
             }
         }
+        if let ExpelPolicy::Quorum { k } = self.expel {
+            if k == 0 {
+                return Err(CharterError::QuorumZero);
+            }
+        }
         Ok(())
     }
 }
@@ -107,6 +141,7 @@ mod tests {
             initial_cipher: "noise-ik-chachapoly".into(),
             overlay_prefix: [100, 80],
             self_destruct: SelfDestruct::Off,
+            expel: ExpelPolicy::CreatorOnly,
         }
     }
 

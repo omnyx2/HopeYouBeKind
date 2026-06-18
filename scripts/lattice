@@ -125,6 +125,7 @@ def cmd_info(sock, a):
     print(f"mesh #{d['id']}  {d['name']}    net {d.get('network_fp', '?')}")
     print(f"  cipher     {d['cipher']}   epoch {d['epoch']}")
     print(f"  charter    {d['invite']} · {d['trigger']} · max {d['max_members']} · {sd}")
+    print(f"  expel      {d.get('expel', '?')}")
     print(f"  health     {d['live']}/{len(d['members'])} live · floor {d['threshold']}")
     if d.get("attack_armed_secs_left") is not None:
         print(f"  ⚠ ATTACK   self-destruct in {d['attack_armed_secs_left']}s "
@@ -149,7 +150,7 @@ def cmd_new(sock, a):
     req = {"CreateMesh": {
         "name": a.name, "my_name": a.me, "max_members": a.max,
         "cipher": a.cipher, "self_destruct": a.ephemeral,
-        "master_gated": a.master_gated}}
+        "master_gated": a.master_gated, "expel": a.expel}}
     r = call(sock, req)
     mid = r["MeshCreated"]["mesh"]
     print(f"created mesh #{mid} '{a.name}' — you are '{a.me}'.")
@@ -227,6 +228,14 @@ def cmd_allclear(sock, a):
     mid = resolve_mesh(sock, a.mesh)
     call(sock, {"AllClear": {"mesh": mid}})
     print(f"all-clear sent for mesh {mid} — self-destruct cancelled.")
+
+
+def cmd_expel(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    eid = resolve_member(sock, mid, a.member)
+    r = call(sock, {"ExpelMember": {"mesh": mid, "member": eid}})
+    msg = r.get("Info", {}).get("message") if isinstance(r, dict) else None
+    print(msg or f"expel sent for member #{eid}.")
 
 
 def cmd_rm(sock, a):
@@ -342,6 +351,8 @@ def build_parser():
                    help="self-destruct keys when the mesh loses live quorum (default off)")
     s.add_argument("--master-gated", action="store_true", dest="master_gated",
                    help="only the creator may invite (default: any member can — open-chain)")
+    s.add_argument("--expel", default=None,
+                   help="who may expel a member: creator (default) | inviter | quorum[:k] | none")
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("id", help="mint an identity code to hand to a mesh host")
@@ -383,6 +394,11 @@ def build_parser():
     s = sub.add_parser("allclear", help="(creator) cancel an attack alert")
     s.add_argument("mesh", help="mesh id or name")
     s.set_defaults(fn=cmd_allclear)
+
+    s = sub.add_parser("expel", help="expel (revoke) a member, per the mesh's expel policy")
+    s.add_argument("mesh", help="mesh id or name")
+    s.add_argument("member", help="member id or name to expel")
+    s.set_defaults(fn=cmd_expel)
 
     s = sub.add_parser("rm", help="wipe a mesh from this computer")
     s.add_argument("mesh", help="mesh id or name")

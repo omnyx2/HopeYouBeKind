@@ -150,8 +150,15 @@ async function renderPeersFor(id) {
     const action = needsAddr
       ? `<div class="add-row" style="margin-top:6px"><input class="peer-ep-in" data-m="${m.id}" placeholder="ip:port — e.g. 203.0.113.10:41000" style="font-size:12px;flex:1" /><button class="small-btn peer-ep-set" data-m="${m.id}">set address</button></div>`
       : "";
+    // Expel (kick) a member — shown unless the mesh forbids it (expel policy = none).
+    const canExpel = !m.is_me && d.expel && d.expel !== "none";
+    const expelBtn = canExpel
+      ? ` <button class="small-btn peer-expel" data-m="${m.id}" data-name="${esc(m.name)}">expel</button>`
+      : "";
+    // The daemon explains a non-live peer (idle/unknown) in `reason` — show it verbatim.
+    const why = m.reason ? `<div class="muted small" style="margin-top:4px">↳ ${esc(m.reason)}</div>` : "";
     return `<tr><td>${m.id}</td><td>${esc(m.name)}${m.is_me ? ' <span class="muted small">(me)</span>' : ""}</td>` +
-      `<td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}${action}</td></tr>`;
+      `<td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}${why}${action}${expelBtn}</td></tr>`;
   }).join("");
   const tbl = el("peers-table");
   tbl.querySelector("tbody").innerHTML = rows;
@@ -165,6 +172,16 @@ async function renderPeersFor(id) {
       try { await meshd({ SetPeer: { mesh: id, member: m, endpoint: ep } }); toast("peer address set — connecting…"); }
       catch (e) { return toast(String(e)); }
       setTimeout(() => renderPeersFor(id), 1500);
+    };
+  });
+  // Wire the expel buttons (revoke a member per the mesh's expel policy).
+  tbl.querySelectorAll(".peer-expel").forEach((btn) => {
+    btn.onclick = async () => {
+      const mid = parseInt(btn.dataset.m, 10);
+      if (!confirm(`Expel "${btn.dataset.name}" (#${mid}) from this mesh?`)) return;
+      try { const r = await meshd({ ExpelMember: { mesh: id, member: mid } }); toast(r.Info?.message || "expel sent"); }
+      catch (e) { return toast(String(e)); }
+      setTimeout(() => renderPeersFor(id), 1200);
     };
   });
 }
@@ -279,8 +296,9 @@ el("mesh-create").addEventListener("click", async () => {
   const cipher = el("mesh-cipher").value || null;
   const selfDestruct = el("mesh-selfdestruct").checked;
   const masterGated = el("mesh-mastergated").checked;
+  const expel = el("mesh-expel")?.value || null;
   try {
-    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher, self_destruct: selfDestruct, master_gated: masterGated } });
+    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher, self_destruct: selfDestruct, master_gated: masterGated, expel } });
     el("mesh-name").value = "";
     el("mesh-myname").value = "";
     toast(`mesh created (#${r.MeshCreated.mesh})`);
@@ -306,6 +324,8 @@ async function renderOverview(id) {
     </div>
     ${warn.length ? `<div class="kv"><span>warnings</span><b><a href="#" id="ov-goto-warn" style="color:#ff6477">⚠ ${warn.length} active — open Warnings</a></b></div>` : ""}
     <div class="kv"><span>charter</span><b class="small">${d.invite} · ${esc(d.trigger)} · max ${d.max_members} · ${d.self_destruct ? "ephemeral (self-destruct)" : "persistent"}</b></div>
+    <div class="kv"><span>network</span><b class="mono small">${esc(d.network_fp || "?")}</b></div>
+    <div class="kv"><span>expel</span><b class="small">${esc(d.expel || "?")}</b></div>
     <div class="kv"><span>cipher</span><b class="mono small">${esc(d.cipher)}</b></div>
     <div class="kv"><span>epoch</span><b>${d.epoch}</b></div>
     <div class="kv"><span>health</span><b>${d.live}/${d.members.length} live · floor ${d.threshold}${d.attack_armed_secs_left != null ? ` · <span style="color:#e44">⚠ ARMED ${d.attack_armed_secs_left}s</span>` : ""}</b></div>
@@ -433,19 +453,17 @@ async function renderConfigs(id) {
 }
 
 // ---- Derive the active warnings for a mesh (attack detection + liveness/health) ----
+// The DAEMON is authoritative for health warnings (data-plane down, below-floor,
+// decrypt-fail / split-brain). The GUI only visualizes what the daemon reports in
+// `d.warnings` — it does not re-derive them. The attack countdown is separate because it
+// drives an interactive control (the creator's all-clear button).
 function meshWarnings(d) {
   const w = [];
   if (d.attack_armed_secs_left != null) {
     w.push({ kind: "attack", secs: d.attack_armed_secs_left, is_creator: d.is_creator });
   }
-  if (d.dp_error) {
-    w.push({ kind: "dataplane",
-      detail: `The data plane is DOWN: ${d.dp_error}. This mesh looks joined but cannot send or receive — peers will appear unreachable. Restart Lattice; if a stale daemon is holding the port it will free within seconds and the mesh recovers automatically.` });
-  }
-  if (d.live < d.threshold) {
-    w.push({ kind: "quorum",
-      detail: `Only ${d.live}/${d.members.length} members are live; the live floor is ${d.threshold}.`
-        + (d.self_destruct ? " This mesh is ephemeral — if it stays below the floor the keys self-destruct." : "") });
+  for (const msg of (d.warnings || [])) {
+    w.push({ kind: "daemon", detail: msg });
   }
   return w;
 }
@@ -470,10 +488,9 @@ async function renderWarnings(id) {
         ${x.is_creator ? `<div class="add-row" style="margin-top:8px"><button class="small-btn" id="warn-allclear">All clear (cancel self-destruct)</button></div>` : ""}
       </div>`;
     }
-    if (x.kind === "dataplane") {
-      return `<div class="warn-card"><h3>⛔ Data plane DOWN</h3><p>${x.detail}</p></div>`;
-    }
-    return `<div class="warn-card amber"><h3>⚠ Below live quorum</h3><p>${x.detail}</p></div>`;
+    // A daemon-reported warning (data-plane down, below-floor, decrypt-fail/split-brain).
+    const dp = x.detail.startsWith("⛔");
+    return `<div class="warn-card${dp ? "" : " amber"}"><h3>${dp ? "⛔ Data plane" : "⚠ Health"}</h3><p>${esc(x.detail)}</p></div>`;
   }).join("");
   const ac = el("warn-allclear");
   if (ac) ac.onclick = async () => { try { await meshd({ AllClear: { mesh: id } }); toast("all-clear sent"); } catch (e) { toast(String(e)); } renderWarnings(id); };

@@ -183,6 +183,10 @@ pub enum LoopEvent {
     /// cert bytes. The supervisor merges any new, valid certs so the roster converges
     /// across the mesh (a node added via a third member reaches everyone).
     Roster(Vec<u8>),
+    /// A peer gossiped membership revocations (`CTRL_REVOKE`): signed expulsions. The
+    /// supervisor merges them (accumulating quorum co-signers) so an expulsion converges
+    /// across the mesh the same way the roster does.
+    Revoke(Vec<u8>),
 }
 
 /// meshd→loop command channel (re-cipher, attack signals).
@@ -197,6 +201,9 @@ pub const CTRL_ALLCLEAR: u8 = 0x04;
 /// mesh (a node admitted via one member propagates to all). Carried like other control
 /// frames; merged + re-validated by the supervisor.
 pub const CTRL_ROSTER: u8 = 0x05;
+/// Membership revocation gossip: signed expulsions, merged + re-validated by the
+/// supervisor so an expelled member converges out of the roster mesh-wide (§ expulsion).
+pub const CTRL_REVOKE: u8 = 0x06;
 
 /// Encode a re-cipher announce: `[epoch(8 BE)][cipher_len(1)][cipher][secret(32)]`.
 fn encode_recipher(r: &Recipher) -> Vec<u8> {
@@ -355,6 +362,11 @@ pub async fn run<X: Transport + 'static>(
                         // it came from a member sharing this mesh's secret).
                         Some(CTRL_ROSTER) => {
                             let _ = loop_event.send(LoopEvent::Roster(payload[1..].to_vec()));
+                        }
+                        // Membership revocation gossip — hand the signed expulsions up to
+                        // the supervisor to merge + re-validate (same path as the roster).
+                        Some(CTRL_REVOKE) => {
+                            let _ = loop_event.send(LoopEvent::Revoke(payload[1..].to_vec()));
                         }
                         _ => {}
                     },
