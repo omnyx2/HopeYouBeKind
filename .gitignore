@@ -26,6 +26,10 @@ legacy/gui-admin/.vite
 # Claude Code local overrides
 .claude/settings.local.json
 
+# Course submission forms + reports (personal info / not source — keep out of repo)
+*.docx
+~$*
+
 # OS / editor
 .DS_Store
 Thumbs.db

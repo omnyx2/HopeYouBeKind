@@ -268,6 +268,44 @@ Each phase builds **and runs** on Mac + Ubuntu + Windows ([[verify-all-three-pla
 
 ---
 
+## 11b. Shipped: live editing + gossip distribution (unsigned)
+
+Phases 1–2 above assumed an **admin-signed** manifest distributed over the DHT. The
+v2 mesh is admin-free, so the first shipped cut distributes the table the same way the
+roster and revocations already travel: **per-mesh control-plane gossip, newest version
+wins, no signing** (any member may edit — matching the mesh's invite-chain trust model).
+Signing can be layered on later without changing the wire shape.
+
+**State.** Each mesh carries `flows: Vec<FlowRule>` + a monotonic `flow_version: u64`.
+Both are persisted (`PersistedMesh`, `#[serde(default)]` so older state files load) and
+restored at startup; an empty persisted table means "use the built-in default", so a
+node that never edited stays on `default_table()` and **gossips nothing** (version 0).
+
+**Edit.** `Request::SetFlows { mesh, flows }` → meshd bumps `flow_version`, stores the
+table, applies it to the live data plane (`LoopCmd::SetFlows` → `dp.set_flows`), persists,
+and gossips it immediately. `Request::GetFlows { mesh }` → `Response::FlowRules`.
+
+**Distribution.** Control frame `CTRL_FLOWS = 0x07` carries `version(8 BE) ‖ bincode(flows)`,
+sent to every known peer on edit and re-gossiped periodically by `spawn_roster_gossip`
+(only when `flow_version > 0`). A receiver adopts the table iff `version > flow_version`
+(`LoopEvent::Flows` → store + apply + persist). Ties and older versions are ignored, so
+convergence is deterministic and a node that missed an edit heals on the next periodic tick.
+
+**Apply at bringup.** `Bringup.flows` is pushed to the data plane right after it is
+constructed, so route decisions honour the table from the first packet.
+
+**Editors.**
+- CLI: `lattice flows <mesh>` lists; `--block <CIDR>` adds a high-priority `Drop`;
+  `--exit <CIDR>` routes a prefix via the mesh exit; `--reset` restores the default.
+- GUI: a **Routing rules** card on each mesh's Configs tab — lists rules, add a
+  block/route-via-exit rule by destination CIDR, remove a rule, or reset. Every edit
+  calls `SetFlows`, so it propagates to all members automatically.
+
+**Not yet:** signing/authority on edits, `src_uid` app-auth (§7), the DNS rule (§8).
+Those remain as Phases 3–5 above.
+
+---
+
 ## 12. Open questions
 
 - **Rule granularity vs table size:** how many flows before per-packet evaluation

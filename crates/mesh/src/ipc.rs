@@ -115,6 +115,16 @@ pub enum Request {
     Shutdown,
     /// The current routing policy.
     GetPolicy,
+    /// The mesh's SDN flow table (ordered rules; first match wins). See
+    /// docs/FLOW_TABLE.md. Returns [`Response::FlowRules`].
+    GetFlows { mesh: MeshId },
+    /// Replace the mesh's SDN flow table. Bumps the table version, applies it to the
+    /// live data plane, persists it, and gossips it to peers (CTRL_FLOWS, newest version
+    /// wins). Unsigned — any member may edit (Phase 2). Returns [`Response::Ok`].
+    SetFlows {
+        mesh: MeshId,
+        flows: Vec<lattice_proto::flow::FlowRule>,
+    },
 
     // --- join flow (cert + sealed-secret exchange) ---
     /// (Joiner) Mint a fresh member + encryption keypair to be invited under.
@@ -175,6 +185,8 @@ pub enum Response {
     Mesh(MeshDetail),
     Traffic(TrafficView),
     Policy(PolicyView),
+    /// A mesh's SDN flow table (from `GetFlows`).
+    FlowRules(Vec<lattice_proto::flow::FlowRule>),
     /// A freshly minted identity's public keys + mint time (from `NewIdentity`).
     Identity {
         member_pubkey_hex: String,

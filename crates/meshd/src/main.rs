@@ -35,10 +35,11 @@ use lattice_mesh::membership::{
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
-    SharedEndpoint, SharedExit, SharedTraffic, Traffic, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_REVOKE,
-    CTRL_ROSTER,
+    SharedEndpoint, SharedExit, SharedTraffic, Traffic, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_FLOWS,
+    CTRL_REVOKE, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
+use lattice_proto::flow::FlowRule;
 use lattice_proto::wire_v2::{MemberId, MeshId};
 use lattice_proto::VirtualIp;
 use lattice_tun::{open as tun_open, TunConfig};
@@ -195,6 +196,11 @@ struct MeshState {
     /// Live per-peer byte/packet counters + recent overlay flows, shared with the data-plane
     /// loop. Projected into the GUI traffic monitor (`TrafficStats`).
     traffic: SharedTraffic,
+    /// The mesh's SDN flow table (docs/FLOW_TABLE.md) + a monotonic version. Edited via
+    /// `SetFlows`, gossiped (`CTRL_FLOWS`, newest version wins, no signing), applied to the
+    /// live data plane and persisted. `flow::default_table()` = the classic behavior.
+    flows: Vec<FlowRule>,
+    flow_version: u64,
 }
 
 impl MeshState {
@@ -272,6 +278,7 @@ struct Bringup {
     decrypt_fails: DecryptFails,
     traffic: SharedTraffic,
     header_placement: HeaderPlacement,
+    flows: Vec<FlowRule>,
 }
 
 fn now_ms() -> u64 {
@@ -309,6 +316,12 @@ struct PersistedMesh {
     /// Signed expulsions (P-revoke). `#[serde(default)]` so older state files load.
     #[serde(default)]
     revocations: Vec<Revocation>,
+    /// SDN flow table + version (docs/FLOW_TABLE.md). `#[serde(default)]` so older state
+    /// files load; an empty table is treated as the default at restore.
+    #[serde(default)]
+    flows: Vec<FlowRule>,
+    #[serde(default)]
+    flow_version: u64,
     secret: [u8; 32],
     epoch: u64,
     cipher: String,
@@ -357,6 +370,8 @@ fn to_persisted(ms: &MeshState) -> PersistedMesh {
         charter: ms.mesh.charter.clone(),
         certs: ms.certs.clone(),
         revocations: ms.revocations.clone(),
+        flows: ms.flows.clone(),
+        flow_version: ms.flow_version,
         secret: ms.secret,
         epoch: ms.epoch,
         cipher: ms.cipher.clone(),
@@ -473,6 +488,12 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
+    // An empty persisted table (older state files) means "use the default".
+    let restored_flows = if p.flows.is_empty() {
+        lattice_proto::flow::default_table()
+    } else {
+        p.flows.clone()
+    };
     let bringup = Bringup {
         mesh_id: p.mesh_id,
         my_id,
@@ -486,6 +507,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
         header_placement: mesh.charter.header_placement,
+        flows: restored_flows.clone(),
     };
     let ms = MeshState {
         mesh,
@@ -509,6 +531,8 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         attack_armed_at: None,
         decrypt_fails,
         traffic,
+        flows: restored_flows,
+        flow_version: p.flow_version,
     };
     (ms, bringup)
 }
@@ -956,7 +980,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
             }
         }
     };
-    let dp = MeshDataPlane::new(
+    let mut dp = MeshDataPlane::new(
         b.mesh_id,
         b.my_id,
         b.prefix,
@@ -964,6 +988,11 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         &b.secret,
         b.header_placement,
     );
+    // Apply this mesh's SDN flow table (default or persisted/edited) to the live data
+    // plane so route decisions honour it from the first packet (docs/FLOW_TABLE.md).
+    if !b.flows.is_empty() {
+        dp.set_flows(b.flows);
+    }
     // Record the TUN name (needed to divert the default route for full-tunnel) and
     // make this node able to serve as an exit for others — ip_forward + NAT, which
     // is idempotent and unused unless a peer routes through us (reuses v1 exit.rs).
@@ -1103,6 +1132,30 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                         }
                     }
                 }
+                // A peer gossiped its SDN flow table (`version(8 BE) ‖ bincode(flows)`).
+                // Newest version wins; ties are ignored. On adopting a newer table we
+                // store it, persist it, and push it down to the live data plane.
+                LoopEvent::Flows(bytes) => {
+                    if bytes.len() >= 8 {
+                        let mut v = [0u8; 8];
+                        v.copy_from_slice(&bytes[..8]);
+                        let version = u64::from_be_bytes(v);
+                        if version > ms.flow_version {
+                            if let Ok(flows) = bincode::deserialize::<Vec<FlowRule>>(&bytes[8..]) {
+                                elog!(
+                                    "meshd: mesh {mid} adopted flow table v{version} ({} rules) via gossip",
+                                    flows.len()
+                                );
+                                ms.flow_version = version;
+                                ms.flows = flows.clone();
+                                if let Some(tx) = &ms.loop_cmd {
+                                    let _ = tx.send(LoopCmd::SetFlows(flows));
+                                }
+                                persist_after = true;
+                            }
+                        }
+                    }
+                }
             }
             if persist_after {
                 persist(&state);
@@ -1146,7 +1199,16 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
                         // Revocations (signed expulsions) — converges expulsions the same way.
                         if !ms.revocations.is_empty() {
                             if let Ok(body) = bincode::serialize(&ms.revocations) {
-                                out.push((CTRL_REVOKE, body, peers, tx));
+                                out.push((CTRL_REVOKE, body, peers.clone(), tx.clone()));
+                            }
+                        }
+                        // SDN flow table — only once edited away from the default (version > 0);
+                        // newest version wins, so periodic re-gossip heals any node that missed it.
+                        if ms.flow_version > 0 {
+                            if let Ok(enc) = bincode::serialize(&ms.flows) {
+                                let mut body = ms.flow_version.to_be_bytes().to_vec();
+                                body.extend_from_slice(&enc);
+                                out.push((CTRL_FLOWS, body, peers, tx));
                             }
                         }
                         out
@@ -1816,6 +1878,46 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             )
         }
 
+        Request::GetFlows { mesh } => match st.meshes.get(&mesh) {
+            Some(ms) => (Response::FlowRules(ms.flows.clone()), None),
+            None => (no_mesh(mesh), None),
+        },
+
+        Request::SetFlows { mesh, flows } => {
+            let Some(ms) = st.meshes.get_mut(&mesh) else {
+                return (no_mesh(mesh), None);
+            };
+            ms.flow_version += 1;
+            ms.flows = flows.clone();
+            let version = ms.flow_version;
+            // Apply to the live data plane so the next packet routes by the new table.
+            if let Some(tx) = &ms.loop_cmd {
+                let _ = tx.send(LoopCmd::SetFlows(flows.clone()));
+            }
+            // Gossip `version(8 BE) ‖ bincode(flows)` to peers (newest version wins).
+            if let Some(tx) = ms.loop_cmd.clone() {
+                let peers: Vec<MemberId> = ms.links.lock().unwrap().keys().copied().collect();
+                if !peers.is_empty() {
+                    if let Ok(enc) = bincode::serialize(&flows) {
+                        let mut body = version.to_be_bytes().to_vec();
+                        body.extend_from_slice(&enc);
+                        let _ = tx.send(LoopCmd::SendControl(CTRL_FLOWS, body, peers));
+                    }
+                }
+            }
+            persist(st);
+            elog!(
+                "meshd: mesh {mesh} flow table set to v{version} ({} rules)",
+                flows.len()
+            );
+            (
+                Response::Info {
+                    message: format!("flow table updated (v{version}, {} rules)", flows.len()),
+                },
+                None,
+            )
+        }
+
         Request::NewIdentity => {
             let member = MemberKey::generate();
             let enc = EncKey::generate();
@@ -2094,6 +2196,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
         header_placement: mesh.charter.header_placement,
+        flows: lattice_proto::flow::default_table(),
     });
     st.meshes.insert(
         invite.mesh_id,
@@ -2119,6 +2222,8 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             attack_armed_at: None,
             decrypt_fails,
             traffic,
+            flows: lattice_proto::flow::default_table(),
+            flow_version: 0,
         },
     );
     (
@@ -2238,6 +2343,7 @@ fn create_mesh(
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
         header_placement: mesh.charter.header_placement,
+        flows: lattice_proto::flow::default_table(),
     });
     st.meshes.insert(
         id,
@@ -2263,6 +2369,8 @@ fn create_mesh(
             attack_armed_at: None,
             decrypt_fails,
             traffic,
+            flows: lattice_proto::flow::default_table(),
+            flow_version: 0,
         },
     );
     (

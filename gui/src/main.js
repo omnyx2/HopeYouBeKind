@@ -504,7 +504,22 @@ async function renderConfigs(id) {
       </div>
       <p class="muted small">Rotates this mesh's key (and the cipher, if changed). Needs ≥60% of members online; anyone offline now is evicted and must be re-invited.</p>
     </div>
+    <div class="card" id="flow-card">
+      <div class="card-head"><h2 class="card-title">Routing rules <span class="muted small">(flow table — SDN)</span></h2></div>
+      <div id="flow-list" class="muted small">loading…</div>
+      <p class="muted small" style="margin-top:8px">First match wins (highest priority, then order). Rules are gossiped to every member — newest version wins.</p>
+      <div class="add-row">
+        <select id="flow-act" class="select">
+          <option value="block">block (drop)</option>
+          <option value="exit">route via exit</option>
+        </select>
+        <input id="flow-cidr" placeholder="destination — e.g. 1.1.1.1 or 10.0.0.0/8" />
+        <button class="small-btn" id="flow-add">add rule</button>
+        <button class="small-btn" id="flow-reset">reset to default</button>
+      </div>
+    </div>
     <p class="muted small" style="margin-top:6px">Invite a member is on the <b>Peers</b> tab; Report attack / Wipe are on the <b>Warnings</b> tab.</p>`;
+  renderFlows(id);
   el("ov-egress").onclick = async () => { try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); } refreshMode(); };
   el("ov-exit-set").onclick = async () => {
     const v = el("ov-exit").value;
@@ -524,6 +539,73 @@ async function renderConfigs(id) {
     if (!confirm(`Re-cipher "${d.name}"?\n\nRotates the key${changed ? ` and switches the cipher to "${cipher}"` : ""}. Needs ≥60% of members online; anyone offline now is evicted and must be re-invited.`)) return;
     try { await meshd({ Recipher: { mesh: id, cipher: changed ? cipher : null } }); toast("re-ciphered"); } catch (e) { toast(String(e)); }
     renderConfigs(id);
+  };
+}
+
+// ---- SDN flow table editor (Phase 2: unsigned, gossiped) ----
+function fmtFlowAction(act) {
+  if (typeof act === "string") return act;          // ToOverlayOwner / Local / Drop
+  const k = Object.keys(act)[0], v = act[k];
+  if (k === "ToExit") return v == null ? "→ exit" : `→ exit node ${v}`;
+  if (k === "ToPeer") return `→ peer ${v}`;
+  return `${k}(${v})`;
+}
+function fmtFlowMatch(m) {
+  const p = [];
+  if (m.scope != null) p.push(m.scope.toLowerCase());
+  if (m.dst_cidr != null) p.push(`dst ${m.dst_cidr[0]}/${m.dst_cidr[1]}`);
+  if (m.proto != null) p.push({ 1: "icmp", 6: "tcp", 17: "udp" }[m.proto] || `proto ${m.proto}`);
+  if (m.dport != null) p.push(`dport ${m.dport}`);
+  return p.length ? p.join(", ") : "any";
+}
+function parseCidr(s) {
+  s = s.trim();
+  if (s.includes("/")) { const [n, l] = s.split("/"); return [n, parseInt(l, 10)]; }
+  return [s, 32];
+}
+function defaultFlowTable() {
+  return [
+    { priority: 0, match_: { scope: "Overlay", dst_cidr: null, proto: null, dport: null }, action: "ToOverlayOwner" },
+    { priority: 0, match_: { scope: "Internet", dst_cidr: null, proto: null, dport: null }, action: { ToExit: null } },
+  ];
+}
+async function renderFlows(id) {
+  let rules = [];
+  try { rules = (await meshd({ GetFlows: { mesh: id } })).FlowRules || []; }
+  catch (e) { el("flow-list").textContent = String(e); return; }
+  const node = el("flow-list");
+  if (!node) return;
+  if (!rules.length) {
+    node.innerHTML = `<span class="muted">empty — using the built-in default (overlay → owner, internet → exit).</span>`;
+  } else {
+    node.innerHTML = rules.map((r, i) =>
+      `<div class="kv"><span><code>[${i}]</code> prio ${r.priority} · ${esc(fmtFlowMatch(r.match_))}</span>` +
+      `<b>${esc(fmtFlowAction(r.action))} <button class="small-btn" data-flow-del="${i}">remove</button></b></div>`
+    ).join("");
+    node.querySelectorAll("[data-flow-del]").forEach((b) => {
+      b.onclick = async () => {
+        const idx = parseInt(b.getAttribute("data-flow-del"), 10);
+        const next = rules.filter((_, j) => j !== idx);
+        try { await meshd({ SetFlows: { mesh: id, flows: next } }); toast("rule removed"); } catch (e) { toast(String(e)); }
+        renderFlows(id);
+      };
+    });
+  }
+  el("flow-add").onclick = async () => {
+    const cidr = el("flow-cidr").value.trim();
+    if (!cidr) return toast("enter a destination CIDR");
+    const act = el("flow-act").value;
+    const match_ = { scope: null, dst_cidr: parseCidr(cidr), proto: null, dport: null };
+    const action = act === "block" ? "Drop" : { ToExit: null };
+    const next = rules.concat([{ priority: 100, match_, action }]);
+    try { await meshd({ SetFlows: { mesh: id, flows: next } }); toast("rule added"); } catch (e) { toast(String(e)); }
+    el("flow-cidr").value = "";
+    renderFlows(id);
+  };
+  el("flow-reset").onclick = async () => {
+    if (!confirm("Reset this mesh's flow table to the default?")) return;
+    try { await meshd({ SetFlows: { mesh: id, flows: defaultFlowTable() } }); toast("flow table reset"); } catch (e) { toast(String(e)); }
+    renderFlows(id);
   };
 }
 

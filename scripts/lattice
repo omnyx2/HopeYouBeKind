@@ -268,6 +268,84 @@ def cmd_expel(sock, a):
     print(msg or f"expel sent for member #{eid}.")
 
 
+def _fmt_action(act):
+    # FlowAction is a serde enum: "ToOverlayOwner"/"Local"/"Drop" (unit) or
+    # {"ToExit": null|id} / {"ToPeer": id}.
+    if isinstance(act, str):
+        return act
+    if isinstance(act, dict):
+        k, v = next(iter(act.items()))
+        if k == "ToExit":
+            return "ToExit(default)" if v is None else f"ToExit(node {v})"
+        return f"{k}({v})"
+    return str(act)
+
+
+def _fmt_match(m):
+    parts = []
+    if m.get("scope") is not None:
+        parts.append(m["scope"].lower())
+    if m.get("dst_cidr") is not None:
+        net, ln = m["dst_cidr"]
+        parts.append(f"dst {net}/{ln}")
+    if m.get("proto") is not None:
+        parts.append({1: "icmp", 6: "tcp", 17: "udp"}.get(m["proto"], f"proto {m['proto']}"))
+    if m.get("dport") is not None:
+        parts.append(f"dport {m['dport']}")
+    return ", ".join(parts) if parts else "any"
+
+
+def _parse_cidr(s):
+    if "/" in s:
+        net, ln = s.split("/", 1)
+        return [net, int(ln)]
+    return [s, 32]
+
+
+def cmd_flows(sock, a):
+    mid = resolve_mesh(sock, a.mesh)
+    if a.reset:
+        # An empty table tells meshd to fall back to the built-in default at restore;
+        # but to apply live we send the default explicitly by asking for a no-op edit.
+        # Simplest: send the current default by clearing to [] is rejected, so we ship
+        # the daemon's default by reading it after a fresh create — instead just send the
+        # known default (overlay→owner, internet→exit).
+        rules = [
+            {"priority": 0, "match_": {"scope": "Overlay", "dst_cidr": None, "proto": None, "dport": None},
+             "action": "ToOverlayOwner"},
+            {"priority": 0, "match_": {"scope": "Internet", "dst_cidr": None, "proto": None, "dport": None},
+             "action": {"ToExit": None}},
+        ]
+        r = call(sock, {"SetFlows": {"mesh": mid, "flows": rules}})
+        print((r.get("Info") or {}).get("message", "flow table reset to default."))
+        return
+
+    rules = call(sock, {"GetFlows": {"mesh": mid}}).get("FlowRules", [])
+
+    if a.block or a.exit:
+        if a.block:
+            m = {"scope": None, "dst_cidr": _parse_cidr(a.block), "proto": None, "dport": None}
+            action = "Drop"
+            label = f"block {a.block}"
+        else:
+            m = {"scope": None, "dst_cidr": _parse_cidr(a.exit), "proto": None, "dport": None}
+            action = {"ToExit": None}
+            label = f"route {a.exit} via exit"
+        # Higher priority than the defaults (which are priority 0) so it wins.
+        rules = list(rules) + [{"priority": 100, "match_": m, "action": action}]
+        r = call(sock, {"SetFlows": {"mesh": mid, "flows": rules}})
+        print((r.get("Info") or {}).get("message", f"added rule: {label}."))
+        return
+
+    # Default: list the table (evaluation order = highest priority first, then order).
+    if not rules:
+        print("(empty — using the built-in default table)")
+        return
+    print(f"flow table for mesh {mid} ({len(rules)} rules):")
+    for i, ru in enumerate(rules):
+        print(f"  [{i}] prio {ru['priority']:<4} {_fmt_match(ru['match_'])}  ->  {_fmt_action(ru['action'])}")
+
+
 def cmd_rm(sock, a):
     mid = resolve_mesh(sock, a.mesh)
     call(sock, {"RemoveMesh": {"mesh": mid}})
@@ -445,6 +523,13 @@ def build_parser():
     s.add_argument("mesh", help="mesh id or name")
     s.add_argument("member", help="member id or name to expel")
     s.set_defaults(fn=cmd_expel)
+
+    s = sub.add_parser("flows", help="show/edit the SDN flow table (routing rules)")
+    s.add_argument("mesh", help="mesh id or name")
+    s.add_argument("--block", metavar="CIDR", help="drop traffic to a destination (e.g. 1.1.1.1 or 10.0.0.0/8)")
+    s.add_argument("--exit", metavar="CIDR", help="route a destination via the mesh exit")
+    s.add_argument("--reset", action="store_true", help="reset to the default table")
+    s.set_defaults(fn=cmd_flows)
 
     s = sub.add_parser("rm", help="wipe a mesh from this computer")
     s.add_argument("mesh", help="mesh id or name")

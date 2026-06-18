@@ -269,6 +269,8 @@ pub enum LoopCmd {
     Recipher(Recipher, Vec<MemberId>),
     /// Seal a tagged `Control` payload and send it to `peers` (P-C7 attack signals).
     SendControl(u8, Vec<u8>, Vec<MemberId>),
+    /// Apply a new SDN flow table to the live data plane (docs/FLOW_TABLE.md).
+    SetFlows(Vec<lattice_proto::flow::FlowRule>),
 }
 
 /// An event from the data-plane loop up to the supervisor.
@@ -285,6 +287,9 @@ pub enum LoopEvent {
     /// supervisor merges them (accumulating quorum co-signers) so an expulsion converges
     /// across the mesh the same way the roster does.
     Revoke(Vec<u8>),
+    /// A peer gossiped its SDN flow table (`CTRL_FLOWS`): `version(8 BE) ‖ bincode(flows)`.
+    /// The supervisor adopts it if the version is newer, then applies it to the data plane.
+    Flows(Vec<u8>),
 }
 
 /// meshd→loop command channel (re-cipher, attack signals).
@@ -302,6 +307,9 @@ pub const CTRL_ROSTER: u8 = 0x05;
 /// Membership revocation gossip: signed expulsions, merged + re-validated by the
 /// supervisor so an expelled member converges out of the roster mesh-wide (§ expulsion).
 pub const CTRL_REVOKE: u8 = 0x06;
+/// SDN flow-table gossip: `version(8 BE) ‖ bincode(Vec<FlowRule>)`. Newest version wins;
+/// the supervisor applies an adopted table to the data plane (docs/FLOW_TABLE.md).
+pub const CTRL_FLOWS: u8 = 0x07;
 
 /// Encode a re-cipher announce: `[epoch(8 BE)][cipher_len(1)][cipher][secret(32)]`.
 fn encode_recipher(r: &Recipher) -> Vec<u8> {
@@ -471,6 +479,11 @@ pub async fn run<X: Transport + 'static>(
                         Some(CTRL_REVOKE) => {
                             let _ = loop_event.send(LoopEvent::Revoke(payload[1..].to_vec()));
                         }
+                        // SDN flow-table gossip — the supervisor adopts a newer version and
+                        // sends it back down via LoopCmd::SetFlows to apply to the data plane.
+                        Some(CTRL_FLOWS) => {
+                            let _ = loop_event.send(LoopEvent::Flows(payload[1..].to_vec()));
+                        }
                         _ => {}
                     },
                     // P5 relay: we're a hop, not the destination — pass the frame on
@@ -528,6 +541,9 @@ pub async fn run<X: Transport + 'static>(
                         &r.secret,
                     );
                     let _ = loop_event.send(LoopEvent::Recipher(r));
+                }
+                LoopCmd::SetFlows(flows) => {
+                    dp.set_flows(flows); // apply a programmed table to the live data plane
                 }
                 LoopCmd::SendControl(tag, body, peers) => {
                     let mut payload = vec![tag];
