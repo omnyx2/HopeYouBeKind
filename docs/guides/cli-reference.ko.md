@@ -64,8 +64,8 @@ lattice off                         # 직접 인터넷으로 복귀
 cargo build --release -p lattice-meshd
 # 바이너리: target/release/meshd
 
-# CLI를 PATH에 등록
-sudo ln -sf "$PWD/scripts/lattice" /usr/local/bin/lattice
+# CLI를 PATH에 등록(/usr/local/bin 심볼릭 링크; 복사는 --copy)
+sudo ./scripts/lattice install
 lattice --help            # 내장 도움말; 명령별 `lattice <명령> --help`
 ```
 
@@ -78,6 +78,25 @@ CLI 자체는 Python 3 외 의존성 없음.
 
 `meshd`는 로컬 소켓에서 대기하고, 데이터 플레인이 켜지면 **메쉬마다** TUN 1개 + UDP 소켓 1개를
 만듭니다. TUN 때문에 **root**(Linux/macOS) 또는 **elevated**(Windows)로 실행해야 합니다.
+
+**쉬운 방법 (헤드리스 서버)** — CLI가 데몬을 대신 관리하니, 환경변수나 sudo 줄을 손으로 쓸
+필요가 없습니다:
+
+```sh
+sudo lattice up                 # meshd를 백그라운드로 기동(데이터 플레인 ON)
+lattice status                  # 데몬 건강 + 메쉬 / 출구 / 트래픽 (--watch N 으로 실시간)
+lattice logs -f                 # 데몬 로그 팔로우
+lattice down                    # 깨끗이 종료(sudo 불필요 — IPC 소켓 경유)
+# 공개 주소 고정(출구/시드 노드) + 부팅 자동시작:
+sudo lattice install-service --advertise <공개IP>:41000
+```
+
+`lattice up`은 `meshd` 바이너리를 자동 탐지(레포 빌드 디렉토리, 설치된 앱, 또는
+`$LATTICE_MESHD`)하고, TUN을 위해 `sudo`로 재실행한 뒤, 소켓이 응답할 때까지 기다립니다.
+플래그: `--advertise IP:PORT`, `--state-dir DIR`, `--dht-port N`, `--dht-bootstrap IP:PORT`,
+`--bind-port N`, `--no-dht`, `--foreground`, `--log FILE`.
+
+**수동 방법** (동일, 참고용):
 
 ```sh
 # Linux / macOS — 데이터 플레인 ON, 포그라운드(Ctrl-C로 종료)
@@ -139,7 +158,18 @@ sudo DATA_PLANE=1 ./target/release/meshd
 | `ciphers` / `algos` | 데이터 플레인 암호 / 초대-랩 알고리즘 목록. |
 | `policy` | 현재 라우팅 정책. |
 | `backup [경로]` | 메쉬 스냅샷 파일(업데이트 이관). |
+| `flows <mesh> [--block CIDR\|--exit CIDR\|--reset]` | SDN 플로우 테이블(라우팅 규칙) 조회/편집 — 전 멤버에게 gossip 전파. |
 | `raw '<json>'` | 원시 IPC 요청(탈출구). |
+| **— 서버 / 데몬 —** | |
+| `up [meshd 플래그]` | meshd를 백그라운드로 기동(헤드리스; TUN 위해 자동 sudo). |
+| `down` | 소켓 경유로 데몬 깨끗이 종료(sudo 불필요). |
+| `restart [meshd 플래그]` | `down` 후 `up`. |
+| `status [--watch N]` | 데몬 건강 + 메쉬 / 출구 / 트래픽, 선택적 실시간. |
+| `logs [-f] [-n N]` | 데몬 로그 조회/팔로우. |
+| `serve-exit <mesh> [--advertise IP:PORT]` | 이 노드를 메쉬의 인터넷 출구로 지정. |
+| `install-service [meshd 플래그]` | systemd 유닛 설치+활성화(Linux; 부팅 자동시작). |
+| `uninstall-service` | systemd 유닛 제거(Linux). |
+| `install [--prefix DIR] [--copy]` | `lattice`를 PATH에 등록. |
 
 ---
 
@@ -164,6 +194,15 @@ lattice info home            # 두 멤버 모두 'live'여야 함
 신원 코드는 만료됩니다(~10분, P-C6). 비밀성을 위해 호스트가 `invite`에 `--algo`를 줄 수 있고,
 가입자는 `join`에 같은 `--algo`를 써야 합니다(out-of-band로 전달).
 
+**헤드리스 단축** — `invite`/`join`에 `-`를 주면 코드를 **stdin**에서 읽으므로, SSH 가능한
+머신 사이에서 교환 전체를 파이프로 연결할 수 있습니다:
+
+```sh
+# 호스트가 가입자의 신원 코드를 SSH로 받아 한 줄로 초대 발급
+ssh joiner lattice id | lattice invite home bob -
+# ...출력된 초대 코드를 다시 가입자에게 전달(또는 반대로 파이프)
+```
+
 ---
 
 ## 5. 다중 노드 메쉬 배포 (공개 시드 1 + NAT 클라이언트들)
@@ -174,7 +213,20 @@ lattice info home            # 두 멤버 모두 'live'여야 함
 
 ### 5a. 공개 시드/출구 노드 (systemd)
 
-UDP **41000**(메쉬)과 **41001**(DHT)을 클라우드 보안 목록 **과** 호스트 방화벽에서 여세요. 그리고:
+UDP **41000**(메쉬)과 **41001**(DHT)을 클라우드 보안 목록 **과** 호스트 방화벽에서 여세요.
+그러면 **명령 하나**로 부팅 서비스를 설치+활성화합니다:
+
+```sh
+sudo lattice install-service --advertise <공인IP>:41000 --dht-port 41001
+lattice status                                  # active + 도달 가능
+sudo lattice serve-exit corp                    # 이 노드를 메쉬 출구로
+```
+
+`/etc/systemd/system/lattice-meshd.service`를 작성하고 `daemon-reload` + `enable --now`
+까지 합니다. 관리: `lattice status` / `lattice logs -f` / `journalctl -u lattice-meshd -f`,
+제거: `sudo lattice uninstall-service`.
+
+<details><summary>동일한 수작업 유닛 (참고용)</summary>
 
 ```ini
 # /etc/systemd/system/meshd-node.service
@@ -205,6 +257,8 @@ sudo systemctl status meshd-node.service        # active (running) 확인
 LATTICE_SOCK=/tmp/meshd.sock lattice ls         # 여기에 말 걸기
 ```
 
+</details>
+
 시드에서 메쉬를 만들고 멤버 #1이 됩니다:
 
 ```sh
@@ -219,7 +273,8 @@ lattice new corp --me seed
 ### 5b. 클라이언트 노드 (NAT 뒤)
 
 ```sh
-sudo DATA_PLANE=1 MESHD_DHT_BOOTSTRAP=<공인IP>:41001 ./target/release/meshd
+sudo lattice up --dht-bootstrap <공인IP>:41001
+# (수동 등가: sudo DATA_PLANE=1 MESHD_DHT_BOOTSTRAP=<공인IP>:41001 ./target/release/meshd)
 ```
 
 그다음 [초대/가입 흐름](#4-초대--가입-흐름-3단계-머신-2대): 클라이언트 `lattice id` →

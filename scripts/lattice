@@ -537,6 +537,10 @@ def _meshd_env(a):
         env["MESHD_STATE_DIR"] = a.state_dir
     if getattr(a, "dht_port", None):
         env["MESHD_DHT_PORT"] = str(a.dht_port)
+    if getattr(a, "dht_bootstrap", None):
+        env["MESHD_DHT_BOOTSTRAP"] = a.dht_bootstrap
+    if getattr(a, "bind_port", None):
+        env["MESHD_BIND_PORT"] = str(a.bind_port)
     return env
 
 
@@ -858,6 +862,10 @@ def build_parser():
         sp.add_argument("--state-dir", dest="state_dir", default=None,
                         help="persistence dir (default ~/.lattice/meshd)")
         sp.add_argument("--dht-port", dest="dht_port", type=int, default=None, help="DHT UDP port")
+        sp.add_argument("--dht-bootstrap", dest="dht_bootstrap", default=None, metavar="IP:PORT",
+                        help="DHT seed node(s) to bootstrap from (client behind NAT)")
+        sp.add_argument("--bind-port", dest="bind_port", type=int, default=None,
+                        help="pin the per-mesh data-plane UDP port (single-open-port hosts)")
         sp.add_argument("--no-dht", dest="no_dht", action="store_true", help="disable DHT rendezvous")
         sp.add_argument("--log", default=DEFAULT_LOG, help=f"daemon log file (default {DEFAULT_LOG})")
 

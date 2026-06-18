@@ -67,8 +67,8 @@ lattice off                         # back to direct internet
 cargo build --release -p lattice-meshd
 # the binary: target/release/meshd
 
-# put the CLI on PATH
-sudo ln -sf "$PWD/scripts/lattice" /usr/local/bin/lattice
+# put the CLI on PATH (symlink into /usr/local/bin; --copy to copy instead)
+sudo ./scripts/lattice install
 lattice --help            # built-in help; `lattice <cmd> --help` per command
 ```
 
@@ -82,6 +82,25 @@ plane (it creates a TUN device). The CLI needs nothing but Python 3.
 `meshd` listens on a local socket and (with the data plane on) creates one TUN device
 + one UDP socket **per mesh**. It must run as **root** (Linux/macOS) or **elevated**
 (Windows) for the TUN.
+
+**The easy way (headless server)** — the CLI manages the daemon for you, so you never
+hand-write env vars or sudo lines:
+
+```sh
+sudo lattice up                 # start meshd in the background (data plane on)
+lattice status                  # daemon health + meshes / exit / traffic (--watch N)
+lattice logs -f                 # follow the daemon log
+lattice down                    # stop it cleanly (no sudo — over the IPC socket)
+# pin a public address (exit/seed node) and start at boot:
+sudo lattice install-service --advertise <public-ip>:41000
+```
+
+`lattice up` auto-detects the `meshd` binary (repo build dir, the installed app, or
+`$LATTICE_MESHD`), re-launches it under `sudo` for the TUN, and waits until the socket
+answers. Flags: `--advertise IP:PORT`, `--state-dir DIR`, `--dht-port N`, `--no-dht`,
+`--foreground`, `--log FILE`.
+
+**The manual way** (equivalent, for reference):
 
 ```sh
 # Linux / macOS — data plane on, foreground (Ctrl-C to stop)
@@ -145,7 +164,18 @@ runs.
 | `ciphers` / `algos` | List data-plane ciphers / invite-wrap algorithms. |
 | `policy` | Show the current routing policy. |
 | `backup [path]` | Snapshot meshes to a file (update migration). |
+| `flows <mesh> [--block CIDR\|--exit CIDR\|--reset]` | Show/edit the SDN flow table (routing rules; gossiped to all members). |
 | `raw '<json>'` | Send a raw IPC request (escape hatch). |
+| **— server / daemon —** | |
+| `up [meshd flags]` | Start meshd in the background (headless; auto-sudo for the TUN). |
+| `down` | Stop the daemon cleanly over the socket (no sudo). |
+| `restart [meshd flags]` | `down` then `up`. |
+| `status [--watch N]` | Daemon health + meshes / exit / traffic, optionally live. |
+| `logs [-f] [-n N]` | Show/tail the daemon log. |
+| `serve-exit <mesh> [--advertise IP:PORT]` | Make THIS node the mesh's internet exit. |
+| `install-service [meshd flags]` | Install + enable a systemd unit (Linux; start at boot). |
+| `uninstall-service` | Remove the systemd unit (Linux). |
+| `install [--prefix DIR] [--copy]` | Put `lattice` on PATH. |
 
 ---
 
@@ -170,6 +200,15 @@ lattice info home            # both members should show 'live'
 Identity codes expire (~10 min, P-C6). For secrecy, the host may pass `--algo` to
 `invite`; the joiner must use the same `--algo` on `join` (tell them out-of-band).
 
+**Headless shortcut** — `invite`/`join` read the code from **stdin** when given `-`, so
+the whole exchange pipes between machines you can SSH into:
+
+```sh
+# host pulls the joiner's identity code over SSH and mints the invite in one line
+ssh joiner lattice id | lattice invite home bob -
+# ...then hand the printed invite code back (or pipe it the other way)
+```
+
 ---
 
 ## 5. Deploy a multi-node mesh (1 public seed + NAT clients)
@@ -181,7 +220,19 @@ behind NAT and finds peers automatically (gossip + reflexive STUN + DHT rendezvo
 ### 5a. Public seed/exit node (systemd)
 
 Open UDP **41000** (mesh) and **41001** (DHT) in the cloud security list **and** the host
-firewall. Then:
+firewall. Then **one command** installs + enables the boot service:
+
+```sh
+sudo lattice install-service --advertise <PUBLIC_IP>:41000 --dht-port 41001
+lattice status                                  # active + reachable
+sudo lattice serve-exit corp                    # make this node the mesh's exit
+```
+
+That writes `/etc/systemd/system/lattice-meshd.service`, `daemon-reload`s, and
+`enable --now`s it. Manage it with `lattice status` / `lattice logs -f` /
+`journalctl -u lattice-meshd -f`, or `sudo lattice uninstall-service` to remove.
+
+<details><summary>Equivalent hand-written unit (for reference)</summary>
 
 ```ini
 # /etc/systemd/system/meshd-node.service
@@ -212,6 +263,8 @@ sudo systemctl status meshd-node.service        # expect: active (running)
 LATTICE_SOCK=/tmp/meshd.sock lattice ls         # talk to it
 ```
 
+</details>
+
 On the seed, create the mesh and become member #1:
 
 ```sh
@@ -222,7 +275,8 @@ lattice new corp --me seed
 ### 5b. Client node (behind NAT)
 
 ```sh
-sudo DATA_PLANE=1 MESHD_DHT_BOOTSTRAP=<PUBLIC_IP>:41001 ./target/release/meshd
+sudo lattice up --dht-bootstrap <PUBLIC_IP>:41001
+# (manual equivalent: sudo DATA_PLANE=1 MESHD_DHT_BOOTSTRAP=<PUBLIC_IP>:41001 ./target/release/meshd)
 ```
 
 Then run the [invite/join flow](#4-the-invite--join-flow-3-steps-2-machines): client
