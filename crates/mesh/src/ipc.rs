@@ -353,6 +353,13 @@ pub struct FlowView {
     pub member_name: String,
     pub src: String,
     pub dst: String,
+    /// If `src`/`dst` is an in-mesh overlay address, the member name it resolves to (so the
+    /// UI shows WHO, not a raw `100.80.x.y`). Empty = not an in-mesh address (e.g. internet
+    /// behind the exit). `src_node` is the **requesting** node.
+    #[serde(default)]
+    pub src_node: String,
+    #[serde(default)]
+    pub dst_node: String,
     /// "tcp" | "udp" | "icmp" | "proto N".
     pub proto: String,
     pub sport: u16,

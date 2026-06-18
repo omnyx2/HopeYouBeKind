@@ -2474,6 +2474,17 @@ fn mesh_traffic(ms: &MeshState, out: &mut TrafficView) {
     let names: HashMap<MemberId, String> =
         ms.roster().iter().map(|c| (c.id, c.name.clone())).collect();
     let name_of = |id: MemberId| names.get(&id).cloned().unwrap_or_else(|| format!("#{id}"));
+    // Resolve an overlay address (prefix + member-id last octet) to its member name, so the
+    // flow view shows WHO sent/received instead of a raw `100.80.x.y`. Empty if not in-mesh.
+    let prefix = ms.mesh.charter.overlay_prefix;
+    let overlay_node = |ip: std::net::Ipv4Addr| -> String {
+        let o = ip.octets();
+        if [o[0], o[1]] == prefix {
+            names.get(&o[3]).cloned().unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
     let t = ms.traffic.lock().unwrap();
     for (id, pt) in &t.per_peer {
         out.rx_bytes += pt.rx_bytes;
@@ -2501,6 +2512,8 @@ fn mesh_traffic(ms: &MeshState, out: &mut TrafficView) {
             member_name: name_of(ev.member),
             src: ev.src.to_string(),
             dst: ev.dst.to_string(),
+            src_node: overlay_node(ev.src),
+            dst_node: overlay_node(ev.dst),
             proto: proto_name(ev.proto),
             sport: ev.sport,
             dport: ev.dport,

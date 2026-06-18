@@ -253,7 +253,10 @@ def cmd_traffic(sock, a):
             arrow = "↑out" if f["out"] else "↓in "
             port = f":{f['sport']}→{f['dport']}" if f["sport"] or f["dport"] else ""
             ex = " via-exit" if f["via_exit"] else ""
-            print(f"    {arrow} {f['proto']} {f['src']}→{f['dst']}{port} {f['bytes']}B  ({f['member_name']}){ex}")
+            sn = f.get("src_node") or ""; dn = f.get("dst_node") or ""
+            src = f"{sn}({f['src']})" if sn else f["src"]
+            dst = f"{dn}({f['dst']})" if dn else f["dst"]
+            print(f"    {arrow} {f['proto']} {src}→{dst}{port} {f['bytes']}B  req:{sn or f['member_name']}{ex}")
 
 
 def cmd_expel(sock, a):

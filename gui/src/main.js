@@ -230,11 +230,14 @@ async function renderTraffic(scope) {
       const arrow = f.out ? '<span style="color:#e0a020">↑ out</span>' : '<span style="color:#22c55e">↓ in</span>';
       const port = (f.sport || f.dport) ? `:${f.sport}→${f.dport}` : "";
       const ex = f.via_exit ? ' <span class="muted small">via exit</span>' : "";
-      return `<tr><td>${arrow}</td><td class="mono small">${esc(f.proto)}</td>` +
-        `<td class="mono small">${esc(f.src)}→${esc(f.dst)}${port}</td><td>${f.bytes}B</td>` +
-        `<td class="muted small">${esc(f.member_name)}${meshArg == null ? " · " + esc(f.mesh_name) : ""}${ex}</td></tr>`;
-    }).join("") || `<tr><td colspan="5" class="muted">no packet flows recorded yet</td></tr>`;
-    html += `<div class="card"><table class="topo-table"><thead><tr><th>dir</th><th>proto</th><th>src→dst</th><th>bytes</th><th>peer</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      const req = f.src_node || f.member_name; // the node that made the request
+      const sn = f.src_node ? `${esc(f.src_node)} ` : "";
+      const dn = f.dst_node ? `${esc(f.dst_node)} ` : "";
+      return `<tr><td>${arrow}</td><td><b>${esc(req)}</b></td><td class="mono small">${esc(f.proto)}</td>` +
+        `<td class="mono small">${sn}${esc(f.src)}→${dn}${esc(f.dst)}${port}</td><td>${f.bytes}B</td>` +
+        `<td class="muted small">${meshArg == null ? esc(f.mesh_name) : ""}${ex}</td></tr>`;
+    }).join("") || `<tr><td colspan="6" class="muted">no packet flows recorded yet</td></tr>`;
+    html += `<div class="card"><table class="topo-table"><thead><tr><th>dir</th><th>requester</th><th>proto</th><th>src→dst</th><th>bytes</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
   }
   body.innerHTML = html;
   el(`${scope}-traffic-toggle`).onclick = () => { TRAFFIC_DETAIL[scope] = !TRAFFIC_DETAIL[scope]; renderTraffic(scope); };
