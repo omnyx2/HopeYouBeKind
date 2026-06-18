@@ -45,6 +45,10 @@ pub enum Request {
         /// `None` ⇒ `creator-only`.
         #[serde(default)]
         expel: Option<String>,
+        /// Header-placement (P-C5) policy: `random`(default) | `front` | `back` | `fixed:N`.
+        /// Where the sealed wire header sits; `None`/`random` = the secret-derived float.
+        #[serde(default)]
+        header: Option<String>,
     },
     /// List the data-plane ciphers a mesh can be created with (populates the dropbox).
     Ciphers,
@@ -319,6 +323,9 @@ pub struct MeshDetail {
     /// "quorum(k=2)" / "none". Fixed at genesis; shown so members know the rule.
     #[serde(default)]
     pub expel: String,
+    /// The header-placement (P-C5) policy: "random (P-C5 float)" / "front" / "fixed:N".
+    #[serde(default)]
+    pub header_placement: String,
 }
 
 /// Live traffic for the monitor — totals + per-peer rows (summary view A) + recent overlay

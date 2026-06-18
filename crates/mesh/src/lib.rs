@@ -129,6 +129,7 @@ mod tests {
             overlay_prefix: [100, 80],
             self_destruct: crate::charter::SelfDestruct::Off,
             expel: crate::charter::ExpelPolicy::CreatorOnly,
+            header_placement: crate::charter::HeaderPlacement::Random,
         }
     }
 

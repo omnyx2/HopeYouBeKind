@@ -141,6 +141,15 @@
                   <option value="none">No expulsion — membership is permanent</option>
                 </select>
               </label>
+              <label style="display:block;margin-top:10px"
+                     title="Where the sealed wire header sits in each frame (P-C5). Fixed at creation.">
+                <span><b>Header position</b> <span class="muted small">(P-C5)</span></span>
+                <select id="mesh-header" class="select" style="margin-top:6px">
+                  <option value="random">Random float — secret-derived per frame (default, unfingerprintable)</option>
+                  <option value="front">Front — always at the start (classic, fingerprintable)</option>
+                  <option value="back">Back — always at the end</option>
+                </select>
+              </label>
             </div>
 
             <div class="add-row">

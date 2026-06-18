@@ -46,8 +46,10 @@ pub struct MeshDataPlane {
     /// Header cipher — the time-windowed key that seals the wire header (P-C2).
     header: HeaderCrypto,
     /// Frame scramble — floats the sealed header + masks `seq` so nothing is at a
-    /// fixed offset to fingerprint (P-C5).
+    /// fixed offset to fingerprint (P-C5), per the mesh's `HeaderPlacement`.
     scramble: Scramble,
+    /// The mesh's header-placement policy (charter), kept so a re-cipher preserves it.
+    placement: crate::charter::HeaderPlacement,
     /// Outbound counter — the per-message AEAD nonce. Atomic so the run loop can
     /// seal and recv concurrently behind a shared `&MeshDataPlane`.
     send_seq: AtomicU64,
@@ -60,6 +62,7 @@ impl MeshDataPlane {
         overlay_prefix: [u8; 2],
         suite: Box<dyn MeshSuite>,
         secret: &[u8; 32],
+        placement: crate::charter::HeaderPlacement,
     ) -> Self {
         Self {
             mesh_id,
@@ -67,7 +70,8 @@ impl MeshDataPlane {
             overlay_prefix,
             suite,
             header: HeaderCrypto::new(secret, mesh_id),
-            scramble: Scramble::new(secret),
+            scramble: Scramble::new(secret, placement),
+            placement,
             send_seq: AtomicU64::new(0),
         }
     }
@@ -79,7 +83,7 @@ impl MeshDataPlane {
     pub fn recipher(&mut self, suite: Box<dyn MeshSuite>, secret: &[u8; 32]) {
         self.suite = suite;
         self.header = HeaderCrypto::new(secret, self.mesh_id);
-        self.scramble = Scramble::new(secret);
+        self.scramble = Scramble::new(secret, self.placement);
         self.send_seq.store(0, Ordering::Relaxed);
     }
 
@@ -180,7 +184,34 @@ mod tests {
 
     fn node(my_id: MemberId) -> MeshDataPlane {
         // Same mesh (id 3), same secret + epoch ⇒ same shared key.
-        MeshDataPlane::new(3, my_id, PREFIX, suite("default", &SECRET, 0), &SECRET)
+        MeshDataPlane::new(
+            3,
+            my_id,
+            PREFIX,
+            suite("default", &SECRET, 0),
+            &SECRET,
+            crate::charter::HeaderPlacement::Random,
+        )
+    }
+
+    fn node_p(my_id: MemberId, p: crate::charter::HeaderPlacement) -> MeshDataPlane {
+        MeshDataPlane::new(3, my_id, PREFIX, suite("default", &SECRET, 0), &SECRET, p)
+    }
+
+    #[test]
+    fn round_trips_under_every_header_placement() {
+        use crate::charter::HeaderPlacement::*;
+        for p in [Random, Front, Back, Fixed(0), Fixed(3), Fixed(50_000)] {
+            let alice = node_p(1, p);
+            let bob = node_p(2, p);
+            let packet = b"placement round-trip payload";
+            let frame = alice.seal_to(2, packet);
+            assert_eq!(
+                bob.recv(&frame),
+                Some((1, Inbound::Deliver(packet.to_vec()))),
+                "placement {p:?} must round-trip"
+            );
+        }
     }
 
     #[test]
@@ -207,7 +238,14 @@ mod tests {
     #[test]
     fn other_mesh_frame_is_dropped() {
         let alice = node(1);
-        let other_mesh = MeshDataPlane::new(9, 2, PREFIX, suite("default", &SECRET, 0), &SECRET);
+        let other_mesh = MeshDataPlane::new(
+            9,
+            2,
+            PREFIX,
+            suite("default", &SECRET, 0),
+            &SECRET,
+            crate::charter::HeaderPlacement::Random,
+        );
         let frame = alice.seal_to(2, b"x");
         assert_eq!(other_mesh.recv(&frame), None); // mesh id mismatch (header won't open)
     }
@@ -230,8 +268,14 @@ mod tests {
         // the frame head does not parse as a plaintext header.
         assert_ne!(frame[0], wire_v2::VERSION);
         // A non-member (different secret) can't open the header ⇒ recovers nothing.
-        let outsider =
-            MeshDataPlane::new(3, 2, PREFIX, suite("default", &[7u8; 32], 0), &[7u8; 32]);
+        let outsider = MeshDataPlane::new(
+            3,
+            2,
+            PREFIX,
+            suite("default", &[7u8; 32], 0),
+            &[7u8; 32],
+            crate::charter::HeaderPlacement::Random,
+        );
         assert_eq!(outsider.recv(&frame), None);
     }
 

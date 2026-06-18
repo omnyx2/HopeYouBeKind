@@ -563,6 +563,7 @@ mod tests {
             [100, 80],
             suite("default", &[42u8; 32], 0),
             &[42u8; 32],
+            lattice_mesh::charter::HeaderPlacement::Random,
         )
     }
 

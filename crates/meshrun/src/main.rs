@@ -57,7 +57,14 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var("EXIT_NODE").as_deref() == Ok("1") {
         enable_exit_nat(prefix, mesh);
     }
-    let dp = MeshDataPlane::new(mesh, my, prefix, suite("default", &secret, 0), &secret);
+    let dp = MeshDataPlane::new(
+        mesh,
+        my,
+        prefix,
+        suite("default", &secret, 0),
+        &secret,
+        lattice_mesh::charter::HeaderPlacement::Random,
+    );
     let links = lattice_meshrun::seed_links(endpoints);
     let exit = std::sync::Arc::new(std::sync::Mutex::new(exit));
     // This node's own reachable address. ADVERTISE= pins it (a known public node);

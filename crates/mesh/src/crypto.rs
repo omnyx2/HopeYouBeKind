@@ -268,10 +268,11 @@ impl HeaderCrypto {
 pub struct Scramble {
     secret: [u8; 32],
     seq_mask: [u8; 8],
+    placement: crate::charter::HeaderPlacement,
 }
 
 impl Scramble {
-    pub fn new(secret: &[u8; 32]) -> Self {
+    pub fn new(secret: &[u8; 32], placement: crate::charter::HeaderPlacement) -> Self {
         let mut h = Blake2s256::new();
         h.update(b"lattice-seq-mask-v1");
         h.update(secret);
@@ -281,6 +282,7 @@ impl Scramble {
         Self {
             secret: *secret,
             seq_mask,
+            placement,
         }
     }
 
@@ -293,16 +295,26 @@ impl Scramble {
         b
     }
 
-    /// Where to splice the sealed header into the body: a per-mesh, per-frame offset
-    /// in `0..=body_len` (so the header can land before, inside, or after the body).
+    /// Where to splice the sealed header into the body, in `0..=body_len`, per the mesh's
+    /// [`HeaderPlacement`](crate::charter::HeaderPlacement): `Random` (default) is the
+    /// secret-derived per-frame float; the others pin a deterministic position. Both ends
+    /// share the policy via the charter, so they always agree.
     pub fn header_offset(&self, seq: u64, body_len: usize) -> usize {
-        let mut h = Blake2s256::new();
-        h.update(b"lattice-scramble-off-v1");
-        h.update(self.secret);
-        h.update(seq.to_be_bytes());
-        let d = h.finalize();
-        let v = u64::from_be_bytes(d[..8].try_into().unwrap());
-        (v % (body_len as u64 + 1)) as usize
+        use crate::charter::HeaderPlacement::*;
+        match self.placement {
+            Random => {
+                let mut h = Blake2s256::new();
+                h.update(b"lattice-scramble-off-v1");
+                h.update(self.secret);
+                h.update(seq.to_be_bytes());
+                let d = h.finalize();
+                let v = u64::from_be_bytes(d[..8].try_into().unwrap());
+                (v % (body_len as u64 + 1)) as usize
+            }
+            Front => 0,
+            Back => body_len,
+            Fixed(n) => (n as usize).min(body_len),
+        }
     }
 }
 
@@ -446,7 +458,7 @@ mod tests {
 
     #[test]
     fn scramble_seq_mask_round_trips() {
-        let s = Scramble::new(&SECRET);
+        let s = Scramble::new(&SECRET, crate::charter::HeaderPlacement::Random);
         let seq = 42u64.to_be_bytes();
         let masked = s.mask_seq(seq);
         assert_ne!(masked, seq); // actually masked
@@ -455,7 +467,7 @@ mod tests {
 
     #[test]
     fn scramble_offset_in_range_and_deterministic() {
-        let s = Scramble::new(&SECRET);
+        let s = Scramble::new(&SECRET, crate::charter::HeaderPlacement::Random);
         for (seq, blen) in [(0u64, 0usize), (1, 10), (1000, 100), (5, 21)] {
             let off = s.header_offset(seq, blen);
             assert!(off <= blen);

@@ -19,7 +19,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use lattice_mesh::charter::{ExpelPolicy, GenesisCharter, InviteTopology, RecipherTrigger};
+use lattice_mesh::charter::{
+    ExpelPolicy, GenesisCharter, HeaderPlacement, InviteTopology, RecipherTrigger,
+};
 use lattice_mesh::crypto::suite;
 use lattice_mesh::dataplane::MeshDataPlane;
 use lattice_mesh::ipc::{
@@ -269,6 +271,7 @@ struct Bringup {
     my_endpoint: SharedEndpoint,
     decrypt_fails: DecryptFails,
     traffic: SharedTraffic,
+    header_placement: HeaderPlacement,
 }
 
 fn now_ms() -> u64 {
@@ -482,6 +485,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
+        header_placement: mesh.charter.header_placement,
     };
     let ms = MeshState {
         mesh,
@@ -958,6 +962,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         b.prefix,
         suite(&b.cipher, &b.secret, b.epoch),
         &b.secret,
+        b.header_placement,
     );
     // Record the TUN name (needed to divert the default route for full-tunnel) and
     // make this node able to serve as an exit for others — ip_forward + NAT, which
@@ -1455,6 +1460,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             self_destruct,
             master_gated,
             expel,
+            header,
         } => create_mesh(
             st,
             name,
@@ -1464,6 +1470,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             self_destruct,
             master_gated,
             expel,
+            header,
         ),
 
         Request::ExpelMember { mesh, member } => expel_member(st, mesh, member),
@@ -2086,6 +2093,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
+        header_placement: mesh.charter.header_placement,
     });
     st.meshes.insert(
         invite.mesh_id,
@@ -2130,6 +2138,7 @@ fn create_mesh(
     self_destruct: Option<bool>,
     master_gated: Option<bool>,
     expel: Option<String>,
+    header: Option<String>,
 ) -> (Response, Option<PostAction>) {
     // The mesh id is the real key, but a human picks a mesh by NAME and the GUI lists
     // meshes by name — so two same-named meshes render as indistinguishable "peer" rows
@@ -2173,6 +2182,11 @@ fn create_mesh(
         Ok(p) => p,
         Err(e) => return (err(&e), None),
     };
+    // Header-placement (P-C5) policy — where the sealed header sits; default random.
+    let header_placement = match parse_header_placement(header.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return (err(&e), None),
+    };
     let master = MasterKey::generate();
     let my_key = MemberKey::generate();
     let charter = GenesisCharter {
@@ -2192,6 +2206,7 @@ fn create_mesh(
             lattice_mesh::charter::SelfDestruct::Off
         },
         expel,
+        header_placement,
     };
     if let Err(e) = charter.validate() {
         return (err(&e.to_string()), None);
@@ -2222,6 +2237,7 @@ fn create_mesh(
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
+        header_placement: mesh.charter.header_placement,
     });
     st.meshes.insert(
         id,
@@ -2497,6 +2513,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
         warnings,
         network_fp: fp(&ch.master_pubkey),
         expel: expel_name(ch.expel),
+        header_placement: header_placement_name(ch.header_placement),
     }
 }
 
@@ -2623,6 +2640,39 @@ fn parse_expel(s: Option<&str>) -> Result<ExpelPolicy, String> {
             }
         },
     })
+}
+
+/// Parse the `header` placement name (CreateMesh) into a [`HeaderPlacement`]. `None`/""
+/// ⇒ `Random` (the secret-derived per-frame float, the secure default); `fixed:N` pins a
+/// byte offset.
+fn parse_header_placement(s: Option<&str>) -> Result<HeaderPlacement, String> {
+    let s = s.map(|x| x.trim().to_ascii_lowercase()).unwrap_or_default();
+    Ok(match s.as_str() {
+        "" | "random" | "float" | "scramble" => HeaderPlacement::Random,
+        "front" | "head" | "start" => HeaderPlacement::Front,
+        "back" | "tail" | "end" => HeaderPlacement::Back,
+        other => match other
+            .strip_prefix("fixed:")
+            .and_then(|n| n.parse::<u16>().ok())
+        {
+            Some(n) => HeaderPlacement::Fixed(n),
+            None => {
+                return Err(format!(
+                    "unknown header placement '{other}' (random|front|back|fixed:N)"
+                ))
+            }
+        },
+    })
+}
+
+/// Human name of a header-placement policy (MeshInfo display).
+fn header_placement_name(p: HeaderPlacement) -> String {
+    match p {
+        HeaderPlacement::Random => "random (P-C5 float)".into(),
+        HeaderPlacement::Front => "front".into(),
+        HeaderPlacement::Back => "back".into(),
+        HeaderPlacement::Fixed(n) => format!("fixed:{n}"),
+    }
 }
 
 /// Human name of an expel policy (MeshInfo display).

@@ -71,6 +71,25 @@ pub enum ExpelPolicy {
     None,
 }
 
+/// **Where the sealed wire header sits inside a frame** (P-C5) — the explicit knob over
+/// the header-position permutation, fixed at genesis. The default keeps the
+/// secret-derived per-frame float (unfingerprintable); the others let an operator pin a
+/// deterministic position (e.g. for debugging, or a fixed-layout middlebox).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum HeaderPlacement {
+    /// P-C5 default: a per-frame, secret-derived offset (`Blake2s(secret,seq) % (body+1)`).
+    /// Nothing sits at a constant position, so the wire can't be fingerprinted by header
+    /// offset. Recommended.
+    #[default]
+    Random,
+    /// Always at the front of the body (offset 0) — classic/legacy layout, fingerprintable.
+    Front,
+    /// Always at the back (offset = body length).
+    Back,
+    /// A fixed byte offset into the body, clamped to the body length.
+    Fixed(u16),
+}
+
 /// The 1-byte id space caps any mesh at 254 members (`0`/`255` reserved).
 pub const MAX_MEMBERS_CEILING: u8 = 254;
 
@@ -97,6 +116,10 @@ pub struct GenesisCharter {
     /// `CreatorOnly` for older charters that predate the field.
     #[serde(default)]
     pub expel: ExpelPolicy,
+    /// Where the sealed wire header sits in a frame (P-C5). `#[serde(default)]` ⇒ `Random`
+    /// (the secret-derived per-frame float) for older charters.
+    #[serde(default)]
+    pub header_placement: HeaderPlacement,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -142,6 +165,7 @@ mod tests {
             overlay_prefix: [100, 80],
             self_destruct: SelfDestruct::Off,
             expel: ExpelPolicy::CreatorOnly,
+            header_placement: HeaderPlacement::Random,
         }
     }
 

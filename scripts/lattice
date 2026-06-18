@@ -126,6 +126,7 @@ def cmd_info(sock, a):
     print(f"  cipher     {d['cipher']}   epoch {d['epoch']}")
     print(f"  charter    {d['invite']} · {d['trigger']} · max {d['max_members']} · {sd}")
     print(f"  expel      {d.get('expel', '?')}")
+    print(f"  header     {d.get('header_placement', '?')}")
     print(f"  health     {d['live']}/{len(d['members'])} live · floor {d['threshold']}")
     if d.get("attack_armed_secs_left") is not None:
         print(f"  ⚠ ATTACK   self-destruct in {d['attack_armed_secs_left']}s "
@@ -150,7 +151,7 @@ def cmd_new(sock, a):
     req = {"CreateMesh": {
         "name": a.name, "my_name": a.me, "max_members": a.max,
         "cipher": a.cipher, "self_destruct": a.ephemeral,
-        "master_gated": a.master_gated, "expel": a.expel}}
+        "master_gated": a.master_gated, "expel": a.expel, "header": a.header}}
     r = call(sock, req)
     mid = r["MeshCreated"]["mesh"]
     print(f"created mesh #{mid} '{a.name}' — you are '{a.me}'.")
@@ -391,6 +392,8 @@ def build_parser():
                    help="only the creator may invite (default: any member can — open-chain)")
     s.add_argument("--expel", default=None,
                    help="who may expel a member: creator (default) | inviter | quorum[:k] | none")
+    s.add_argument("--header", default=None,
+                   help="header placement (P-C5): random (default) | front | back | fixed:N")
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("id", help="mint an identity code to hand to a mesh host")
