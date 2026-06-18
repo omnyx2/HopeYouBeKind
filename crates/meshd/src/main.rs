@@ -1245,6 +1245,16 @@ fn spawn_netchange_watcher(state: Arc<Mutex<State>>) {
                 .await
                 .ok()
                 .flatten();
+            // `None` means either full-tunnel has diverted the default route through our own
+            // mesh tun (the gateway is then a link/interface, not an IP — see
+            // `macos_default_gateway`) or there is momentarily no network. Either way there is
+            // no *physical* gateway to re-pin to, and self-healing here would fight the
+            // full-tunnel route the kill-switch already manages. Idle until a real underlay
+            // gateway reappears (full-tunnel off, or roamed onto a new network), keeping the
+            // last physical gateway so a later toggle back to it is a no-op, not a false change.
+            let Some(_) = gw else {
+                continue;
+            };
             if gw == last_gw {
                 continue;
             }

@@ -102,6 +102,12 @@ fn macos_default_gateway() -> Option<String> {
         l.trim()
             .strip_prefix("gateway:")
             .map(|g| g.trim().to_string())
+            // Only a real next-hop IP counts. When full-tunnel diverts the default route
+            // through our own mesh tun, `route get default` reports the gateway as an
+            // interface/link (e.g. `index: 21 utun6`), NOT an IP — that is *our own*
+            // tunnel, not a physical network change, so it must not trigger self-healing
+            // (otherwise the netchange watcher fights the full-tunnel route it set).
+            .filter(|g| g.parse::<std::net::IpAddr>().is_ok())
     })
 }
 
