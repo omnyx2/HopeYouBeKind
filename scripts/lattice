@@ -17,18 +17,36 @@ Quick start:
     lattice vpn home                     # route ALL traffic through that exit
     lattice off                          # back to direct internet
 
+Headless server (no GUI to run the daemon):
+    lattice install                      # put `lattice` on PATH (/usr/local/bin)
+    sudo lattice up                      # start meshd in the background (needs root)
+    lattice status [--watch 2]           # daemon health + meshes/exit/traffic
+    lattice logs -f                      # follow the daemon log
+    sudo lattice install-service --advertise <ip>:41000   # start at boot (systemd)
+    lattice serve-exit home              # make THIS node the mesh's internet exit
+    ssh joiner lattice id | lattice invite home bob -      # pipe the invite flow
+    lattice down                         # stop the daemon cleanly (no sudo)
+
 The socket defaults to $LATTICE_SOCK or /tmp/lattice-meshd.sock
-(Windows: \\.\pipe\lattice-meshd — use --sock to override).
+(Windows: \\.\pipe\lattice-meshd — use --sock to override). The daemon log
+defaults to $LATTICE_LOG or /tmp/lattice-meshd.log.
 """
 
 import argparse
 import base64
 import json
 import os
+import platform
+import shutil
 import socket
+import subprocess
 import sys
+import time
 
 DEFAULT_SOCK = os.environ.get("LATTICE_SOCK", "/tmp/lattice-meshd.sock")
+DEFAULT_LOG = os.environ.get("LATTICE_LOG", "/tmp/lattice-meshd.log")
+SERVICE_NAME = "lattice-meshd"
+SERVICE_UNIT = f"/etc/systemd/system/{SERVICE_NAME}.service"
 
 
 # ----------------------------- transport -----------------------------
@@ -71,6 +89,23 @@ def unb64(s):
         return json.loads(base64.urlsafe_b64decode(s.strip().encode()))
     except Exception as e:
         die(f"malformed code: {e}")
+
+
+def read_code(arg):
+    """A code argument of '-' (or omitted via stdin pipe) is read from stdin — so
+    codes can be piped between machines: `ssh joiner lattice id | lattice invite m bob -`."""
+    if arg == "-":
+        data = sys.stdin.read().strip()
+        if not data:
+            die("expected a code on stdin (got nothing).")
+        # Take the last non-comment line (lattice id/invite print hints to stderr, code to stdout,
+        # but if both were captured, the code is the last bare token).
+        for line in reversed(data.splitlines()):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line
+        die("no code found on stdin.")
+    return arg
 
 
 def resolve_mesh(sock, ref):
@@ -168,7 +203,7 @@ def cmd_id(sock, a):
 
 def cmd_invite(sock, a):
     mid = resolve_mesh(sock, a.mesh)
-    ident = unb64(a.id_code)
+    ident = unb64(read_code(a.id_code))
     req = {"CreateInvite": {
         "mesh": mid, "name": a.name,
         "member_pubkey_hex": ident["member_pubkey_hex"],
@@ -184,7 +219,7 @@ def cmd_invite(sock, a):
 
 
 def cmd_join(sock, a):
-    inv = unb64(a.invite_code)
+    inv = unb64(read_code(a.invite_code))
     req = {"JoinMesh": {"invite": inv}}
     if a.algo:
         req["JoinMesh"]["algo"] = a.algo
@@ -439,6 +474,286 @@ def cmd_doctor(sock, a):
         print("\n모든 mesh 정상입니다.")
 
 
+# ============================ server / daemon lifecycle ============================
+# A headless server (no GUI to spawn meshd) drives the daemon entirely from here.
+
+def _is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _script_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_meshd():
+    """Locate the meshd binary. Order: $LATTICE_MESHD, repo build dirs, installed app,
+    then PATH. Returns an absolute path or None."""
+    env = os.environ.get("LATTICE_MESHD")
+    if env and os.path.exists(env):
+        return os.path.abspath(env)
+    repo = os.path.dirname(_script_dir())  # scripts/ -> repo root
+    candidates = [
+        os.path.join(repo, "target", "release", "meshd"),
+        os.path.join(repo, "target", "debug", "meshd"),
+        os.path.join(repo, "gui", "src-tauri", "resources", "meshd"),
+        "/Applications/Lattice.app/Contents/Resources/resources/meshd",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return shutil.which("meshd")
+
+
+def daemon_running(sock_path):
+    """True if a daemon answers on the socket (a stale socket file → False)."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(sock_path)
+        s.sendall(b'"ListMeshes"\n')
+        s.recv(64)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def wait_for_socket(sock_path, secs=20):
+    for _ in range(secs * 2):
+        if daemon_running(sock_path):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _meshd_env(a):
+    """Build the environment overrides meshd reads, from `up`/service flags."""
+    env = {"DATA_PLANE": "1"}
+    if getattr(a, "advertise", None):
+        env["MESHD_ADVERTISE"] = a.advertise
+    if getattr(a, "no_dht", False):
+        env["MESHD_DHT"] = "0"
+    if getattr(a, "state_dir", None):
+        env["MESHD_STATE_DIR"] = a.state_dir
+    if getattr(a, "dht_port", None):
+        env["MESHD_DHT_PORT"] = str(a.dht_port)
+    return env
+
+
+def cmd_up(sock, a):
+    if daemon_running(sock):
+        print(f"daemon already running on {sock} — `lattice status` to inspect.")
+        return
+    meshd = a.meshd or find_meshd()
+    if not meshd:
+        die("meshd binary not found. Build it (`cargo build --release -p lattice-meshd`) "
+            "or pass --meshd PATH / set $LATTICE_MESHD.")
+    env = _meshd_env(a)
+    # meshd needs root for the TUN/route plumbing; re-launch under sudo if we aren't root.
+    argv = [meshd, sock]
+    if a.foreground:
+        full = ([] if _is_root() else ["sudo"]) + \
+            (["env"] + [f"{k}={v}" for k, v in env.items()] if not _is_root() else []) + argv
+        run_env = dict(os.environ)
+        if _is_root():
+            run_env.update(env)
+        print(f"starting meshd (foreground): {' '.join(full)}")
+        os.execvpe(full[0], full, run_env)  # replaces this process; Ctrl-C to stop
+        return
+    # Background: detach, redirect to the log, poll the socket until it answers.
+    log = open(a.log, "a")
+    if _is_root():
+        run_env = dict(os.environ); run_env.update(env)
+        popen_args = argv
+    else:
+        # `sudo env K=V meshd sock` so the elevated process inherits our overrides.
+        run_env = None
+        popen_args = ["sudo", "env"] + [f"{k}={v}" for k, v in env.items()] + argv
+    print(f"starting meshd: {' '.join(popen_args)}")
+    print(f"  log: {a.log}")
+    if not _is_root():
+        print("  (sudo may prompt for your password — meshd needs root for the TUN)")
+    subprocess.Popen(popen_args, env=run_env, stdout=log, stderr=log,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    if wait_for_socket(sock):
+        n = len(call(sock, "ListMeshes").get("Meshes", []))
+        print(f"daemon UP on {sock} — {n} mesh(es). `lattice status` for details.")
+    else:
+        die(f"daemon did not come up within 20s — check the log: {a.log}")
+
+
+def cmd_down(sock, a):
+    if not daemon_running(sock):
+        print("daemon is not running (nothing to stop).")
+        return
+    try:
+        call(sock, "Shutdown")
+    except SystemExit:
+        pass  # the daemon closes the connection as it exits — expected
+    # Confirm it actually went away.
+    for _ in range(10):
+        if not daemon_running(sock):
+            print("daemon stopped (data-plane TUN/ports freed).")
+            return
+        time.sleep(0.5)
+    print("shutdown requested, but the socket is still answering — check `lattice status`.")
+
+
+def cmd_restart(sock, a):
+    cmd_down(sock, a)
+    time.sleep(1)
+    cmd_up(sock, a)
+
+
+def _render_status(sock, a):
+    up = daemon_running(sock)
+    print(f"daemon    {'UP' if up else 'DOWN'}   socket {sock}")
+    meshd = a.meshd or find_meshd()
+    print(f"binary    {meshd or 'not found'}")
+    print(f"log       {a.log}")
+    if not up:
+        print("\nstart it with `lattice up` (server) — needs root for the TUN.")
+        return
+    meshes = call(sock, "ListMeshes").get("Meshes", [])
+    pol = call(sock, "GetPolicy").get("Policy", {})
+    print(f"egress    {pol.get('default', '?')}")
+    print(f"meshes    {len(meshes)}")
+    for m in meshes:
+        exit_s = f"exit #{m['exit']}" if m.get("exit") is not None else "no-exit"
+        cur = " ← egress" if m.get("is_current") else ""
+        atk = " ⚠ATTACK" if m.get("attack_armed_secs_left") is not None else ""
+        print(f"  #{m['id']:<2} {m['name']:<16} {m['members']} members · {exit_s}{cur}{atk}")
+    t = call(sock, {"TrafficStats": {"mesh": None}}).get("Traffic", {})
+    print(f"traffic   ↓ {t.get('rx_bytes', 0)}B/{t.get('rx_pkts', 0)}  "
+          f"↑ {t.get('tx_bytes', 0)}B/{t.get('tx_pkts', 0)}")
+
+
+def cmd_status(sock, a):
+    if not a.watch:
+        _render_status(sock, a)
+        return
+    try:
+        while True:
+            # Clear screen + home cursor for a stable live view.
+            sys.stdout.write("\033[2J\033[H")
+            print(f"lattice status — every {a.watch}s (Ctrl-C to stop)\n")
+            _render_status(sock, a)
+            sys.stdout.flush()
+            time.sleep(a.watch)
+    except KeyboardInterrupt:
+        return
+
+
+def cmd_logs(sock, a):
+    if not os.path.exists(a.log):
+        die(f"no log at {a.log} (set $LATTICE_LOG or --log if meshd logs elsewhere).")
+    if a.follow:
+        try:
+            os.execvp("tail", ["tail", "-n", str(a.lines), "-f", a.log])
+        except OSError as e:
+            die(f"could not tail: {e}")
+    else:
+        with open(a.log) as f:
+            tail = f.readlines()[-a.lines:]
+        sys.stdout.write("".join(tail))
+
+
+def cmd_serve_exit(sock, a):
+    """Make THIS node the internet exit for a mesh (the typical server role)."""
+    mid = resolve_mesh(sock, a.mesh)
+    d = call(sock, {"MeshInfo": {"mesh": mid}})["Mesh"]
+    me = next((mb for mb in d["members"] if mb.get("is_me")), None)
+    if not me:
+        die("could not find this node in the mesh roster.")
+    call(sock, {"SetExit": {"mesh": mid, "exit": me["id"]}})
+    print(f"this node (#{me['id']} {me['name']}) is now the exit for mesh '{d['name']}'.")
+    print("  NAT + ip-forwarding are enabled automatically while the data plane is up.")
+    adv = os.environ.get("MESHD_ADVERTISE")
+    if a.advertise:
+        print(f"  NOTE: advertise is a daemon-start setting. To pin your public address,")
+        print(f"        restart with it:  lattice restart --advertise {a.advertise}")
+        print(f"        (or bake it into the service: lattice install-service --advertise {a.advertise})")
+    elif not adv:
+        print("  TIP: behind NAT, peers learn your public address via DHT/reflection. For a")
+        print("       stable public exit, pin it: `lattice restart --advertise <ip>:<port>`.")
+    print(f"  peers route through you with:  lattice exit {d['name']} {me['name']}  then  lattice vpn {d['name']}")
+
+
+def cmd_install_service(sock, a):
+    """Install a systemd unit so meshd starts at boot (Linux servers)."""
+    if platform.system() != "Linux":
+        die("install-service targets systemd (Linux). On macOS use the GUI app or "
+            "`lattice up`. On Windows, the installer registers a service.")
+    if not _is_root():
+        die("install-service writes /etc/systemd and must run as root (use sudo).")
+    meshd = a.meshd or find_meshd()
+    if not meshd:
+        die("meshd binary not found — pass --meshd PATH or set $LATTICE_MESHD.")
+    env = _meshd_env(a)
+    env_lines = "\n".join(f'Environment="{k}={v}"' for k, v in env.items())
+    unit = f"""[Unit]
+Description=Lattice mesh VPN daemon (meshd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+{env_lines}
+ExecStart={meshd} {sock}
+Restart=always
+RestartSec=3
+# meshd manages TUN + routes — needs full privileges.
+User=root
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open(SERVICE_UNIT, "w") as f:
+        f.write(unit)
+    print(f"wrote {SERVICE_UNIT}")
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", SERVICE_NAME], check=False)
+    print(f"enabled + started {SERVICE_NAME}. Manage it with:")
+    print(f"  systemctl status {SERVICE_NAME}   ·   journalctl -u {SERVICE_NAME} -f")
+    print(f"  lattice status   ·   lattice down (or systemctl stop {SERVICE_NAME})")
+
+
+def cmd_uninstall_service(sock, a):
+    if platform.system() != "Linux":
+        die("no systemd service to remove on this platform.")
+    if not _is_root():
+        die("uninstall-service must run as root (use sudo).")
+    subprocess.run(["systemctl", "disable", "--now", SERVICE_NAME], check=False)
+    if os.path.exists(SERVICE_UNIT):
+        os.remove(SERVICE_UNIT)
+        print(f"removed {SERVICE_UNIT}")
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    print(f"{SERVICE_NAME} uninstalled.")
+
+
+def cmd_install(sock, a):
+    """Put `lattice` on PATH so you can run it from anywhere."""
+    target = a.prefix
+    dest = os.path.join(target, "lattice")
+    src = os.path.abspath(__file__)
+    if not os.access(target, os.W_OK):
+        die(f"{target} is not writable — re-run with sudo, or pass --prefix DIR.")
+    try:
+        if os.path.lexists(dest):
+            os.remove(dest)
+        if a.copy:
+            shutil.copy2(src, dest)
+            os.chmod(dest, 0o755)
+            print(f"copied lattice -> {dest}")
+        else:
+            os.symlink(src, dest)
+            print(f"symlinked {dest} -> {src}")
+    except OSError as e:
+        die(f"install failed: {e}")
+    print(f"run it from anywhere now:  lattice status")
+
+
 def cmd_raw(sock, a):
     req = json.loads(a.json)
     print(json.dumps(call(sock, req), indent=2))
@@ -480,12 +795,12 @@ def build_parser():
     s = sub.add_parser("invite", help="(host) mint an invite for a joiner's identity code")
     s.add_argument("mesh", help="mesh id or name")
     s.add_argument("name", help="the joiner's in-mesh name")
-    s.add_argument("id_code", help="the joiner's identity code (from `lattice id`)")
+    s.add_argument("id_code", help="the joiner's identity code (from `lattice id`); '-' = read stdin")
     s.add_argument("--algo", default=None, help="invite-wrap algorithm (secrecy; see `lattice algos`)")
     s.set_defaults(fn=cmd_invite)
 
     s = sub.add_parser("join", help="join a mesh from an invite code")
-    s.add_argument("invite_code", help="the invite code (from the host's `lattice invite`)")
+    s.add_argument("invite_code", help="the invite code (from the host's `lattice invite`); '-' = read stdin")
     s.add_argument("--algo", default=None, help="invite-wrap algorithm the host used")
     s.set_defaults(fn=cmd_join)
 
@@ -534,6 +849,60 @@ def build_parser():
     s = sub.add_parser("rm", help="wipe a mesh from this computer")
     s.add_argument("mesh", help="mesh id or name")
     s.set_defaults(fn=cmd_rm)
+
+    # -------- server / daemon lifecycle (headless machines) --------
+    def add_meshd_flags(sp):
+        sp.add_argument("--meshd", default=None, help="path to the meshd binary (else auto-detect)")
+        sp.add_argument("--advertise", default=None, metavar="IP:PORT",
+                        help="pin this node's public address (exit/public node)")
+        sp.add_argument("--state-dir", dest="state_dir", default=None,
+                        help="persistence dir (default ~/.lattice/meshd)")
+        sp.add_argument("--dht-port", dest="dht_port", type=int, default=None, help="DHT UDP port")
+        sp.add_argument("--no-dht", dest="no_dht", action="store_true", help="disable DHT rendezvous")
+        sp.add_argument("--log", default=DEFAULT_LOG, help=f"daemon log file (default {DEFAULT_LOG})")
+
+    s = sub.add_parser("up", help="start meshd in the background (headless server)")
+    add_meshd_flags(s)
+    s.add_argument("--foreground", action="store_true", help="run in this terminal (Ctrl-C to stop)")
+    s.set_defaults(fn=cmd_up)
+
+    s = sub.add_parser("down", help="stop the daemon cleanly (no sudo; = shutdown)")
+    s.set_defaults(fn=cmd_down)
+
+    s = sub.add_parser("restart", help="stop then start the daemon")
+    add_meshd_flags(s)
+    s.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_restart)
+
+    s = sub.add_parser("status", help="one-line daemon health + mesh/exit/traffic summary")
+    s.add_argument("--meshd", default=None, help=argparse.SUPPRESS)
+    s.add_argument("--log", default=DEFAULT_LOG, help=argparse.SUPPRESS)
+    s.add_argument("--watch", type=int, default=0, metavar="SECS", help="redraw every SECS seconds")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("logs", help="show the daemon log (-f to follow)")
+    s.add_argument("-f", "--follow", action="store_true", help="follow new lines (tail -f)")
+    s.add_argument("-n", "--lines", type=int, default=80, help="lines to show (default 80)")
+    s.add_argument("--log", default=DEFAULT_LOG, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_logs)
+
+    s = sub.add_parser("serve-exit", help="make THIS node the internet exit for a mesh")
+    s.add_argument("mesh", help="mesh id or name")
+    s.add_argument("--advertise", default=None, metavar="IP:PORT",
+                   help="your public address (reminds you to pin it on restart)")
+    s.set_defaults(fn=cmd_serve_exit)
+
+    s = sub.add_parser("install-service", help="install a systemd unit so meshd starts at boot (Linux)")
+    add_meshd_flags(s)
+    s.set_defaults(fn=cmd_install_service)
+
+    s = sub.add_parser("uninstall-service", help="remove the systemd unit (Linux)")
+    s.set_defaults(fn=cmd_uninstall_service)
+
+    s = sub.add_parser("install", help="put `lattice` on PATH (symlink, or --copy)")
+    s.add_argument("--prefix", default="/usr/local/bin", help="install dir (default /usr/local/bin)")
+    s.add_argument("--copy", action="store_true", help="copy instead of symlink")
+    s.set_defaults(fn=cmd_install)
 
     s = sub.add_parser("shutdown", help="cleanly stop the daemon (no sudo)")
     s.set_defaults(fn=cmd_shutdown)
