@@ -482,7 +482,9 @@ def _is_root():
 
 
 def _script_dir():
-    return os.path.dirname(os.path.abspath(__file__))
+    # realpath (not abspath) so a /usr/local/bin/lattice **symlink** resolves back to the
+    # repo, where find_meshd() looks for target/release/meshd next to scripts/.
+    return os.path.dirname(os.path.realpath(__file__))
 
 
 def find_meshd():
