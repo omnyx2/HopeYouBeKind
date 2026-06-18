@@ -68,6 +68,12 @@ pub enum Request {
     ListMeshes,
     /// Full detail for one mesh.
     MeshInfo { mesh: MeshId },
+    /// Live traffic for the monitor: `Some(mesh)` = that mesh, `None` = this whole
+    /// computer (all meshes aggregated). Per-peer byte/packet totals + recent overlay flows.
+    TrafficStats {
+        #[serde(default)]
+        mesh: Option<MeshId>,
+    },
     /// Admit a member to a mesh — skeleton/demo populate; the real cert-based
     /// invite lands with the membership layer.
     AdmitMember {
@@ -158,6 +164,7 @@ pub enum Response {
     },
     Meshes(Vec<MeshSummary>),
     Mesh(MeshDetail),
+    Traffic(TrafficView),
     Policy(PolicyView),
     /// A freshly minted identity's public keys + mint time (from `NewIdentity`).
     Identity {
@@ -307,6 +314,51 @@ pub struct MeshDetail {
     /// "quorum(k=2)" / "none". Fixed at genesis; shown so members know the rule.
     #[serde(default)]
     pub expel: String,
+}
+
+/// Live traffic for the monitor — totals + per-peer rows (summary view A) + recent overlay
+/// flows (detail view B). For the whole-computer view, rows/flows carry their mesh.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TrafficView {
+    pub rx_bytes: u64,
+    pub rx_pkts: u64,
+    pub tx_bytes: u64,
+    pub tx_pkts: u64,
+    pub peers: Vec<PeerTrafficView>,
+    pub recent: Vec<FlowView>,
+}
+
+/// One peer's byte/packet totals (summary view A).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerTrafficView {
+    pub mesh: MeshId,
+    pub mesh_name: String,
+    pub id: MemberId,
+    pub name: String,
+    pub rx_bytes: u64,
+    pub rx_pkts: u64,
+    pub tx_bytes: u64,
+    pub tx_pkts: u64,
+}
+
+/// One recorded overlay packet (detail view B): when, direction, peer, 5-tuple, exit flag.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FlowView {
+    pub at_ms: u64,
+    /// true = this computer sent it; false = received it.
+    pub out: bool,
+    pub mesh: MeshId,
+    pub mesh_name: String,
+    pub member: MemberId,
+    pub member_name: String,
+    pub src: String,
+    pub dst: String,
+    /// "tcp" | "udp" | "icmp" | "proto N".
+    pub proto: String,
+    pub sport: u16,
+    pub dport: u16,
+    pub bytes: u16,
+    pub via_exit: bool,
 }
 
 /// The routing policy summary (§1).

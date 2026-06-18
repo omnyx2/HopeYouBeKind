@@ -230,6 +230,32 @@ def cmd_allclear(sock, a):
     print(f"all-clear sent for mesh {mid} — self-destruct cancelled.")
 
 
+def _fmt_bytes(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return f"{n:.0f}{u}" if u == "B" else f"{n/1:.0f}{u}" if False else f"{n:.1f}{u}"
+        n /= 1024
+
+
+def cmd_traffic(sock, a):
+    req = {"TrafficStats": {"mesh": resolve_mesh(sock, a.mesh) if a.mesh else None}}
+    t = call(sock, req)["Traffic"]
+    scope = f"mesh {a.mesh}" if a.mesh else "this computer (all meshes)"
+    print(f"traffic — {scope}")
+    print(f"  total   ↓ {t['rx_bytes']}B / {t['rx_pkts']} pkts   ↑ {t['tx_bytes']}B / {t['tx_pkts']} pkts")
+    print("  peers:")
+    for p in t["peers"]:
+        tag = f"[{p['mesh_name']}] " if not a.mesh else ""
+        print(f"    {tag}{p['name']} #{p['id']}   ↓ {p['rx_bytes']}B/{p['rx_pkts']}   ↑ {p['tx_bytes']}B/{p['tx_pkts']}")
+    if a.detail:
+        print("  recent flows (newest first):")
+        for f in t["recent"][:40]:
+            arrow = "↑out" if f["out"] else "↓in "
+            port = f":{f['sport']}→{f['dport']}" if f["sport"] or f["dport"] else ""
+            ex = " via-exit" if f["via_exit"] else ""
+            print(f"    {arrow} {f['proto']} {f['src']}→{f['dst']}{port} {f['bytes']}B  ({f['member_name']}){ex}")
+
+
 def cmd_expel(sock, a):
     mid = resolve_mesh(sock, a.mesh)
     eid = resolve_member(sock, mid, a.member)
@@ -394,6 +420,11 @@ def build_parser():
     s = sub.add_parser("allclear", help="(creator) cancel an attack alert")
     s.add_argument("mesh", help="mesh id or name")
     s.set_defaults(fn=cmd_allclear)
+
+    s = sub.add_parser("traffic", help="traffic monitor: per-peer bytes/packets (+ --detail flows)")
+    s.add_argument("mesh", nargs="?", default=None, help="mesh id/name (omit = whole computer)")
+    s.add_argument("--detail", action="store_true", help="also show recent packet flows (view B)")
+    s.set_defaults(fn=cmd_traffic)
 
     s = sub.add_parser("expel", help="expel (revoke) a member, per the mesh's expel policy")
     s.add_argument("mesh", help="mesh id or name")

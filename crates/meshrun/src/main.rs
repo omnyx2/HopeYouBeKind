@@ -80,8 +80,9 @@ async fn main() -> anyhow::Result<()> {
         pinned,
         rc_rx,
         ra_tx,
-        // The standalone runner has no supervisor to read decrypt-fail stats.
+        // The standalone runner has no supervisor to read decrypt-fail stats / traffic.
         std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        std::sync::Arc::new(std::sync::Mutex::new(lattice_meshrun::Traffic::default())),
     )
     .await;
     Ok(())

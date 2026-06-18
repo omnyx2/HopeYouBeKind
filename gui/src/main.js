@@ -186,16 +186,72 @@ async function renderPeersFor(id) {
   });
 }
 
+// ---- Traffic monitor (user = this whole computer / mesh = one mesh) ----
+// A = per-peer bytes/packets summary; press "Detail ▸" → B = recent packet flows.
+let TRAFFIC_DETAIL = { user: false, mesh: false };
+const TRAFFIC_LAST = {}; // scope:mesh → {at, rx, tx} for throughput between polls
+function fmtBytes(n) {
+  const u = ["B", "KB", "MB", "GB"]; let i = 0;
+  while (n >= 1024 && i < 3) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : n.toFixed(0)) + u[i];
+}
+async function renderTraffic(scope) {
+  const body = el(scope === "user" ? "user-traffic-body" : "mesh-traffic-body");
+  if (!body) return;
+  const meshArg = scope === "mesh" ? CURRENT_MESH : null;
+  if (scope === "mesh" && meshArg == null) return;
+  let t;
+  try { t = (await meshd({ TrafficStats: { mesh: meshArg } })).Traffic; }
+  catch (e) { body.innerHTML = `<div class="card"><p class="muted">traffic unavailable — ${esc(String(e))}</p></div>`; return; }
+  const key = scope + ":" + (meshArg ?? "all");
+  const now = Date.now(); const prev = TRAFFIC_LAST[key];
+  let dn = "", up = "";
+  if (prev && now > prev.at) {
+    const dt = (now - prev.at) / 1000;
+    dn = " · " + fmtBytes(Math.max(0, (t.rx_bytes - prev.rx) / dt)) + "/s";
+    up = " · " + fmtBytes(Math.max(0, (t.tx_bytes - prev.tx) / dt)) + "/s";
+  }
+  TRAFFIC_LAST[key] = { at: now, rx: t.rx_bytes, tx: t.tx_bytes };
+  const detail = TRAFFIC_DETAIL[scope];
+  let html = `<div class="card">
+    <div class="kv"><span>download</span><b>↓ ${fmtBytes(t.rx_bytes)} · ${t.rx_pkts} pkts<span class="muted">${dn}</span></b></div>
+    <div class="kv"><span>upload</span><b>↑ ${fmtBytes(t.tx_bytes)} · ${t.tx_pkts} pkts<span class="muted">${up}</span></b></div>
+    <div class="add-row" style="margin-top:8px"><button class="small-btn" id="${scope}-traffic-toggle">${detail ? "◂ Summary" : "Detail ▸"}</button></div>
+  </div>`;
+  if (!detail) {
+    const rows = t.peers.map((p) =>
+      `<tr>${meshArg == null ? `<td class="muted small">${esc(p.mesh_name)}</td>` : ""}` +
+      `<td>${esc(p.name)} <span class="muted small">#${p.id}</span></td>` +
+      `<td>↓ ${fmtBytes(p.rx_bytes)} / ${p.rx_pkts}</td><td>↑ ${fmtBytes(p.tx_bytes)} / ${p.tx_pkts}</td></tr>`
+    ).join("") || `<tr><td colspan="4" class="muted">no traffic yet — send something over the mesh (e.g. ping a peer's 100.80.x.y)</td></tr>`;
+    html += `<div class="card"><table class="topo-table"><thead><tr>${meshArg == null ? "<th>mesh</th>" : ""}<th>peer</th><th>down</th><th>up</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  } else {
+    const rows = t.recent.map((f) => {
+      const arrow = f.out ? '<span style="color:#e0a020">↑ out</span>' : '<span style="color:#22c55e">↓ in</span>';
+      const port = (f.sport || f.dport) ? `:${f.sport}→${f.dport}` : "";
+      const ex = f.via_exit ? ' <span class="muted small">via exit</span>' : "";
+      return `<tr><td>${arrow}</td><td class="mono small">${esc(f.proto)}</td>` +
+        `<td class="mono small">${esc(f.src)}→${esc(f.dst)}${port}</td><td>${f.bytes}B</td>` +
+        `<td class="muted small">${esc(f.member_name)}${meshArg == null ? " · " + esc(f.mesh_name) : ""}${ex}</td></tr>`;
+    }).join("") || `<tr><td colspan="5" class="muted">no packet flows recorded yet</td></tr>`;
+    html += `<div class="card"><table class="topo-table"><thead><tr><th>dir</th><th>proto</th><th>src→dst</th><th>bytes</th><th>peer</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }
+  body.innerHTML = html;
+  el(`${scope}-traffic-toggle`).onclick = () => { TRAFFIC_DETAIL[scope] = !TRAFFIC_DETAIL[scope]; renderTraffic(scope); };
+}
+
 document.querySelectorAll(".nav-item").forEach((b) =>
   b.addEventListener("click", () => {
     const tab = b.dataset.tab;
     if (tab === "meshes") return setMode("user");
     if (tab === "create-mesh") { populateCiphers(); return activateTab("create-mesh"); }
     if (tab === "join-mesh") { return activateTab("join-mesh"); }
+    if (tab === "traffic") { activateTab("traffic"); return renderTraffic("user"); }
     activateTab(tab);
     if (tab === "mesh-overview") return CURRENT_MESH != null ? renderOverview(CURRENT_MESH) : renderMeshPlain();
     if (CURRENT_MESH == null) return;
     if (tab === "mesh-topology") renderTopologyFor(CURRENT_MESH);
+    if (tab === "mesh-traffic") renderTraffic("mesh");
     if (tab === "mesh-peers") renderPeersFor(CURRENT_MESH);
     if (tab === "mesh-configs") renderConfigs(CURRENT_MESH);
     if (tab === "mesh-warnings") renderWarnings(CURRENT_MESH);
@@ -664,11 +720,13 @@ showAppVersion();
 
 setMode("user");
 setInterval(refreshTopbar, 3000);
-// Live poll: keep the Peers/Topology connection state fresh while viewing them.
+// Live poll: keep the Peers/Topology/Traffic views fresh while viewing them.
 setInterval(() => {
+  if (ACTIVE_TAB === "traffic") return renderTraffic("user"); // this computer (user mode)
   if (MODE !== "mesh" || CURRENT_MESH == null) return;
   if (ACTIVE_TAB === "mesh-peers") renderPeersFor(CURRENT_MESH);
   else if (ACTIVE_TAB === "mesh-topology") renderTopologyFor(CURRENT_MESH);
+  else if (ACTIVE_TAB === "mesh-traffic") renderTraffic("mesh");
 }, 3000);
 
 // ---- browser demo (no Tauri): meshd is unreachable ----

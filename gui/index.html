@@ -53,6 +53,9 @@
             <button class="nav-item" data-tab="join-mesh" data-grp="user">
               <span class="nav-ico">⤵</span> Join mesh
             </button>
+            <button class="nav-item" data-tab="traffic" data-grp="user">
+              <span class="nav-ico">📈</span> Traffic
+            </button>
             <!-- Mesh mode (scoped to the opened mesh) -->
             <button class="nav-item" data-tab="mesh-overview" data-grp="mesh">
               <span class="nav-ico">⬢</span> Overview
@@ -62,6 +65,9 @@
             </button>
             <button class="nav-item" data-tab="mesh-topology" data-grp="mesh">
               <span class="nav-ico">🕸</span> Topology
+            </button>
+            <button class="nav-item" data-tab="mesh-traffic" data-grp="mesh">
+              <span class="nav-ico">📈</span> Traffic
             </button>
             <button class="nav-item" data-tab="mesh-warnings" data-grp="mesh">
               <span class="nav-ico">⚠</span> Warnings
@@ -176,6 +182,14 @@
             <div id="mesh-detail" class="card"></div>
           </section>
 
+          <!-- User mode: Traffic — THIS COMPUTER's traffic across all meshes -->
+          <section data-panel="traffic" class="panel hidden">
+            <h1 class="panel-title">Traffic</h1>
+            <p class="panel-sub">Live traffic on <b>this computer</b> across all meshes —
+              per-peer bytes/packets, and <b>Detail ▸</b> for the recent packet flows.</p>
+            <div id="user-traffic-body"></div>
+          </section>
+
           <!-- Mesh mode: Peers (docs/GUI_PAGES.md §4 — members now, live state later) -->
           <section data-panel="mesh-peers" class="panel hidden">
             <h1 class="panel-title">Peers</h1>
@@ -201,6 +215,14 @@
               <span><i class="tdot live"></i> live</span>
               <span><i class="tdot peer"></i> idle</span>
             </div>
+          </section>
+
+          <!-- Mesh mode: Traffic — this mesh's per-peer bytes/packets (+ flow detail) -->
+          <section data-panel="mesh-traffic" class="panel hidden">
+            <h1 class="panel-title">Traffic</h1>
+            <p class="panel-sub">Live traffic for this mesh — per-peer bytes/packets, and
+              <b>Detail ▸</b> for the recent packet flows.</p>
+            <div id="mesh-traffic-body"></div>
           </section>
 
           <!-- Mesh mode: Warnings — attack detection + health alerts -->

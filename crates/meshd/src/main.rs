@@ -23,7 +23,8 @@ use lattice_mesh::charter::{ExpelPolicy, GenesisCharter, InviteTopology, Reciphe
 use lattice_mesh::crypto::suite;
 use lattice_mesh::dataplane::MeshDataPlane;
 use lattice_mesh::ipc::{
-    InviteBlob, MemberView, MeshDetail, MeshSummary, PolicyView, Request, Response,
+    FlowView, InviteBlob, MemberView, MeshDetail, MeshSummary, PeerTrafficView, PolicyView,
+    Request, Response, TrafficView,
 };
 use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{
@@ -32,7 +33,8 @@ use lattice_mesh::membership::{
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
-    SharedEndpoint, SharedExit, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_REVOKE, CTRL_ROSTER,
+    SharedEndpoint, SharedExit, SharedTraffic, Traffic, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_REVOKE,
+    CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::wire_v2::{MemberId, MeshId};
@@ -188,6 +190,9 @@ struct MeshState {
     /// endpoint IP is the "peer is on a different mesh/epoch" signal, surfaced as a
     /// health warning + per-member reason in `MeshInfo` instead of a silent drop.
     decrypt_fails: DecryptFails,
+    /// Live per-peer byte/packet counters + recent overlay flows, shared with the data-plane
+    /// loop. Projected into the GUI traffic monitor (`TrafficStats`).
+    traffic: SharedTraffic,
 }
 
 impl MeshState {
@@ -261,6 +266,7 @@ struct Bringup {
     exit_sel: SharedExit,
     my_endpoint: SharedEndpoint,
     decrypt_fails: DecryptFails,
+    traffic: SharedTraffic,
 }
 
 fn now_ms() -> u64 {
@@ -268,6 +274,18 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Startup self-check (docs/DAEMON_SELF_HEALING.md). Full-tunnel state is NOT persisted, so
+/// on a fresh start it is always OFF — any leftover full-tunnel route bookkeeping is stale
+/// from a previous run that didn't clean up (crash / `kill -9` / reboot / network change
+/// while diverted). A stale exit `/32` pin blackholes that IP (`connect` → `EADDRNOTAVAIL`)
+/// and a stale saved default-gateway would make a later revert point the default route at a
+/// DEAD gateway. Clear both at boot so the daemon starts from a known-good route state.
+/// (Extend with further boot-time sanity cleanups as they come up.)
+fn startup_preflight() {
+    exit::clear_exit_pin();
+    elog!("meshd: startup preflight — cleared any stale full-tunnel route bookkeeping");
 }
 
 // ---- P-S1 persistence: survive reboots / network changes ---------------------
@@ -449,6 +467,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
     let exit_sel: SharedExit = Arc::new(Mutex::new(p.exit));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
+    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
     let bringup = Bringup {
         mesh_id: p.mesh_id,
         my_id,
@@ -460,6 +479,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         exit_sel: Arc::clone(&exit_sel),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
+        traffic: Arc::clone(&traffic),
     };
     let ms = MeshState {
         mesh,
@@ -482,6 +502,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         loop_cmd: None,
         attack_armed_at: None,
         decrypt_fails,
+        traffic,
     };
     (ms, bringup)
 }
@@ -540,6 +561,15 @@ async fn main() -> anyhow::Result<()> {
             "off"
         }
     );
+    // Startup preflight: full-tunnel is never active on a fresh start (it isn't persisted),
+    // so ANY leftover full-tunnel route bookkeeping is stale from a previous run that didn't
+    // clean up (crash / kill -9 / reboot / network change while diverted). Left behind, a
+    // stale exit /32 blackholes that IP (connect → EADDRNOTAVAIL) and a stale saved
+    // default-gateway would make a later revert point the default at a DEAD gateway. Clean
+    // both at boot so the daemon starts from a known-good route state.
+    if data_plane {
+        startup_preflight();
+    }
     // P-S1: reload persisted meshes so a reboot / network change doesn't drop us from
     // them; bring each data plane back up at its live secret/epoch/cipher.
     if let Some(dir) = &pdir {
@@ -938,6 +968,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         cmd_rx,
         applied_tx,
         b.decrypt_fails,
+        b.traffic,
     ));
     // Record the loop's abort handle (RemoveMesh stops it) + the command sender.
     if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
@@ -1546,6 +1577,8 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             None => (no_mesh(mesh), None),
         },
 
+        Request::TrafficStats { mesh } => (Response::Traffic(traffic_view(st, mesh)), None),
+
         Request::AdmitMember {
             mesh,
             name,
@@ -1993,6 +2026,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
+    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
     let mut mesh = Mesh::new(
         invite.mesh_id,
         invite.mesh_name.clone(),
@@ -2011,6 +2045,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         exit_sel: Arc::clone(&exit_sel),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
+        traffic: Arc::clone(&traffic),
     });
     st.meshes.insert(
         invite.mesh_id,
@@ -2035,6 +2070,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             loop_cmd: None,
             attack_armed_at: None,
             decrypt_fails,
+            traffic,
         },
     );
     (
@@ -2130,6 +2166,7 @@ fn create_mesh(
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
+    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
     let mesh = Mesh::new(id, name, charter, 1);
     // If data-plane mode is on, ask the async caller to bring up this mesh's loop
     // (sharing the same links/exit handles we store below).
@@ -2144,6 +2181,7 @@ fn create_mesh(
         exit_sel: Arc::clone(&exit_sel),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
+        traffic: Arc::clone(&traffic),
     });
     st.meshes.insert(
         id,
@@ -2168,6 +2206,7 @@ fn create_mesh(
             loop_cmd: None,
             attack_armed_at: None,
             decrypt_fails,
+            traffic,
         },
     );
     (
@@ -2419,6 +2458,78 @@ fn detail(ms: &MeshState) -> MeshDetail {
         network_fp: fp(&ch.master_pubkey),
         expel: expel_name(ch.expel),
     }
+}
+
+fn proto_name(p: u8) -> String {
+    match p {
+        1 => "icmp".into(),
+        6 => "tcp".into(),
+        17 => "udp".into(),
+        n => format!("proto {n}"),
+    }
+}
+
+/// Fold one mesh's live traffic (per-peer totals + recent flows) into `out`.
+fn mesh_traffic(ms: &MeshState, out: &mut TrafficView) {
+    let names: HashMap<MemberId, String> =
+        ms.roster().iter().map(|c| (c.id, c.name.clone())).collect();
+    let name_of = |id: MemberId| names.get(&id).cloned().unwrap_or_else(|| format!("#{id}"));
+    let t = ms.traffic.lock().unwrap();
+    for (id, pt) in &t.per_peer {
+        out.rx_bytes += pt.rx_bytes;
+        out.rx_pkts += pt.rx_pkts;
+        out.tx_bytes += pt.tx_bytes;
+        out.tx_pkts += pt.tx_pkts;
+        out.peers.push(PeerTrafficView {
+            mesh: ms.mesh.id,
+            mesh_name: ms.mesh.name.clone(),
+            id: *id,
+            name: name_of(*id),
+            rx_bytes: pt.rx_bytes,
+            rx_pkts: pt.rx_pkts,
+            tx_bytes: pt.tx_bytes,
+            tx_pkts: pt.tx_pkts,
+        });
+    }
+    for ev in &t.recent {
+        out.recent.push(FlowView {
+            at_ms: ev.at_ms,
+            out: ev.out,
+            mesh: ms.mesh.id,
+            mesh_name: ms.mesh.name.clone(),
+            member: ev.member,
+            member_name: name_of(ev.member),
+            src: ev.src.to_string(),
+            dst: ev.dst.to_string(),
+            proto: proto_name(ev.proto),
+            sport: ev.sport,
+            dport: ev.dport,
+            bytes: ev.bytes,
+            via_exit: ev.via_exit,
+        });
+    }
+}
+
+/// Build the traffic monitor view: one mesh (`Some`) or this whole computer (`None`).
+fn traffic_view(st: &State, mesh: Option<MeshId>) -> TrafficView {
+    let mut v = TrafficView::default();
+    match mesh {
+        Some(id) => {
+            if let Some(ms) = st.meshes.get(&id) {
+                mesh_traffic(ms, &mut v);
+            }
+        }
+        None => {
+            for ms in st.meshes.values() {
+                mesh_traffic(ms, &mut v);
+            }
+        }
+    }
+    v.recent.sort_by(|a, b| b.at_ms.cmp(&a.at_ms)); // newest first
+    v.recent.truncate(200);
+    v.peers
+        .sort_by(|a, b| (b.rx_bytes + b.tx_bytes).cmp(&(a.rx_bytes + a.tx_bytes))); // top talkers
+    v
 }
 
 fn no_mesh(id: MeshId) -> Response {

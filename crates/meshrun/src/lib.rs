@@ -51,6 +51,104 @@ pub struct DecryptFailStat {
 /// silent drop into an actionable health warning instead (the split-brain signal).
 pub type DecryptFails = Arc<Mutex<HashMap<IpAddr, DecryptFailStat>>>;
 
+/// Per-peer byte/packet counters for the traffic monitor (rx = we received, tx = we sent).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PeerTraffic {
+    pub rx_bytes: u64,
+    pub rx_pkts: u64,
+    pub tx_bytes: u64,
+    pub tx_pkts: u64,
+}
+
+/// One recorded overlay packet for the flow-detail view — the 5-tuple of an app packet
+/// that crossed the TUN (out = we sent it to `member`, in = we received it from `member`).
+#[derive(Clone, Copy, Debug)]
+pub struct FlowEvent {
+    pub at_ms: u64,
+    pub out: bool,
+    pub member: MemberId,
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
+    pub proto: u8,
+    pub sport: u16,
+    pub dport: u16,
+    pub bytes: u16,
+    /// The packet was routed via the exit (internet-bound), not to an in-mesh member.
+    pub via_exit: bool,
+}
+
+/// How many recent flow events to keep per mesh (a ring; oldest drops).
+const FLOW_RING_CAP: usize = 200;
+
+/// A mesh's live traffic: per-peer totals + a ring of recent overlay flows. Shared with the
+/// supervisor (meshd), which projects it into the GUI's traffic monitor.
+#[derive(Default)]
+pub struct Traffic {
+    pub per_peer: HashMap<MemberId, PeerTraffic>,
+    pub recent: std::collections::VecDeque<FlowEvent>,
+}
+
+impl Traffic {
+    /// Count one overlay packet `p` to/from `member` and (if it parses as IPv4) record its
+    /// 5-tuple in the recent ring.
+    fn record(&mut self, member: MemberId, out: bool, p: &[u8], via_exit: bool) {
+        let e = self.per_peer.entry(member).or_default();
+        let len = p.len() as u64;
+        if out {
+            e.tx_bytes += len;
+            e.tx_pkts += 1;
+        } else {
+            e.rx_bytes += len;
+            e.rx_pkts += 1;
+        }
+        if let Some(mut ev) = parse_flow(p) {
+            ev.at_ms = now_ms();
+            ev.out = out;
+            ev.member = member;
+            ev.via_exit = via_exit;
+            if self.recent.len() >= FLOW_RING_CAP {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(ev);
+        }
+    }
+}
+
+/// Shared traffic handle (run loop writes, supervisor reads).
+pub type SharedTraffic = Arc<Mutex<Traffic>>;
+
+/// Parse the IPv4 5-tuple of a raw overlay packet for the flow-detail view. Fields
+/// `at_ms/out/member/via_exit` are filled by the caller. `None` if not IPv4.
+fn parse_flow(p: &[u8]) -> Option<FlowEvent> {
+    if p.len() < 20 || (p[0] >> 4) != 4 {
+        return None;
+    }
+    let ihl = ((p[0] & 0x0f) as usize) * 4;
+    let proto = p[9];
+    let src = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
+    let dst = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+    let (sport, dport) = if (proto == 6 || proto == 17) && p.len() >= ihl + 4 {
+        (
+            u16::from_be_bytes([p[ihl], p[ihl + 1]]),
+            u16::from_be_bytes([p[ihl + 2], p[ihl + 3]]),
+        )
+    } else {
+        (0, 0)
+    };
+    Some(FlowEvent {
+        at_ms: 0,
+        out: false,
+        member: 0,
+        src,
+        dst,
+        proto,
+        sport,
+        dport,
+        bytes: p.len().min(u16::MAX as usize) as u16,
+        via_exit: false,
+    })
+}
+
 /// The member that internet-bound traffic egresses through (the exit). Shared so a
 /// supervisor can change egress live (the GUI's egress toggle) without a respawn.
 pub type SharedExit = Arc<Mutex<Option<MemberId>>>;
@@ -254,6 +352,7 @@ pub async fn run<X: Transport + 'static>(
     mut loop_cmd: LoopCmdRx,
     loop_event: LoopEventTx,
     fails: DecryptFails,
+    traffic: SharedTraffic,
 ) {
     let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
     loop {
@@ -263,10 +362,13 @@ pub async fn run<X: Transport + 'static>(
             outbound = tun.read_packet() => {
                 let Ok(p) = outbound else { break };
                 if let Some(dst) = ipv4_dst(&p) {
-                    let member = dp.route(dst).or_else(|| *exit.lock().unwrap());
+                    let routed = dp.route(dst);
+                    let via_exit = routed.is_none();
+                    let member = routed.or_else(|| *exit.lock().unwrap());
                     if let Some(member) = member {
                         let endpoint = links.lock().unwrap().get(&member).map(|l| l.endpoint);
                         if let Some(addr) = endpoint {
+                            traffic.lock().unwrap().record(member, true, &p, via_exit);
                             let _ = transport.send_to(&dp.seal_to(member, &p), addr).await;
                         }
                     }
@@ -309,7 +411,10 @@ pub async fn run<X: Transport + 'static>(
                         .insert(src, Link { endpoint: from, last_seen_ms: now_ms() });
                 }
                 match msg {
-                    Inbound::Deliver(inner) => { let _ = tun.write_packet(&inner).await; }
+                    Inbound::Deliver(inner) => {
+                        traffic.lock().unwrap().record(src, false, &inner, false);
+                        let _ = tun.write_packet(&inner).await;
+                    }
                     // Control frame: gossip (endpoint table) or a re-cipher announce,
                     // told apart by the first payload byte.
                     Inbound::Control(payload) => match payload.first().copied() {
@@ -481,6 +586,9 @@ mod tests {
     fn no_fails() -> DecryptFails {
         Arc::new(Mutex::new(HashMap::new()))
     }
+    fn no_traffic() -> SharedTraffic {
+        Arc::new(Mutex::new(Traffic::default()))
+    }
 
     fn ipv4_to(dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0u8; 28]; // 20B IPv4 header + 8B payload
@@ -513,6 +621,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         )); // Alice (member 1)
         tokio::spawn(run(
             dp(2),
@@ -526,6 +635,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         )); // Bob   (member 2)
 
         // Inject an IP packet at Alice's TUN, destined for Bob's overlay IP.
@@ -564,6 +674,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         )); // exit = member 2
         tokio::spawn(run(
             dp(2),
@@ -577,6 +688,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
 
         // A real internet destination (not in the mesh /24) → goes to the exit.
@@ -673,6 +785,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -686,6 +799,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         )); // relay hop
         tokio::spawn(run(
             dp(3),
@@ -699,6 +813,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
 
         let packet = ipv4_to("100.80.3.3".parse().unwrap()); // member 3 = C
@@ -758,6 +873,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -771,6 +887,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
         tokio::spawn(run(
             dp(3),
@@ -784,6 +901,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
 
         // Poll A's link table until C (member 3) appears, learned via B's gossip.
@@ -846,6 +964,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -859,6 +978,7 @@ mod tests {
             dummy_cmd(),
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
 
         // B should adopt the public address A reflected (the `self` line in A's gossip).
@@ -917,6 +1037,7 @@ mod tests {
             a_cmd_rx,
             dummy_applied(),
             no_fails(),
+            no_traffic(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -930,6 +1051,7 @@ mod tests {
             dummy_cmd(),
             b_applied_tx,
             no_fails(),
+            no_traffic(),
         ));
 
         // Baseline: a packet flows on the original cipher.
