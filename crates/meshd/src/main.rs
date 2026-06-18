@@ -70,6 +70,10 @@ const DHT_RECONNECT_TICK_SECS: u64 = 25;
 /// How often to gossip our membership roster (signed certs) to peers so a member
 /// admitted via a third node propagates to everyone (the roster converges).
 const ROSTER_GOSSIP_TICK_SECS: u64 = 20;
+/// How often to poll the host's default gateway for a network change (Wi-Fi↔cellular,
+/// sleep/wake, a new network after an outage). Cheap; routes/endpoints only refresh on an
+/// actual change.
+const NETCHANGE_TICK_SECS: u64 = 8;
 /// Overlay MTU for meshd-run data planes (matches meshrun's conservative default).
 const OVERLAY_MTU: u16 = 1280;
 /// Live-paired self-destruct (P-C4): how often to check liveness, and how long the
@@ -651,6 +655,13 @@ async fn main() -> anyhow::Result<()> {
         spawn_roster_gossip(Arc::clone(&state));
     }
 
+    // Network-change self-healing: detect the host's IP/gateway changing (Wi-Fi↔cellular,
+    // sleep/wake, a new network after an outage) and re-establish routes + re-learn our
+    // address so peers re-discover us (docs/DYNAMIC_NETWORK.md).
+    if data_plane {
+        spawn_netchange_watcher(Arc::clone(&state));
+    }
+
     elog!("meshd: listening on {socket}");
     accept_loop(&socket, state).await
 }
@@ -1070,6 +1081,79 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
             };
             for (tag, body, peers, tx) in sends {
                 let _ = tx.send(LoopCmd::SendControl(tag, body, peers));
+            }
+        }
+    });
+}
+
+/// Self-heal across **network changes** (docs/DYNAMIC_NETWORK.md). A laptop/desktop/server
+/// can get a new IP from sleep/wake, Wi-Fi↔cellular roaming, or a new network after an
+/// outage. On each default-gateway change this:
+/// 1. **cleans a now-stale exit `/32` pin** — pinned via the OLD gateway it blackholes the
+///    exit's IP (a connect to it fails with `EADDRNOTAVAIL`) even with full-tunnel off — or
+///    **re-pins it via the NEW gateway** if full-tunnel is on, so the tunnel survives roaming;
+/// 2. **re-learns our local address** and writes it to each mesh's advertised endpoint, so the
+///    next gossip/DHT tick tells every peer our new address and they re-discover us.
+///
+/// The data-plane socket is bound to the wildcard, so it keeps working across the change;
+/// only routes + the advertised address need refreshing. A pinned public node
+/// (`MESHD_ADVERTISE`) never re-learns its address.
+fn spawn_netchange_watcher(state: Arc<Mutex<State>>) {
+    let pinned = std::env::var("MESHD_ADVERTISE").is_ok();
+    tokio::spawn(async move {
+        // Start from `None` so the first tick also cleans any leftover pin from a prior run.
+        let mut last_gw: Option<String> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(NETCHANGE_TICK_SECS)).await;
+            let gw = tokio::task::spawn_blocking(exit::current_gateway)
+                .await
+                .ok()
+                .flatten();
+            if gw == last_gw {
+                continue;
+            }
+            elog!("meshd: network change — default gateway {last_gw:?} -> {gw:?}; self-healing");
+            last_gw = gw;
+            // (1) Re-assert (full-tunnel on) or clean (off) the exit pin via the new gateway.
+            let full_tunnel: Option<(String, std::net::IpAddr)> = {
+                let st = state.lock().unwrap();
+                st.current.and_then(|id| {
+                    let ms = st.meshes.get(&id)?;
+                    let exit_id = ms.mesh.exit?;
+                    let tun = ms.tun_name.clone()?;
+                    let ip = ms
+                        .links
+                        .lock()
+                        .unwrap()
+                        .get(&exit_id)
+                        .map(|l| l.endpoint.ip())?;
+                    Some((tun, ip))
+                })
+            };
+            let _ = tokio::task::spawn_blocking(move || match full_tunnel {
+                Some((tun, ip)) => {
+                    exit::clear_exit_pin();
+                    exit::route_through(&tun, ip);
+                }
+                None => exit::clear_exit_pin(),
+            })
+            .await;
+            // (2) Re-learn our local address so peers re-find us (unless a pinned public node).
+            if !pinned {
+                if let Some(ip) = local_ip() {
+                    let st = state.lock().unwrap();
+                    for ms in st.meshes.values() {
+                        let mut me = ms.my_endpoint.lock().unwrap();
+                        let port = me
+                            .map(|a| a.port())
+                            .filter(|p| *p != 0)
+                            .unwrap_or(ms.dp_port);
+                        if port != 0 {
+                            *me = Some(SocketAddr::new(ip, port));
+                        }
+                    }
+                    elog!("meshd: re-learned local address {ip} after network change");
+                }
             }
         }
     });
@@ -2197,13 +2281,25 @@ fn detail(ms: &MeshState) -> MeshDetail {
     // recent fail from a member's endpoint IP is the "different mesh / different epoch"
     // signal — it turns an opaque `idle` into an explained one and raises a warning.
     let fails = ms.decrypt_fails.lock().unwrap().clone();
+    let links = ms.links.lock().unwrap();
+    // IPs that have a currently-live member: we ARE decrypting frames from them, so a
+    // decrypt fail on that IP is a DIFFERENT sender sharing the same NAT/public IP — not
+    // this peer. Suppress decrypt-fail attribution for those IPs, so two members behind one
+    // NAT (or a stray node on a shared campus NAT) don't raise a false split-brain warning.
+    let live_ips: std::collections::HashSet<std::net::IpAddr> = links
+        .values()
+        .filter(|l| l.last_seen_ms != 0 && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS)
+        .map(|l| l.endpoint.ip())
+        .collect();
     let recent_fail = |ip: std::net::IpAddr| -> Option<u64> {
+        if live_ips.contains(&ip) {
+            return None;
+        }
         fails.get(&ip).and_then(|s: &DecryptFailStat| {
             (s.count > 0 && now.saturating_sub(s.last_ms) < DECRYPT_FAIL_WINDOW_MS)
                 .then_some(s.count)
         })
     };
-    let links = ms.links.lock().unwrap();
     let members: Vec<MemberView> = ms
         .roster()
         .iter()

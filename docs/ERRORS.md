@@ -7,6 +7,26 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ---
 
+## 2026-06-18 — mesh unreachable on an IPv6-only / NAT64 cellular network
+
+**Incident:** on an iPhone hotspot, the Mac couldn't reach Oracle (peer idle) AND SSH to
+`203.0.113.10` failed with `Can't assign requested address`. Same hotspot had worked before.
+
+**Root cause:** the carrier gave an **IPv6-only (NAT64/464XLAT)** stack that session — en0 had
+`192.0.0.2` (CLAT) + IPv6, no usable IPv4. Hostnames worked (DNS64 → IPv6: `google.com` 200) but
+**raw IPv4 literals failed** (`203.0.113.10` → 000): `ipv4only.arpa` returned empty, so CLAT
+couldn't discover the NAT64 prefix and had no path to translate IPv4 literals. The mesh underlay
+advertises Oracle as an **IPv4 literal**, so it was unreachable. "Worked before" = that session
+the cellular gave IPv4 (dual-stack) or CLAT discovered the prefix. The program didn't change; the
+carrier's per-session address assignment did.
+
+**Not a code bug — a missing capability.** Fix is to make the underlay IPv6/dual-stack so a
+node on an IPv6-only carrier reaches the public node over native v6 (no CLAT dependence).
+Detailed work plan: **docs/IPV6_PLAN.md** (dual-stack bind, v6 advertise, multi-endpoint per
+member, DHT v6). Deferred — planned, not built.
+
+---
+
 ## 2026-06-18 — two bugs found while building membership expulsion
 
 Both surfaced during live testing of the new expulsion feature (docs/EXPULSION.md).
@@ -139,6 +159,15 @@ takes the blame). On distinct real IPs it pinpoints correctly. Source *port* is 
 under NAT, so IP-keying was deliberate — but a future improvement could correlate the fail
 to the member whose last successful decrypt just stopped, or key by (IP, advertised port)
 when not NAT'd. Filed as a known edge, not a blocker.
+
+**Mitigated (2026-06-18, live):** `detail()` now suppresses decrypt-fail attribution for any
+IP that has a **currently-live** member — if we're successfully decrypting frames from that
+IP, a fail on it is a *different* sender sharing the NAT, not this peer. This killed a real
+false positive: a fresh `home` mesh (Mac↔Oracle) was healthy (overlay ping 3/3) but Oracle
+kept warning about "mac" because another node behind the same campus NAT (public
+`203.0.113.20`) was sending stale frames to Oracle's port. Since `mac` was live, its IP is
+now in `live_ips` and the warning is suppressed. A genuinely idle/unknown peer on a private
+IP still raises it. (Two members behind one NAT where BOTH are idle is still ambiguous.)
 
 ### Diagnostic cheat-sheet (for next time)
 - `lattice doctor` — one-shot health + suggested fixes for every mesh.

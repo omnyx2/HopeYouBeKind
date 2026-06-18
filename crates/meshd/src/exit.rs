@@ -69,6 +69,29 @@ pub fn restore_routes() {
     }
 }
 
+/// Remove left-behind full-tunnel route bookkeeping WITHOUT touching the live default
+/// route. Used by the network-change watcher: a `/32` pin made via the OLD gateway
+/// blackholes the exit's IP after the network changes (`connect()` → `EADDRNOTAVAIL`),
+/// and a stale `SAVED` default gateway would make a later `restore_routes` point the
+/// default at a DEAD gateway (no internet). Both only legitimately exist while a full
+/// tunnel is active, so when we're not (or are about to re-pin) we clear them.
+#[cfg(target_os = "macos")]
+pub fn clear_exit_pin() {
+    if let Ok(exit_ip) = std::fs::read_to_string(EXIT_HOST_SAVED) {
+        run("route", &["-q", "delete", "-host", exit_ip.trim()]);
+        let _ = std::fs::remove_file(EXIT_HOST_SAVED);
+    }
+    // Drop a stale saved default gateway so a later `restore_routes` can't apply a dead one.
+    let _ = std::fs::remove_file(SAVED);
+}
+
+/// The current default gateway (a stable string while the network is unchanged) — the
+/// network-change watcher polls this to detect Wi-Fi↔cellular / new-network transitions.
+#[cfg(target_os = "macos")]
+pub fn current_gateway() -> Option<String> {
+    macos_default_gateway()
+}
+
 #[cfg(target_os = "macos")]
 fn macos_default_gateway() -> Option<String> {
     let out = Command::new("route")
@@ -242,6 +265,21 @@ pub fn restore_routes() {
         run("ip", &["route", "del", &format!("{}/32", exit_ip.trim())]);
         let _ = std::fs::remove_file(EXIT_HOST_SAVED);
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn clear_exit_pin() {
+    if let Ok(exit_ip) = std::fs::read_to_string(EXIT_HOST_SAVED) {
+        run("ip", &["route", "del", &format!("{}/32", exit_ip.trim())]);
+        let _ = std::fs::remove_file(EXIT_HOST_SAVED);
+    }
+    // Drop a stale saved default route so a later `restore_routes` can't apply a dead one.
+    let _ = std::fs::remove_file(SAVED);
+}
+
+#[cfg(target_os = "linux")]
+pub fn current_gateway() -> Option<String> {
+    linux_default_route().map(|(gw, _)| gw)
 }
 
 /// Point the host resolver at `servers` (full-tunnel DNS). Backs up the current
@@ -424,6 +462,39 @@ if (Test-Path '{saved}') {{
 }
 
 #[cfg(target_os = "windows")]
+pub fn clear_exit_pin() {
+    let script = format!(
+        r#"
+$ErrorActionPreference='SilentlyContinue'
+if (Test-Path '{saved}') {{
+  $exit = (Get-Content '{saved}').Trim()
+  Remove-NetRoute -DestinationPrefix "$exit/32" -Confirm:$false
+  Remove-Item '{saved}'
+}}
+"#,
+        saved = WIN_SAVED
+    );
+    ps(&script);
+}
+
+#[cfg(target_os = "windows")]
+pub fn current_gateway() -> Option<String> {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let pwsh = format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe");
+    let out = Command::new(pwsh)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(target_os = "windows")]
 pub fn enable_nat() {
     // Forward between interfaces + WinNAT for the overlay range.
     ps("Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue");
@@ -468,3 +539,9 @@ pub fn disable_nat() {}
 pub fn set_dns(_servers: &[IpAddr]) {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn restore_dns() {}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn clear_exit_pin() {}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn current_gateway() -> Option<String> {
+    None
+}
