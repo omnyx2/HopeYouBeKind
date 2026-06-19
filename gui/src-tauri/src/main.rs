@@ -240,15 +240,14 @@ fn send_shutdown() {
 /// auth dialog, NOT a terminal — so Lattice is a clean double-click with no manual
 /// `sudo meshd`. Best-effort: in dev (no bundled binary) or if already running, do
 /// nothing.
+#[cfg(not(windows))]
 fn ensure_meshd(app: &tauri::App) {
     if meshd_running() {
         return;
     }
-    #[cfg(windows)]
-    let resource = "resources/meshd.exe";
-    #[cfg(not(windows))]
-    let resource = "resources/meshd";
-    let meshd = match app.path_resolver().resolve_resource(resource) {
+    // On Unix a running binary can be overwritten in place (the live process keeps its
+    // inode), so the install-dir copy is safe to run directly and updates land fine.
+    let meshd = match app.path_resolver().resolve_resource("resources/meshd") {
         Some(p) if p.exists() => p.to_string_lossy().to_string(),
         _ => {
             eprintln!("Lattice: bundled meshd not found (dev build?) — start meshd manually");
@@ -258,6 +257,81 @@ fn ensure_meshd(app: &tauri::App) {
     launch_meshd_elevated(&meshd);
     // Give meshd a moment to bind its socket before the UI starts polling.
     std::thread::sleep(std::time::Duration::from_millis(1800));
+}
+
+/// Windows: run meshd from a per-user COPY (`%LOCALAPPDATA%\Lattice\meshd.exe`), NEVER
+/// directly from the install dir. Windows cannot overwrite a running `.exe`, so running
+/// `resources\meshd.exe` would lock it — the installer then silently keeps the OLD daemon
+/// on every update (the GUI updates, meshd does not; the exact "reinstalled but still
+/// broken" bug). Running from a copy keeps the install-dir binary unlocked, so the
+/// installer always replaces it. On the next launch we notice the bundled binary is newer
+/// than our copy, stop the stale daemon via the `Shutdown` IPC (world-writable pipe — no
+/// elevation), refresh the copy, and relaunch. A normal launch (no update, daemon already
+/// current) is a no-op, so a running VPN is left alone.
+#[cfg(windows)]
+fn ensure_meshd(app: &tauri::App) {
+    let bundled = match app.path_resolver().resolve_resource("resources/meshd.exe") {
+        Some(p) if p.exists() => p,
+        _ => {
+            eprintln!("Lattice: bundled meshd not found (dev build?) — start meshd manually");
+            return;
+        }
+    };
+    let run_dir = std::path::PathBuf::from(
+        std::env::var("LOCALAPPDATA").unwrap_or_else(|_| r"C:\Windows\Temp".to_string()),
+    )
+    .join("Lattice");
+    let run_copy = run_dir.join("meshd.exe");
+
+    let newer = !run_copy.exists() || files_differ(&bundled, &run_copy);
+    let running = meshd_running();
+
+    // Daemon already up AND current — leave the running VPN untouched.
+    if running && !newer {
+        return;
+    }
+    // A newer meshd was just installed: stop the stale daemon so we can replace the copy.
+    if running && newer {
+        send_shutdown();
+        for _ in 0..20 {
+            if !meshd_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    }
+    let _ = std::fs::create_dir_all(&run_dir);
+    if newer || !run_copy.exists() {
+        if let Err(e) = std::fs::copy(&bundled, &run_copy) {
+            // Copy failed (e.g. the old daemon didn't exit in time and still locks the copy).
+            // Fall back to the install-dir binary so the VPN still comes up this session.
+            eprintln!("Lattice: could not stage meshd copy ({e}); running bundled directly");
+            launch_meshd_elevated(&bundled.to_string_lossy());
+            std::thread::sleep(std::time::Duration::from_millis(1800));
+            return;
+        }
+    }
+    launch_meshd_elevated(&run_copy.to_string_lossy());
+    // Give meshd a moment to bind its pipe before the UI starts polling.
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+}
+
+/// Cheap "are these two files different?": compare length, then full bytes on a tie. Run
+/// once at startup, so reading two ~2-3 MB binaries is negligible.
+#[cfg(windows)]
+fn files_differ(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => {
+            if ma.len() != mb.len() {
+                return true;
+            }
+            match (std::fs::read(a), std::fs::read(b)) {
+                (Ok(da), Ok(db)) => da != db,
+                _ => true,
+            }
+        }
+        _ => true,
+    }
 }
 
 #[cfg(unix)]
