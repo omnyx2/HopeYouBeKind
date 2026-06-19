@@ -112,10 +112,17 @@ where
                     // Same mesh, and not our own beacon looping back.
                     if m.tag == tag && member != m.member_id {
                         let ep = SocketAddr::from((*src.ip(), port));
-                        // Prefer the direct LAN path (overwrite any WAN endpoint).
+                        // Prefer the direct LAN path (overwrite any WAN endpoint). A LAN
+                        // beacon is a same-segment direct reachability signal, so mark the
+                        // direct path fresh too (docs/RELAY.md) — no need to relay a LAN peer.
+                        let now = now_ms();
                         m.links.lock().unwrap().insert(
                             member,
-                            Link { endpoint: ep, last_seen_ms: now_ms() },
+                            Link {
+                                endpoint: ep,
+                                last_seen_ms: now,
+                                last_direct_ms: now,
+                            },
                         );
                     }
                 }

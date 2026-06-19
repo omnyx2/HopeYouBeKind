@@ -27,8 +27,14 @@ pub struct Link {
     /// Where to send this peer's frames (seeded out-of-band, then kept fresh from
     /// the source address of inbound frames — peers roam / sit behind NAT).
     pub endpoint: SocketAddr,
-    /// Unix-ms of the last frame received from this peer; 0 = never heard (a seed).
+    /// Unix-ms of the last frame received from this peer by **any** path (direct OR
+    /// relayed); 0 = never heard (a seed). Drives liveness.
     pub last_seen_ms: u64,
+    /// Unix-ms of the last frame received **directly** from this peer (its UDP source was
+    /// the peer itself, not a relay hop); 0 = no direct path confirmed. When this is
+    /// stale, the peer is presumed unreachable directly and overlay traffic is relayed
+    /// through a public node (docs/RELAY.md).
+    pub last_direct_ms: u64,
 }
 
 /// The mesh's live peer table, shared between the run loop and its supervisor.
@@ -195,6 +201,7 @@ pub fn seed_links(endpoints: HashMap<MemberId, SocketAddr>) -> PeerLinks {
                 Link {
                     endpoint,
                     last_seen_ms: 0,
+                    last_direct_ms: 0,
                 },
             )
         })
@@ -214,6 +221,81 @@ pub fn ipv4_dst(p: &[u8]) -> Option<Ipv4Addr> {
 /// Endpoint gossip / keepalive interval (also the NAT-keepalive cadence, docs/
 /// DISCOVERY.md §3,§6).
 const GOSSIP_INTERVAL_SECS: u64 = 20;
+
+/// A peer is "directly reachable" iff we got a **direct** frame from it within this
+/// window. Just over `GOSSIP_INTERVAL_SECS` so one missed keepalive doesn't flap us onto
+/// the relay. When a peer's direct path is stale, overlay traffic to it is relayed
+/// through a public node (docs/RELAY.md).
+const DIRECT_OK_MS: u64 = 25_000;
+
+/// How often (per peer) the relay-fallback decisions are logged, so a permanently
+/// unreachable peer can't spam the log on every packet.
+const RELAY_LOG_THROTTLE_MS: u64 = 15_000;
+
+/// Where to route one outbound overlay frame for member `to`.
+#[derive(Debug, PartialEq)]
+enum Route {
+    /// Send straight to the peer's own endpoint.
+    Direct(SocketAddr),
+    /// Send to a relay member's endpoint; the relay opens the header, sees `dst = to`,
+    /// and forwards it (docs/RELAY.md). `via` = the relay's address, `member` = its id.
+    Relay { via: SocketAddr, member: MemberId },
+    /// No direct path and no relay — the frame is dropped (logged, throttled).
+    None,
+}
+
+/// Is member `m`'s direct path fresh enough to use? (a direct frame within `DIRECT_OK_MS`)
+fn directly_reachable(lk: &Link, now: u64) -> bool {
+    lk.last_direct_ms != 0 && now.saturating_sub(lk.last_direct_ms) < DIRECT_OK_MS
+}
+
+/// Pick a relay for `to`: a **directly-reachable, public** member (≠ `to`). The `exit`
+/// (the designated always-on public node) is preferred; otherwise any live public peer.
+fn pick_relay(
+    links: &HashMap<MemberId, Link>,
+    to: MemberId,
+    exit: Option<MemberId>,
+    now: u64,
+) -> Option<(MemberId, SocketAddr)> {
+    let ok = |m: MemberId, lk: &Link| {
+        m != to && directly_reachable(lk, now) && is_public(lk.endpoint.ip())
+    };
+    if let Some(ex) = exit {
+        if let Some(lk) = links.get(&ex) {
+            if ok(ex, lk) {
+                return Some((ex, lk.endpoint));
+            }
+        }
+    }
+    links
+        .iter()
+        .find(|(m, lk)| ok(**m, lk))
+        .map(|(m, lk)| (*m, lk.endpoint))
+}
+
+/// Decide how to reach `to`: direct if its direct path is fresh; else relay through a
+/// public node; else best-effort direct (so NAT punching can still establish it); else
+/// nothing (docs/RELAY.md).
+fn pick_route(
+    links: &HashMap<MemberId, Link>,
+    to: MemberId,
+    exit: Option<MemberId>,
+    now: u64,
+) -> Route {
+    let target = links.get(&to);
+    if let Some(t) = target {
+        if directly_reachable(t, now) {
+            return Route::Direct(t.endpoint);
+        }
+    }
+    if let Some((member, via)) = pick_relay(links, to, exit, now) {
+        return Route::Relay { via, member };
+    }
+    if let Some(t) = target {
+        return Route::Direct(t.endpoint); // best-effort: keep punching toward direct
+    }
+    Route::None
+}
 
 /// Encode the gossip payload (sealed): the endpoint table as `id ip:port` lines,
 /// plus an optional `self ip:port` line = "where I observe YOU (the recipient)",
@@ -363,6 +445,8 @@ pub async fn run<X: Transport + 'static>(
     traffic: SharedTraffic,
 ) {
     let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
+    // Per-peer last-logged time for relay-fallback decisions, so a stuck peer can't spam.
+    let mut relay_log_at: HashMap<MemberId, u64> = HashMap::new();
     loop {
         tokio::select! {
             // App traffic out of the TUN → route to its member, else (internet-bound)
@@ -373,10 +457,37 @@ pub async fn run<X: Transport + 'static>(
                 // overlay → owner, internet → exit, but an admin can program any policy.
                 let exit_now = *exit.lock().unwrap();
                 if let RouteDecision::Send { to, via_exit } = dp.decide(&p, exit_now) {
-                    let endpoint = links.lock().unwrap().get(&to).map(|l| l.endpoint);
-                    if let Some(addr) = endpoint {
-                        traffic.lock().unwrap().record(to, true, &p, via_exit);
-                        let _ = transport.send_to(&dp.seal_to(to, &p), addr).await;
+                    // Pick a path: direct if the peer is directly reachable, else relay the
+                    // frame through a public node, which forwards it on (docs/RELAY.md).
+                    let now = now_ms();
+                    let route = pick_route(&links.lock().unwrap(), to, exit_now, now);
+                    let sealed = dp.seal_to(to, &p);
+                    match route {
+                        Route::Direct(addr) => {
+                            traffic.lock().unwrap().record(to, true, &p, via_exit);
+                            let _ = transport.send_to(&sealed, addr).await;
+                        }
+                        Route::Relay { via, member } => {
+                            traffic.lock().unwrap().record(to, true, &p, via_exit);
+                            // The frame's header dst is `to`; the relay opens it and forwards.
+                            let _ = transport.send_to(&sealed, via).await;
+                            let last = relay_log_at.get(&to).copied().unwrap_or(0);
+                            if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
+                                relay_log_at.insert(to, now);
+                                eprintln!(
+                                    "meshrun: relaying overlay → member {to} via relay member {member} ({via}) — no direct path"
+                                );
+                            }
+                        }
+                        Route::None => {
+                            let last = relay_log_at.get(&to).copied().unwrap_or(0);
+                            if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
+                                relay_log_at.insert(to, now);
+                                eprintln!(
+                                    "meshrun: dropping overlay frame for member {to} — not directly reachable and no relay available"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -411,10 +522,30 @@ pub async fn run<X: Transport + 'static>(
                 // can carry src==us); a self-entry pollutes the table and shows up as our
                 // endpoint.
                 if src != my_id {
-                    links
-                        .lock()
-                        .unwrap()
-                        .insert(src, Link { endpoint: from, last_seen_ms: now_ms() });
+                    let now = now_ms();
+                    let mut l = links.lock().unwrap();
+                    // A frame whose UDP source is some OTHER member's endpoint is a relayed
+                    // hop, not `src` speaking to us directly. Keep `src` alive, but do NOT
+                    // adopt the relay's address as `src`'s endpoint — that would pin us to
+                    // the relay forever and pollute the gossip table (docs/RELAY.md).
+                    let relayed = l.iter().any(|(m, lk)| *m != src && lk.endpoint == from);
+                    let e = l.entry(src).or_insert(Link {
+                        endpoint: from,
+                        last_seen_ms: 0,
+                        last_direct_ms: 0,
+                    });
+                    e.last_seen_ms = now;
+                    if !relayed {
+                        // Direct frame: this is the peer's real, current address.
+                        let recovered = e.last_direct_ms == 0;
+                        e.endpoint = from;
+                        e.last_direct_ms = now;
+                        if recovered {
+                            eprintln!(
+                                "meshrun: direct path to member {src} established ({from})"
+                            );
+                        }
+                    }
                 }
                 match msg {
                     Inbound::Deliver(inner) => {
@@ -430,7 +561,11 @@ pub async fn run<X: Transport + 'static>(
                                 let mut l = links.lock().unwrap();
                                 for (m, ep) in table {
                                     if m != my_id {
-                                        l.entry(m).or_insert(Link { endpoint: ep, last_seen_ms: 0 });
+                                        l.entry(m).or_insert(Link {
+                                            endpoint: ep,
+                                            last_seen_ms: 0,
+                                            last_direct_ms: 0,
+                                        });
                                     }
                                 }
                             }
@@ -487,11 +622,26 @@ pub async fn run<X: Transport + 'static>(
                         _ => {}
                     },
                     // P5 relay: we're a hop, not the destination — pass the frame on
-                    // unchanged (we don't need to decrypt to forward).
+                    // unchanged (we don't need to decrypt the body to forward). We are the
+                    // relay node here (docs/RELAY.md). Never forward back toward the sender
+                    // (a frame whose dst we'd reach via `src`'s own address would loop).
                     Inbound::Forward { to } => {
                         let endpoint = links.lock().unwrap().get(&to).map(|l| l.endpoint);
-                        if let Some(addr) = endpoint {
-                            let _ = transport.send_to(&frame, addr).await;
+                        match endpoint {
+                            Some(addr) if addr != from => {
+                                let _ = transport.send_to(&frame, addr).await;
+                            }
+                            Some(_) => {} // would echo straight back to where it came from — drop
+                            None => {
+                                let last = relay_log_at.get(&to).copied().unwrap_or(0);
+                                let now = now_ms();
+                                if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
+                                    relay_log_at.insert(to, now);
+                                    eprintln!(
+                                        "meshrun: relay asked to forward to member {to} but its endpoint is unknown — dropping"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -500,25 +650,42 @@ pub async fn run<X: Transport + 'static>(
             // keepalive + liveness ping). The first tick fires immediately → fast
             // bootstrap from the invite-seeded links.
             _ = gossip.tick() => {
+                let now = now_ms();
                 let my_ep = *my_endpoint.lock().unwrap();
-                let (peers, table) = {
+                let gossip_exit = *exit.lock().unwrap();
+                let (peers, table, snapshot) = {
                     let l = links.lock().unwrap();
                     let mut table: Vec<(MemberId, SocketAddr)> =
                         l.iter().map(|(m, lk)| (*m, lk.endpoint)).collect();
                     if let Some(ep) = my_ep {
                         table.push((my_id, ep));
                     }
-                    let peers: Vec<(MemberId, SocketAddr)> =
-                        l.iter().map(|(m, lk)| (*m, lk.endpoint)).collect();
-                    (peers, table)
+                    // (member, endpoint, is-its-direct-path-fresh)
+                    let peers: Vec<(MemberId, SocketAddr, bool)> = l
+                        .iter()
+                        .map(|(m, lk)| (*m, lk.endpoint, directly_reachable(lk, now)))
+                        .collect();
+                    (peers, table, l.clone())
                 };
-                for (m, addr) in peers {
+                for (m, addr, direct) in peers {
                     // Per-peer payload: the shared table + a `self` line telling THIS
                     // peer where we observe it, so a NAT'd peer learns its public
                     // address from us if we're public (P-D3). Tagged as gossip.
                     let mut payload = vec![CTRL_GOSSIP];
                     payload.extend_from_slice(&encode_gossip(&table, Some(addr)));
+                    // Always send DIRECT — this is also the NAT-punch attempt that lets a
+                    // direct path (re)form, so a relayed peer upgrades to direct (docs/RELAY.md).
                     let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
+                    // If the direct path is stale, ALSO keepalive via a relay so liveness +
+                    // the relay path stay up and the peer hears us (its replies then relay
+                    // back). No reflexion on the relayed copy (we don't observe them directly).
+                    if !direct {
+                        if let Some((_rm, raddr)) = pick_relay(&snapshot, m, gossip_exit, now) {
+                            let mut rpayload = vec![CTRL_GOSSIP];
+                            rpayload.extend_from_slice(&encode_gossip(&table, None));
+                            let _ = transport.send_to(&dp.seal_control(m, &rpayload), raddr).await;
+                        }
+                    }
                 }
             }
             // A command from the supervisor: re-cipher (P-C3) or send a tagged Control
@@ -931,6 +1098,69 @@ mod tests {
         .await
         .expect("A never learned C's endpoint from gossip");
         assert_eq!(learned, c);
+    }
+
+    fn link(ep: &str, last_direct: u64) -> Link {
+        Link {
+            endpoint: ep.parse().unwrap(),
+            last_seen_ms: last_direct.max(1),
+            last_direct_ms: last_direct,
+        }
+    }
+
+    #[test]
+    fn pick_route_relays_through_a_public_node_when_direct_is_dead() {
+        let now = 1_000_000u64;
+        let pub_b: SocketAddr = "203.0.113.2:2".parse().unwrap();
+        let mut links = HashMap::new();
+        links.insert(2u8, link("203.0.113.2:2", now)); // B: public + directly reachable
+        links.insert(3u8, link("10.0.0.3:3", 0)); // C: private, never heard directly
+
+        // Direct to C is dead → relay through the public node B.
+        assert_eq!(
+            pick_route(&links, 3, None, now),
+            Route::Relay {
+                via: pub_b,
+                member: 2
+            }
+        );
+
+        // C's direct path is fresh → go direct.
+        links.get_mut(&3).unwrap().last_direct_ms = now;
+        assert!(matches!(pick_route(&links, 3, None, now), Route::Direct(_)));
+
+        // Direct dead again AND no public relay (B is now private) → best-effort direct to C.
+        links.get_mut(&3).unwrap().last_direct_ms = 0;
+        links.insert(2u8, link("10.0.0.2:2", now));
+        assert!(matches!(pick_route(&links, 3, None, now), Route::Direct(_)));
+
+        // Unknown member with no relay → nothing.
+        links.clear();
+        assert_eq!(pick_route(&links, 9, None, now), Route::None);
+    }
+
+    #[test]
+    fn pick_relay_prefers_the_exit_and_skips_stale_or_private_peers() {
+        let now = 1_000_000u64;
+        let mut links = HashMap::new();
+        links.insert(2u8, link("203.0.113.2:2", now)); // public + live
+        links.insert(4u8, link("198.51.100.4:4", now)); // also public + live
+        links.insert(5u8, link("203.0.113.5:5", now - 60_000)); // public but STALE direct
+        links.insert(6u8, link("10.0.0.6:6", now)); // live but PRIVATE
+                                                    // Exit (member 4) is preferred when it qualifies.
+        assert_eq!(
+            pick_relay(&links, 3, Some(4), now),
+            Some((4, "198.51.100.4:4".parse().unwrap()))
+        );
+        // No exit hint → any live public peer (2 or 4); stale (5) and private (6) excluded.
+        let r = pick_relay(&links, 3, None, now).unwrap();
+        assert!(
+            r.0 == 2 || r.0 == 4,
+            "relay must be a live public peer, got {}",
+            r.0
+        );
+        // Never relay through the target itself.
+        assert_ne!(pick_relay(&links, 4, Some(4), now).map(|(m, _)| m), Some(4));
     }
 
     #[test]

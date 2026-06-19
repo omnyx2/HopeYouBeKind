@@ -1385,6 +1385,7 @@ fn spawn_dht_reconnect(state: Arc<Mutex<State>>) {
                                 .or_insert(Link {
                                     endpoint: ep,
                                     last_seen_ms: 0,
+                                    last_direct_ms: 0,
                                 })
                                 .endpoint = ep;
                         }
@@ -1785,6 +1786,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                         Link {
                             endpoint: addr,
                             last_seen_ms: 0,
+                            last_direct_ms: 0,
                         },
                     );
                     (Response::Ok, None)
