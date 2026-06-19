@@ -174,9 +174,17 @@ async function renderPeersFor(id) {
       setTimeout(() => renderPeersFor(id), 1500);
     };
   });
-  // Invite a member now lives here on the Peers tab (moved from Configs).
+  // Invite a member now lives here on the Peers tab (moved from Configs). Only (re)build
+  // it when the mesh actually changes — this panel is re-rendered every few seconds by the
+  // live poll, and rebuilding the card each time would wipe whatever the user is typing
+  // into the name / join-code fields mid-entry. Rebuilding on mesh-switch re-wires the
+  // handlers to the new id; same-mesh polls leave the inputs (and their values) untouched.
   const extra = el("peers-extra");
-  if (extra) { extra.innerHTML = inviteCardHtml(); wireInviteCard(id); }
+  if (extra && extra.dataset.inviteMesh !== String(id)) {
+    extra.innerHTML = inviteCardHtml();
+    wireInviteCard(id);
+    extra.dataset.inviteMesh = String(id);
+  }
   // Wire the expel buttons (revoke a member per the mesh's expel policy).
   tbl.querySelectorAll(".peer-expel").forEach((btn) => {
     btn.onclick = async () => {
@@ -828,10 +836,19 @@ showAppVersion();
 setMode("user");
 setInterval(refreshTopbar, 3000);
 // Live poll: keep the Peers/Topology/Traffic views fresh while viewing them.
+// Is the user currently typing into an input on the Peers tab (the invite fields or an
+// inline peer-address box)? If so, the live poll must NOT re-render the panel out from
+// under them — the table-row rebuild would destroy the focused input and drop the keys.
+function typingInPeers() {
+  const a = document.activeElement;
+  if (!a || (a.tagName !== "INPUT" && a.tagName !== "TEXTAREA")) return false;
+  const t = el("peers-table"), x = el("peers-extra");
+  return (t && t.contains(a)) || (x && x.contains(a));
+}
 setInterval(() => {
   if (ACTIVE_TAB === "traffic") return renderTraffic("user"); // this computer (user mode)
   if (MODE !== "mesh" || CURRENT_MESH == null) return;
-  if (ACTIVE_TAB === "mesh-peers") renderPeersFor(CURRENT_MESH);
+  if (ACTIVE_TAB === "mesh-peers") { if (!typingInPeers()) renderPeersFor(CURRENT_MESH); }
   else if (ACTIVE_TAB === "mesh-topology") renderTopologyFor(CURRENT_MESH);
   else if (ACTIVE_TAB === "mesh-traffic") renderTraffic("mesh");
 }, 3000);
