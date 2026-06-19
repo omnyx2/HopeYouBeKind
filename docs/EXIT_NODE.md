@@ -159,8 +159,8 @@ that client's internet out through that exit; egress IP must equal the exit's.
 
 | client ↓ \ exit → | Mac | Ubuntu | Windows | Oracle |
 |---|---|---|---|---|
-| **Mac**     | direct | ✅ 203.0.113.30 | ⚠️ Win | ✅ 203.0.113.10 |
-| **Ubuntu**  | ✅ 203.0.113.20 | direct | ⚠️ Win | ✅ 203.0.113.10 |
+| **Mac**     | direct | ✅ 203.0.113.30 | ⚠️ Win | ✅ <PUBLIC_IP> |
+| **Ubuntu**  | ✅ 203.0.113.20 | direct | ⚠️ Win | ✅ <PUBLIC_IP> |
 | **Windows** | ⚠️ Win | ⚠️ Win | direct | ⚠️ Win |
 | **Oracle**  | ✅ 118.235.x | ✅ 203.0.113.30 | ⚠️ Win | direct |
 

@@ -1166,7 +1166,7 @@ mod tests {
     #[test]
     fn is_public_classifies_addresses() {
         let pub_ = |s: &str| is_public(s.parse().unwrap());
-        assert!(pub_("203.0.113.10")); // the Oracle exit
+        assert!(pub_("203.0.113.10")); // a public exit node (RFC 5737 example range)
         assert!(pub_("203.0.113.9"));
         assert!(!pub_("10.0.0.5")); // campus LAN
         assert!(!pub_("192.168.0.5"));

@@ -10,11 +10,11 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 ## 2026-06-18 — mesh unreachable on an IPv6-only / NAT64 cellular network
 
 **Incident:** on an iPhone hotspot, the Mac couldn't reach Oracle (peer idle) AND SSH to
-`203.0.113.10` failed with `Can't assign requested address`. Same hotspot had worked before.
+`<PUBLIC_IP>` failed with `Can't assign requested address`. Same hotspot had worked before.
 
 **Root cause:** the carrier gave an **IPv6-only (NAT64/464XLAT)** stack that session — en0 had
 `192.0.0.2` (CLAT) + IPv6, no usable IPv4. Hostnames worked (DNS64 → IPv6: `google.com` 200) but
-**raw IPv4 literals failed** (`203.0.113.10` → 000): `ipv4only.arpa` returned empty, so CLAT
+**raw IPv4 literals failed** (`<PUBLIC_IP>` → 000): `ipv4only.arpa` returned empty, so CLAT
 couldn't discover the NAT64 prefix and had no path to translate IPv4 literals. The mesh underlay
 advertises Oracle as an **IPv4 literal**, so it was unreachable. "Worked before" = that session
 the cellular gave IPv4 (dual-stack) or CLAT discovered the prefix. The program didn't change; the

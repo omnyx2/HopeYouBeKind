@@ -2,7 +2,7 @@
 
 **Goal:** the mesh underlay works on **IPv6-only / NAT64 (464XLAT) cellular networks**, not
 just IPv4. Today a node behind an IPv6-only carrier can't reach a peer advertised by an IPv4
-literal (e.g. Oracle `203.0.113.10:41000`): the carrier does DNS64 (hostnames → IPv6) but the
+literal (e.g. Oracle `<PUBLIC_IP>:41000`): the carrier does DNS64 (hostnames → IPv6) but the
 device's CLAT may fail to translate raw IPv4 literals, so the UDP send has no route
 (`EADDRNOTAVAIL`). The fix is to make the **overlay-carrying UDP underlay** speak IPv6.
 
@@ -42,7 +42,7 @@ The blockers are the **IPv4-hardcoded bind addresses** and the **v4-only local-a
 - **meshd `local_ip()`** + the `advertise` computation: produce BOTH a v4 and a v6 candidate
   when available.
 - **`MESHD_ADVERTISE`**: already `parse::<SocketAddr>()`, so `[2001:...]:41000` works. Allow a
-  COMMA-LIST so a public node can pin both: `MESHD_ADVERTISE=203.0.113.10:41000,[2001:..]:41000`.
+  COMMA-LIST so a public node can pin both: `MESHD_ADVERTISE=<PUBLIC_IP>:41000,[2001:..]:41000`.
 
 ### 3. Carry MULTIPLE endpoints per member (v4 + v6) end-to-end
 This is the key design change — a peer should advertise every address it might be reached on,

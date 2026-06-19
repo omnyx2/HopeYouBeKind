@@ -143,12 +143,12 @@ async function renderPeersFor(id) {
     const badge = `<span class="state-badge state-${st}">${st}</span>`;
     const ep = m.endpoint ? `<span class="muted small mono"> ${esc(m.endpoint)}</span>` : "";
     // Unreachable peer (not me, not live / no endpoint) → offer an inline "set address" right
-    // where the problem shows. A node behind NAT can't auto-find a public peer (e.g. an Oracle
-    // exit) unless its DHT was bootstrapped at launch; pointing it once lets reflexion + gossip
-    // take over. Same SetPeer the CLI uses; also on the Overview "Peer address" card.
+    // where the problem shows. A node behind NAT can't auto-find a public peer unless its DHT
+    // was bootstrapped at launch; pointing it once lets reflexion + gossip take over. Same
+    // SetPeer the CLI uses; also on the Overview "Peer address" card.
     const needsAddr = !m.is_me && (st !== "live" || !m.endpoint);
     const action = needsAddr
-      ? `<div class="add-row" style="margin-top:6px"><input class="peer-ep-in" data-m="${m.id}" placeholder="ip:port — e.g. 203.0.113.10:41000" style="font-size:12px;flex:1" /><button class="small-btn peer-ep-set" data-m="${m.id}">set address</button></div>`
+      ? `<div class="add-row" style="margin-top:6px"><input class="peer-ep-in" data-m="${m.id}" placeholder="the peer's ip:port" style="font-size:12px;flex:1" /><button class="small-btn peer-ep-set" data-m="${m.id}">set address</button></div>`
       : "";
     // Expel (kick) a member — shown unless the mesh forbids it (expel policy = none).
     const canExpel = !m.is_me && d.expel && d.expel !== "none";
@@ -497,10 +497,10 @@ async function renderConfigs(id) {
     </div>
     <div class="card">
       <div class="card-head"><h2 class="card-title">Peer address <span class="muted small">(manual)</span></h2></div>
-      <p class="muted small">Tell this node where to reach a member. Public Oracle exit: <code>203.0.113.10:41000</code>. The rest is learned once a peer speaks.</p>
+      <p class="muted small">Tell this node where to reach a member — its <code>ip:port</code> (a public node's reachable address). The rest is learned once a peer speaks.</p>
       <div class="add-row">
         <select id="ov-peer-id" class="select">${peerOpts}</select>
-        <input id="ov-peer-ep" placeholder="ip:port — e.g. 203.0.113.10:41000" />
+        <input id="ov-peer-ep" placeholder="the member's ip:port" />
         <button class="small-btn" id="ov-peer-set">set address</button>
       </div>
     </div>

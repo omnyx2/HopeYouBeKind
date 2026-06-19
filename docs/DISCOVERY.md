@@ -25,9 +25,9 @@ knows → it can immediately send (handshake) to them. / `InviteBlob`에 **`invi
 `EndpointRecord { network, member, endpoints, seq, at_ms, sig }` (discovery.rs) —
 signed by the member's key; `seq` bumps when the endpoint changes. `endpoints` = this
 node's reachable address(es): its **reflexive (public) address** (STUN, or set
-explicitly for a public node — the Oracle exit declares `203.0.113.10:41000`), plus any
+explicitly for a public node — the Oracle exit declares `<PUBLIC_IP>:41000`), plus any
 LAN address. / 멤버 키로 서명; 엔드포인트 바뀌면 `seq` 증가. `endpoints` = 도달 가능한 주소들:
-**reflexive(공인) 주소**(STUN 또는 공인 노드는 명시 — Oracle exit은 `203.0.113.10:41000` 선언) +
+**reflexive(공인) 주소**(STUN 또는 공인 노드는 명시 — Oracle exit은 `<PUBLIC_IP>:41000` 선언) +
 LAN 주소.
 
 ### 3. Gossip / 가십
