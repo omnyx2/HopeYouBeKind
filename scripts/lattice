@@ -167,11 +167,12 @@ def cmd_info(sock, a):
         print(f"  ⚠ ATTACK   self-destruct in {d['attack_armed_secs_left']}s "
               f"(creator: `lattice allclear {d['name']}`)")
     print(f"  exit       {('#' + str(d['exit'])) if d['exit'] is not None else 'none'}")
-    print("  members:")
+    print("  members:        (overlay IP = reach it over the tunnel, e.g. ssh user@<overlay-ip>)")
     for mb in d["members"]:
         me = " (me)" if mb["is_me"] else ""
         ep = mb.get("endpoint") or "—"
-        print(f"    #{mb['id']:<3} {mb['name']:<14} {mb['state']:<8} {ep}{me}")
+        ov = mb.get("overlay_ip") or "?"
+        print(f"    #{mb['id']:<3} {mb['name']:<14} {ov:<14} {mb['state']:<8} {ep}{me}")
         if mb.get("reason"):
             print(f"         └ {mb['reason']}")
     warns = d.get("warnings") or []

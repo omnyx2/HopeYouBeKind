@@ -2555,10 +2555,15 @@ fn detail(ms: &MeshState) -> MeshDetail {
                     ),
                 }
             };
+            // Overlay (virtual) IP: <prefix>.<mesh_id>.<member_id> — the address peers
+            // reach this member at over the tunnel (e.g. ssh user@100.80.1.1).
+            let p = ms.mesh.charter.overlay_prefix;
+            let overlay_ip = format!("{}.{}.{}.{}", p[0], p[1], ms.mesh.id, c.id);
             MemberView {
                 id: c.id,
                 name: c.name.clone(),
                 pubkey_fp: fp(&c.member),
+                overlay_ip,
                 is_me,
                 endpoint,
                 state,

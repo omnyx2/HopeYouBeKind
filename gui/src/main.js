@@ -157,8 +157,11 @@ async function renderPeersFor(id) {
       : "";
     // The daemon explains a non-live peer (idle/unknown) in `reason` — show it verbatim.
     const why = m.reason ? `<div class="muted small" style="margin-top:4px">↳ ${esc(m.reason)}</div>` : "";
+    // The overlay IP is the stable address you reach this member at over the tunnel
+    // (e.g. ssh user@100.80.1.1) — far more useful day-to-day than the physical endpoint.
+    const ov = m.overlay_ip ? `<span class="mono small">${esc(m.overlay_ip)}</span>` : "";
     return `<tr><td>${m.id}</td><td>${esc(m.name)}${m.is_me ? ' <span class="muted small">(me)</span>' : ""}</td>` +
-      `<td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}${why}${action}${expelBtn}</td></tr>`;
+      `<td>${ov}</td><td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}${why}${action}${expelBtn}</td></tr>`;
   }).join("");
   const tbl = el("peers-table");
   tbl.querySelector("tbody").innerHTML = rows;

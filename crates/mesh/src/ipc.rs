@@ -269,6 +269,11 @@ pub struct MemberView {
     pub name: String,
     /// Short hex fingerprint of the member's public key.
     pub pubkey_fp: String,
+    /// This member's **overlay (virtual mesh) IP** — the stable address you reach it at
+    /// over the tunnel (e.g. `ssh user@100.80.1.1`), regardless of its physical network.
+    /// Derived from the mesh's overlay prefix + mesh id + member id.
+    #[serde(default)]
+    pub overlay_ip: String,
     pub is_me: bool,
     /// Where we currently reach this member (`ip:port`), if known. `None` until it
     /// is seeded or heard from (P6.3c/d).
