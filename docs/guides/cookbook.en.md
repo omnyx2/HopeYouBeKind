@@ -76,7 +76,8 @@ lattice off                # back to direct internet
 ```
 
 **Caveats:** DNS and routing are handled for you automatically (this was fixed in
-**0.7.0** — on older builds full tunnel could break DNS). If the exit member dies
+a later release — on older builds full tunnel could break DNS, so update `meshd`).
+If the exit member dies
 while you're tunnelled, a **kill-switch** auto-reverts you to direct internet so
 you're never stranded.
 

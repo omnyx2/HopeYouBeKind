@@ -3,7 +3,7 @@
 A snapshot of what Lattice does today. Legend: ✅ working & tested ·
 ⚠️ working subset / needs integration · 🔜 designed, not built.
 
-New since v0.7.0: a **pluggable crypto suite** seam, **mesh membership** (network
+Recent additions: a **pluggable crypto suite** seam, **mesh membership** (network
 CA + certs + revocation), and a **traffic monitor**. Per-feature guides:
 [USAGE](../legacy/docs/USAGE.md) · [MEMBERSHIP](MEMBERSHIP.md) · [CRYPTO_SUITE](../legacy/docs/CRYPTO_SUITE.md) ·
 [TRAFFIC_MONITOR](../legacy/docs/TRAFFIC_MONITOR.md) · [EXIT_NODE](EXIT_NODE.md) ·
