@@ -105,6 +105,12 @@ You can now reach machine A from machine B at its overlay IP — e.g.
 peer-to-peer.
 
 > The identity code **expires in ~10 minutes** — mint it right before inviting.
+>
+> **Important:** the identity from `lattice id` lives **in memory only**, so `id` and
+> `join` must happen on the **same computer with no `meshd` restart in between**. If the
+> daemon restarts (or you minted `id` on a different machine), `join` fails with
+> `no pending identity for this invite` → re-run `lattice id` on the **joining** computer,
+> re-mint the invite, and join — no restart between.
 
 ---
 
@@ -170,5 +176,6 @@ lattice raw '<json>'       # escape hatch: send a raw request
 | `meshd not reachable` | The daemon isn't running, or wrong socket. Start `meshd`, or pass `--sock <path>`. |
 | `join` says `already in mesh` | This computer is already a member of that mesh. |
 | `invite` says identity is too old | The code expired (~10 min). Re-run `lattice id` and try again. |
+| `join` says `no pending identity for this invite` | The identity lives in memory and is lost on `meshd` restart (or you minted `id` on a different computer). On the **joining** computer: re-run `lattice id` → re-mint the invite → `join`, with no restart between. |
 | Full tunnel, but no internet | You're likely on an old build — DNS/route handling was fixed in a later release. Update to the latest `meshd` (rebuild, or install the newest release). |
 | Peers stuck `idle`, never `live` | They can't reach each other's UDP port. On a public exit set `MESHD_ADVERTISE`; check firewalls. |

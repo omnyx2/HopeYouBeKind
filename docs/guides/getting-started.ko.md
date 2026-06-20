@@ -102,6 +102,11 @@ lattice info home
 파일 복사, 뭐든 가능. 트래픽은 암호화되고 P2P로 흐릅니다.
 
 > 신원 코드는 **약 10분 후 만료**됩니다 — 초대 직전에 발급하세요.
+>
+> **중요:** `lattice id`로 만든 신원은 **메모리에만** 있습니다. 그래서 **`id`와 `join`은
+> 같은 컴퓨터에서, 중간에 `meshd` 재시작 없이** 해야 합니다. 재시작하면(또는 다른 컴퓨터에서
+> `id`를 만들면) 가입 때 `no pending identity for this invite`가 납니다 → 가입할 컴퓨터에서
+> `lattice id`부터 다시 하고 초대도 재발급하세요.
 
 ---
 
@@ -167,5 +172,6 @@ lattice raw '<json>'       # 비상 탈출구: 원시 요청 전송
 | `meshd not reachable` | 데몬이 안 켜졌거나 소켓 경로가 틀림. `meshd` 실행, 또는 `--sock <경로>` 지정. |
 | `join`이 `already in mesh` | 이 컴퓨터가 이미 그 메쉬의 멤버임. |
 | `invite`가 신원이 너무 오래됐다고 함 | 코드 만료(~10분). `lattice id` 다시 실행 후 재시도. |
+| `join`이 `no pending identity for this invite` | 신원은 메모리에만 있어서 `meshd` 재시작 시 사라짐(또는 `id`를 다른 컴퓨터에서 만듦). **가입할 컴퓨터에서** `lattice id`부터 다시 → 초대 재발급 → 재시작 없이 바로 `join`. |
 | 풀터널인데 인터넷이 안 됨 | 구버전 빌드일 가능성 — DNS/라우트 처리는 이후 릴리스에서 수정됨. 최신 `meshd`로 업데이트(재빌드 또는 최신 릴리스 설치). |
 | 피어가 계속 `idle`, `live`가 안 됨 | 서로의 UDP 포트에 못 닿는 상태. 공개 출구는 `MESHD_ADVERTISE` 설정, 방화벽 확인. |

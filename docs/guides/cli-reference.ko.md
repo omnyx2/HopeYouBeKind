@@ -197,6 +197,9 @@ lattice info home            # 두 멤버 모두 'live'여야 함
 신원 코드는 만료됩니다(~10분, P-C6). 비밀성을 위해 호스트가 `invite`에 `--algo`를 줄 수 있고,
 가입자는 `join`에 같은 `--algo`를 써야 합니다(out-of-band로 전달).
 
+> 신원은 가입자 `meshd`의 **메모리에만** 있습니다 — `id`와 `join`은 **같은 머신·같은 데몬에서
+> 재시작 없이** 하세요. 아니면 `join`이 `no pending identity for this invite`로 실패합니다.
+
 **헤드리스 단축** — `invite`/`join`에 `-`를 주면 코드를 **stdin**에서 읽으므로, SSH 가능한
 머신 사이에서 교환 전체를 파이프로 연결할 수 있습니다:
 
@@ -318,6 +321,7 @@ CLI는 유닉스 소켓을 써서 **Windows 데몬을 직접 제어하지 못합
 | 증상 | 원인 / 해결 |
 |---|---|
 | `meshd not running (… )` | 데몬 미실행 또는 `LATTICE_SOCK` 잘못됨. `meshd` 실행, 소켓 경로 확인. |
+| `join`이 `no pending identity for this invite` | `lattice id`로 만든 신원은 **메모리에만** 있어서 `meshd` 재시작 시 사라짐(또는 `id`를 다른 머신에서 만듦). **가입 머신에서** `lattice id` 재실행 → 초대 재발급 → **재시작 없이** `join`. `id`와 `join`은 같은 머신·같은 데몬이어야 함. |
 | `info`에 멤버 `unknown` / 엔드포인트 `—` | 피어 아직 도달 불가. 양쪽 데이터 플레인 포트 개방 확인; DHT/가십 ~30초 내 수렴. |
 | 멤버가 `unknown`에서 안 풀리고 **공개 노드**가 연결 안 됨 (특히 GUI로 만든 메쉬) | NAT 뒤 노드는 `meshd`를 `MESHD_DHT_BOOTSTRAP=<공인IP>:41001`로 띄우지 않으면 공개 피어를 자동으로 못 찾습니다. **GUI는 그 설정 없이 `meshd`를 띄우므로** 한 번 직접 지정: **Peers 탭 → `unknown` 멤버 → "set address" → `<공인IP>:41000`** (또는 Overview "Peer address" 카드). CLI 등가: `lattice raw '{"SetPeer":{"mesh":N,"member":M,"endpoint":"<공인IP>:41000"}}'`. 패킷 한 번 가면 reflexion + 가십이 이어받아 전원 수렴. **`MESHD_DHT_BOOTSTRAP`으로 띄운 CLI 클라이언트**는 이 단계가 불필요. |
 | GUI/`info`에 **data plane DOWN** | 메쉬 UDP 포트를 다른 프로세스(낡은/두 번째 `meshd`)가 점유. `meshd`가 몇 초간 bind 재시도; 낡은 데몬 종료하면 복구(단일-인스턴스 가드가 새 데몬이 살아있는 걸 빼앗지 않게 함). |

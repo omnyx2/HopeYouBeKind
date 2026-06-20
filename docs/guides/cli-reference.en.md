@@ -203,6 +203,10 @@ lattice info home            # both members should show 'live'
 Identity codes expire (~10 min, P-C6). For secrecy, the host may pass `--algo` to
 `invite`; the joiner must use the same `--algo` on `join` (tell them out-of-band).
 
+> The identity lives **in memory** on the joiner's `meshd` — run `id` and `join` on the
+> **same machine/daemon with no restart between**, or `join` fails with `no pending
+> identity for this invite`.
+
 **Headless shortcut** — `invite`/`join` read the code from **stdin** when given `-`, so
 the whole exchange pipes between machines you can SSH into:
 
@@ -320,6 +324,7 @@ directly — use the desktop GUI, or a named-pipe IPC client, to issue `NewIdent
 | Symptom | Cause / fix |
 |---|---|
 | `meshd not running (… ): No such file/Connection refused` | Daemon isn't up, or wrong `LATTICE_SOCK`. Start `meshd`; check the socket path. |
+| `join` says `no pending identity for this invite` | The identity from `lattice id` lives **in memory** and is lost on `meshd` restart (or you minted `id` on a different machine). On the **joining** machine: re-run `lattice id` → re-mint the invite → `join`, with no restart between. `id` and `join` must be the same machine/daemon. |
 | `info` shows a member `unknown` / endpoint `—` | Peer not reachable yet. Check both data-plane ports are open; the DHT/gossip converge within ~30 s. |
 | A member stays `unknown` and a **public node** never connects (esp. a GUI-created mesh) | A node behind NAT can't auto-find a public peer unless its `meshd` was launched with `MESHD_DHT_BOOTSTRAP=<PUBLIC_IP>:41001`. The **GUI launches `meshd` without that**, so point it once: **Peers tab → the `unknown` member → "set address" → `<PUBLIC_IP>:41000`** (or the Overview "Peer address" card). CLI equivalent: `lattice raw '{"SetPeer":{"mesh":N,"member":M,"endpoint":"<PUBLIC_IP>:41000"}}'`. After one packet, reflexion + gossip take over and everyone converges. A **CLI client started with `MESHD_DHT_BOOTSTRAP`** skips this entirely. |
 | GUI/`info` shows **data plane DOWN** | The mesh's UDP port is held by another process (a stale/second `meshd`). `meshd` retries the bind for a few seconds; kill the stale daemon and it recovers (single-instance guard prevents new ones from orphaning a live one). |
