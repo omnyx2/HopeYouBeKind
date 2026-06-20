@@ -1,126 +1,161 @@
 <h1 align="center">Lattice</h1>
 
 <p align="center">
-  <i>A serverless mesh VPN that fuses every node into one overlay SDN.</i>
+  <i>A serverless mesh VPN — fuse your machines into one private network, anywhere.</i>
+</p>
+
+<p align="center">
+  <a href="https://github.com/omnyx2/HopeYouBeKind/releases/latest"><b>⬇ Download</b></a> ·
+  <a href="docs/guides/getting-started.en.md">Getting started</a> ·
+  <a href="docs/guides/getting-started.ko.md">시작하기</a>
 </p>
 
 ---
 
-Install the app on any set of machines and they self-assemble into a single,
-private, encrypted network — as if they were all plugged into the same switch,
-no matter where they physically are. No central server to run, no accounts.
+Install Lattice on any set of machines and they self-assemble into **one private,
+encrypted network**. Every node gets a stable virtual IP and can reach every other node
+**directly, peer-to-peer — across NAT and firewalls, with no port-forwarding, no central
+server, and no accounts.**
 
-> **Status:** `0.7.0` — working serverless mesh. Real Noise-IK tunnel, mDNS LAN
-> discovery, NAT hole punching, daemon/CLI/GUI control plane, cross-platform TUN
-> (macOS/Linux/Windows), and hardening components (replay window, rekey, cookie).
-> Remaining infra (DHT rendezvous, GUI packaging, AEAD-bound replay) is tracked
-> in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> **Status:** early-access / research prototype (v0.5.x). Live-verified across **macOS,
+> Linux, and Windows** over the real internet. Built for your own machines / trusted
+> members — see [Security](#security).
 
-## What it is
+## What you can do with it
 
-- **Mesh overlay** — every node gets a stable virtual IP (e.g. `100.64.x.x`) and
-  can reach every other node directly, peer-to-peer.
-- **Serverless** — peers discover each other on the LAN via mDNS and (roadmap)
-  across the internet via a DHT + NAT hole-punching. No coordination server.
-- **Custom encrypted tunnel** — the handshake/session protocol is our own
-  design, built on *vetted* cryptographic primitives (the Noise framework via
-  the `snow` crate), not hand-rolled ciphers. See [`legacy/docs/PROTOCOL.md`](legacy/docs/PROTOCOL.md).
-- **GUI-first** — a Tauri desktop app is the primary interface; a `lattice` CLI
-  and a background daemon back it.
-- **Cross-platform** — macOS, Windows, Linux.
+- **🖥 Reach any machine from anywhere.** SSH / RDP / VNC into your home or lab box at its
+  mesh IP (`ssh you@100.80.1.4`) even though it sits behind a school/office NAT —
+  **no port-forwarding, no public IP.**
+- **🔒 A private LAN over the internet.** Your laptop, server, and home PC all see each
+  other on `100.80.x.x` as if plugged into one switch. End-to-end encrypted
+  (ChaCha20-Poly1305).
+- **🌍 Full-tunnel VPN.** Route all your internet through any node (`lattice vpn`) and
+  browse as if you were there (its egress IP / region).
+- **🧱 Punch through restrictive networks.** A NAT'd box reaches *out* to a public node;
+  you reach back *in* over the tunnel. A public node also **auto-relays** when two peers
+  can't connect directly.
 
-## Architecture at a glance
+## Install
 
-```
-        ┌────────────────────────────┐
-        │   GUI (Tauri)  /  CLI       │   user-facing control
-        └─────────────┬──────────────┘
-                      │ IPC (local socket)
-        ┌─────────────▼──────────────┐
-        │   lattice-daemon           │   privileged background service
-        │  ┌──────────────────────┐  │
-        │  │   lattice-engine     │  │   node runtime / orchestration
-        │  ├──────────┬───────────┤  │
-        │  │ overlay  │   net     │  │   control plane + transport/discovery
-        │  ├──────────┼───────────┤  │
-        │  │  crypto  │   tun     │  │   data plane: tunnel + virtual NIC
-        │  └──────────┴───────────┘  │
-        └────────────────────────────┘
-```
+### Desktop app — macOS · Windows · Linux
 
-Each box is its own crate so features, tests, and version bumps move
-independently. Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Grab the installer from the **[latest release](https://github.com/omnyx2/HopeYouBeKind/releases/latest)**:
 
-## Make your first VPN (beginner guide)
+| OS | File |
+|----|------|
+| macOS (Apple Silicon) | `Lattice_*_aarch64.dmg` |
+| Windows | `Lattice_*_x64-setup.exe` |
+| Linux | `lattice_*_amd64.deb`  or  `lattice_*_amd64.AppImage` |
 
-New here? The hands-on, bilingual beginner guides walk you from zero to a working
-VPN using the friendly [`lattice` CLI](scripts/lattice):
+Launch it — it asks once for admin access to create the tunnel, then you're in.
 
-- **English** — [Getting started](docs/guides/getting-started.en.md) ·
-  [Feature cookbook](docs/guides/cookbook.en.md)
-- **한국어** — [시작하기](docs/guides/getting-started.ko.md) ·
-  [기능 쿡북](docs/guides/cookbook.ko.md)
-- Index: [`docs/guides/`](docs/guides/README.md)
+### Headless / server — CLI + daemon
 
-## Quick start (developers)
-
-```bash
-# Build & sanity-check the whole core workspace (no privileges needed)
-cargo check
-cargo test
-
-# Run lints exactly as CI does
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-
-# Run the daemon (needs elevated privileges to create the TUN device)
-sudo cargo run -p lattice-daemon
-
-# Talk to it from another terminal
-cargo run -p lattice-cli -- status
+```sh
+git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
+cargo build --release -p lattice-meshd     # build the daemon
+sudo ./scripts/lattice install             # put the `lattice` CLI on your PATH
+sudo lattice up                            # start the daemon (creates the tunnel)
+lattice status                             # check it's running
 ```
 
-GUI setup lives in [`gui/README.md`](gui/README.md).
+No Rust toolchain? Download the prebuilt daemon from the release
+([`meshd-Linux-X64`](https://github.com/omnyx2/HopeYouBeKind/releases/latest/download/meshd-Linux-X64),
+also macOS-ARM64 / Windows-X64), then `export LATTICE_MESHD=/path/to/meshd` and
+`sudo lattice up`. (The CLI needs only Python 3.)
 
-## Repository layout
+## Quick start — two machines in one mesh
 
-| Path                | What lives there                                        |
-| ------------------- | ------------------------------------------------------- |
-| `crates/proto`      | Shared wire types, message framing, IPC contract        |
-| `crates/crypto`     | The custom encrypted-tunnel protocol (handshake/session)|
-| `crates/tun`        | Cross-platform virtual network interface (TUN)          |
-| `crates/net`        | UDP transport, NAT traversal, mDNS/DHT peer discovery   |
-| `crates/overlay`    | SDN control plane: virtual-IP allocation, routing table |
-| `crates/engine`     | Node runtime that wires the planes together             |
-| `crates/membership` | Network CA: identity, member certs, revocation          |
-| `crates/dht`        | Kademlia DHT for serverless peer rendezvous             |
-| `crates/ipc`        | Local daemon⇄GUI/CLI control protocol (Unix socket)     |
-| `crates/daemon`     | Privileged background service + IPC server              |
-| `crates/cli`        | Terminal control client                                 |
-| `gui/`              | Tauri desktop application                                |
-| `docs/`             | Guides, architecture, protocol spec, roadmap, security  |
+**Machine A** — create the mesh:
+```sh
+lattice new home --me alice          # you become member #1
+```
 
-## Documentation
+**Machine B** — mint an identity:
+```sh
+lattice id                           # prints a one-line code → send it to A
+```
 
-Start with the **v2 beginner guides** —
-[getting started](docs/guides/getting-started.en.md) ·
-[cookbook](docs/guides/cookbook.en.md) ([한국어](docs/guides/getting-started.ko.md)) —
-then the index in **[`docs/README.md`](docs/README.md)**:
-[membership](docs/MEMBERSHIP.md), [exit node](docs/EXIT_NODE.md),
-[mesh v2 internals](docs/MESH_V2.md).
-The original **v1** stack (daemon/CLI, CA, DHT, crypto-swap lab) is archived under
-[`legacy/`](legacy/README.md) — its build/run guide is
-[`legacy/docs/USAGE.md`](legacy/docs/USAGE.md). There's also a design write-up in
-[`docs/blog/`](docs/blog/building-a-serverless-mesh-vpn.md).
+**Machine A** — invite B with that code:
+```sh
+lattice invite home bob <B's-id-code>   # prints a one-line invite code → send it back to B
+```
+
+**Machine B** — join, then reach A over the tunnel:
+```sh
+lattice join <invite-code>
+lattice info home                    # both show 'live' + their overlay IP (100.80.1.x)
+ssh alice@100.80.1.1                  # A is member #1 → 100.80.1.1
+```
+
+That's it — A and B are now one encrypted mesh, reachable by their `100.80.1.x` addresses
+from anywhere.
+
+**Want a public seed/exit node?** On an always-on cloud VM (open UDP 41000+41001):
+```sh
+sudo lattice install-service --advertise <PUBLIC_IP>:41000 --dht-port 41001   # start at boot
+sudo lattice serve-exit home          # make this node the mesh's internet exit
+```
+NAT'd clients then bootstrap off it: `sudo lattice up --dht-bootstrap <PUBLIC_IP>:41001`.
+
+→ **Full walk-throughs:**
+[Getting started](docs/guides/getting-started.en.md) ([한국어](docs/guides/getting-started.ko.md)) ·
+[Cookbook](docs/guides/cookbook.en.md) ·
+[Server setup](docs/guides/server-setup.en.md) ·
+[CLI reference](docs/guides/cli-reference.en.md)
+
+## Features
+
+- **Serverless discovery** — invite endpoints + 20 s gossip + reflexive STUN + LAN
+  multicast beacon + **DHT rendezvous**. No coordination server.
+- **Relay** — a public node forwards traffic when two peers can't connect directly
+  (symmetric-NAT / blocked-path fallback), with NAT-keepalive so the path stays open.
+- **Membership** — admin-free invite chain (any member can invite); per-mesh expel policy;
+  key rotation (re-cipher) that evicts offline members.
+- **Routing** — full-tunnel / split-tunnel internet exit, plus an OpenFlow-style
+  **flow table** for custom routing rules, gossiped to all members.
+- **Crypto** — per-mesh cipher (ChaCha20-Poly1305), floating header placement, attack
+  alert + liveness self-destruct.
+- **Tools** — a `lattice` CLI (daemon lifecycle, invite flow, `doctor`, traffic monitor)
+  and a Tauri **GUI** (peers, topology, traffic, overlay IPs).
+- **Resilient** — persists meshes to disk and self-heals across network changes
+  (Wi-Fi ↔ cellular, new IP) so nodes rejoin automatically.
+- **Cross-platform** — macOS, Linux, Windows.
+
+## How it works
+
+Each machine runs a small daemon (`meshd`) that creates a per-mesh **TUN** device and a
+UDP socket. Members share a mesh secret; every frame is sealed (ChaCha20-Poly1305) and
+sent peer-to-peer, with the public node relaying when direct paths fail. The CLI/GUI talk
+to the daemon over a local socket — the daemon is the single authoritative actor; the GUI
+just visualizes it. Architecture detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
+[`docs/MESH_V2.md`](docs/MESH_V2.md).
+
+```
+crates/proto · tun · net      shared wire types, virtual NIC, UDP transport + relay
+crates/mesh                   per-mesh crypto, membership, charter, flow table, IPC contract
+crates/meshrun                the data-plane loop (TUN ⇄ sealed UDP ⇄ peers/relay)
+crates/meshd                  the daemon: control plane, discovery, persistence, IPC server
+scripts/lattice               the zero-dependency Python CLI
+gui/                          the Tauri desktop app
+```
+(The original v1 stack is archived under [`legacy/`](legacy/README.md).)
+
+## Security
+
+This is an **early-access prototype**, built for **your own machines and trusted members**:
+
+- **Members share the mesh key** — any member can read/relay the mesh's traffic. Invite
+  only people/devices you trust. (App-layer encryption like SSH/TLS still protects content
+  end-to-end on top of the tunnel.)
+- The local control socket trusts **local processes** on that machine — run it on
+  machines you control.
+- Not yet hardened for hostile multi-tenant use. For your own fleet, a home/lab/office
+  setup, or a research deployment, it's ready to use today.
 
 ## License
 
-**Source-available, noncommercial** — see [`LICENSE`](LICENSE). Free for personal
-and research use. Two things require contacting the author (**omnyx2@gmail.com**)
-first: **commercial use** (needs a separate license) and **publishing an academic
-paper** based on this software (needs permission; the author must be credited if
-requested).
-
-Uses the WireGuard-style Noise protocol design via the MIT-licensed `snow` crate;
-"WireGuard" is a trademark of Jason A. Donenfeld and this project is not affiliated
-with or endorsed by it.
+**Source-available, noncommercial** — see [`LICENSE`](LICENSE). Free for personal and
+research use. Two things require contacting the author (**omnyx2@gmail.com**) first:
+**commercial use** (needs a separate license) and **publishing an academic paper** based
+on this software (needs permission; the author must be credited if requested).
