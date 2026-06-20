@@ -170,5 +170,5 @@ lattice raw '<json>'       # escape hatch: send a raw request
 | `meshd not reachable` | The daemon isn't running, or wrong socket. Start `meshd`, or pass `--sock <path>`. |
 | `join` says `already in mesh` | This computer is already a member of that mesh. |
 | `invite` says identity is too old | The code expired (~10 min). Re-run `lattice id` and try again. |
-| Full tunnel, but no internet | You're likely on an old build — DNS/route handling was fixed in `0.7.0`. Rebuild `meshd`. |
+| Full tunnel, but no internet | You're likely on an old build — DNS/route handling was fixed in a later release. Update to the latest `meshd` (rebuild, or install the newest release). |
 | Peers stuck `idle`, never `live` | They can't reach each other's UDP port. On a public exit set `MESHD_ADVERTISE`; check firewalls. |

@@ -144,14 +144,17 @@ sudo DATA_PLANE=1 ./target/release/meshd
 |---|---|
 | `ls` | 이 머신의 메쉬 목록. |
 | `info <mesh>` | 한 메쉬: 멤버·생존성·엔드포인트·출구·건강. |
-| `new <name> [--me 이름] [--max N] [--cipher C] [--ephemeral] [--master-gated]` | 메쉬 생성(당신이 멤버 #1). |
+| `doctor [mesh]` | 메쉬 건강 진단(idle 이유, 복호실패/split-brain) + 권장 조치. |
+| `new <name> [--me 이름] [--max N] [--cipher C] [--ephemeral] [--master-gated] [--expel 정책] [--header 배치]` | 메쉬 생성(당신이 멤버 #1). |
 | `id` | 신원 코드 발급(메쉬 호스트에게 줘서 초대받기). |
 | `invite <mesh> <name> <id_code> [--algo A]` | (호스트) 가입자 신원 코드로 초대 발급. |
 | `join <invite_code> [--algo A]` | 초대 코드로 메쉬 가입. |
 | `exit <mesh> <member>` | 인터넷 출구가 될 멤버 선택. |
 | `vpn <mesh>` | **모든** 인터넷 트래픽을 그 메쉬 출구로(풀 터널). |
 | `off` | 풀 터널 중지; 직접 인터넷으로 복귀. |
+| `traffic [mesh] [--detail]` | 트래픽 모니터: 피어별 바이트/패킷(`--detail`은 최근 흐름까지). |
 | `recipher <mesh> [--cipher C]` | 메쉬 키 교체(오프라인 멤버 축출). |
+| `expel <mesh> <member>` | 멤버 추방(메쉬의 추방 정책에 따라). |
 | `attack <mesh>` | 공격 경보(원-비토, fail-deadly 자폭). |
 | `allclear <mesh>` | (생성자) 공격 경보 취소. |
 | `rm <mesh>` | 이 머신에서 메쉬 삭제. |
@@ -242,7 +245,7 @@ Environment=DATA_PLANE=1
 Environment=MESHD_BIND_PORT=41000
 Environment=MESHD_DHT_PORT=41001
 Environment=MESHD_ADVERTISE=<공인IP>:41000
-ExecStart=/home/ubuntu/myVpn/target/release/meshd /tmp/meshd.sock
+ExecStart=/path/to/meshd /tmp/meshd.sock
 Restart=on-failure
 RestartSec=3
 

@@ -150,14 +150,17 @@ runs.
 |---|---|
 | `ls` | List meshes on this machine. |
 | `info <mesh>` | Show one mesh: members, liveness, endpoints, exit, health. |
-| `new <name> [--me NAME] [--max N] [--cipher C] [--ephemeral] [--master-gated]` | Create a mesh (you become member #1). |
+| `doctor [mesh]` | Diagnose mesh health (idle reasons, decrypt-fail/split-brain) and suggest fixes. |
+| `new <name> [--me NAME] [--max N] [--cipher C] [--ephemeral] [--master-gated] [--expel POLICY] [--header PLACEMENT]` | Create a mesh (you become member #1). |
 | `id` | Mint an identity code (give this to a mesh host so they can invite you). |
 | `invite <mesh> <name> <id_code> [--algo A]` | (host) Mint an invite for a joiner's identity code. |
 | `join <invite_code> [--algo A]` | Join a mesh from an invite code. |
 | `exit <mesh> <member>` | Pick which member is the internet exit. |
 | `vpn <mesh>` | Route **all** internet traffic through that mesh's exit (full tunnel). |
 | `off` | Stop full tunnel; back to direct internet. |
+| `traffic [mesh] [--detail]` | Traffic monitor: per-peer bytes/packets (`--detail` adds recent flows). |
 | `recipher <mesh> [--cipher C]` | Rotate the mesh key (evicts offline members). |
+| `expel <mesh> <member>` | Expel (revoke) a member, per the mesh's expel policy. |
 | `attack <mesh>` | Raise an attack alert (one-veto, fail-deadly self-destruct). |
 | `allclear <mesh>` | (creator) Cancel an attack alert. |
 | `rm <mesh>` | Wipe a mesh from this machine. |
@@ -248,7 +251,7 @@ Environment=DATA_PLANE=1
 Environment=MESHD_BIND_PORT=41000
 Environment=MESHD_DHT_PORT=41001
 Environment=MESHD_ADVERTISE=<PUBLIC_IP>:41000
-ExecStart=/home/ubuntu/myVpn/target/release/meshd /tmp/meshd.sock
+ExecStart=/path/to/meshd /tmp/meshd.sock
 Restart=on-failure
 RestartSec=3
 
