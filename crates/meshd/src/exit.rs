@@ -159,7 +159,7 @@ fn macos_default_iface() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn enable_nat() {
+pub fn enable_nat(_isolate: bool) {
     run("sysctl", &["-w", "net.inet.ip.forwarding=1"]);
     let Some(wan) = macos_default_iface() else {
         tracing::warn!("no default interface; macOS exit NAT not applied");
@@ -388,10 +388,16 @@ fn linux_default_route() -> Option<(String, String)> {
     Some((gw, dev))
 }
 
+/// Side routing table + rule priority for exit-policy ISOLATE (docs/EXIT_POLICY.md).
 #[cfg(target_os = "linux")]
-pub fn enable_nat() {
+const ISO_TABLE: &str = "100";
+#[cfg(target_os = "linux")]
+const ISO_PRIO: &str = "1000";
+
+#[cfg(target_os = "linux")]
+pub fn enable_nat(isolate: bool) {
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"]);
-    if let Some((_, wan)) = linux_default_route() {
+    if let Some((gw, wan)) = linux_default_route() {
         run(
             "iptables",
             &[
@@ -419,6 +425,40 @@ pub fn enable_nat() {
             &["-I", "FORWARD", "1", "-d", "100.64.0.0/10", "-j", "ACCEPT"],
         );
         tracing::warn!(wan, "exit NAT enabled (masquerade)");
+        if isolate {
+            // Exit-policy ISOLATE: pin traffic we forward FOR OTHERS (sourced from the
+            // overlay range 100.64/10) to the REAL default gateway via a side table, so it
+            // leaves our own WAN even if our own full-tunnel later diverts the main-table
+            // default. Our own traffic (real src IP) is unaffected and still follows main.
+            run(
+                "ip",
+                &[
+                    "route", "replace", "default", "via", &gw, "dev", &wan, "table", ISO_TABLE,
+                ],
+            );
+            // `ip rule add` isn't idempotent — clear any stale duplicate first (ok if absent).
+            let _ = Command::new("ip")
+                .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
+                .status();
+            run(
+                "ip",
+                &[
+                    "rule",
+                    "add",
+                    "from",
+                    "100.64.0.0/10",
+                    "lookup",
+                    ISO_TABLE,
+                    "priority",
+                    ISO_PRIO,
+                ],
+            );
+            tracing::warn!(
+                gw,
+                table = ISO_TABLE,
+                "exit-policy isolate: forwarded traffic pinned to real WAN"
+            );
+        }
     }
 }
 
@@ -441,6 +481,13 @@ pub fn disable_nat() {
             ],
         );
     }
+    // Tear down the isolate source-routing (harmless if it was never installed).
+    let _ = Command::new("ip")
+        .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
+        .status();
+    let _ = Command::new("ip")
+        .args(["route", "flush", "table", ISO_TABLE])
+        .status();
     run("sysctl", &["-w", "net.ipv4.ip_forward=0"]);
 }
 
@@ -554,7 +601,7 @@ pub fn current_gateway() -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn enable_nat() {
+pub fn enable_nat(_isolate: bool) {
     // Forward between interfaces + WinNAT for the overlay range.
     ps("Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue");
     ps("if (-not (Get-NetNat -Name Lattice -ErrorAction SilentlyContinue)) { New-NetNat -Name Lattice -InternalIPInterfaceAddressPrefix 100.64.0.0/10 }");
@@ -590,7 +637,7 @@ pub fn route_through(_tun: &str, _exit_ip: IpAddr) -> Result<(), String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn restore_routes() {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn enable_nat() {
+pub fn enable_nat(_isolate: bool) {
     tracing::warn!("exit-node NAT not implemented on this platform");
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
