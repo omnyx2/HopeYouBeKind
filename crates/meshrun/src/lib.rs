@@ -1172,7 +1172,7 @@ mod tests {
     fn gossip_updates_a_stale_endpoint_but_keeps_a_fresh_direct_one() {
         let now = 1_000_000u64;
         let mut links = HashMap::new();
-        links.insert(4u8, link("10.32.161.153:42001", 0)); // 4: stale — never heard directly
+        links.insert(4u8, link("192.168.0.4:42001", 0)); // 4: stale — never heard directly
         links.insert(5u8, link("10.0.0.5:42001", now)); // 5: fresh direct path
         let table: Vec<(MemberId, SocketAddr)> = vec![
             (1, "203.0.113.1:42001".parse().unwrap()), // our own id → must be ignored

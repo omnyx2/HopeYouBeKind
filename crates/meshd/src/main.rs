@@ -1603,7 +1603,7 @@ fn local_ip() -> Option<std::net::IpAddr> {
     s.local_addr().ok().map(|a| a.ip())
 }
 
-/// This host's real **physical LAN address** (e.g. en0 `10.32.x.x`), read straight from
+/// This host's real **physical LAN address** (e.g. en0 `192.168.x.x`), read straight from
 /// the NIC list (`getifaddrs`) rather than a route lookup. Unlike [`local_ip`], this is NOT
 /// distorted when full-tunnel diverts the default route through the overlay — so it's a
 /// stable "which network am I physically on" signal for topology grouping. Picks the first
