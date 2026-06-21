@@ -609,6 +609,7 @@ dependencies = [
  "lattice-proto",
  "rand",
  "serde",
+ "serde_json",
  "thiserror",
  "x25519-dalek",
 ]

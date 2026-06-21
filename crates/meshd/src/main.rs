@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use lattice_mesh::charter::{
-    ExpelPolicy, GenesisCharter, HeaderPlacement, InviteTopology, RecipherTrigger,
+    ExitPolicy, ExpelPolicy, GenesisCharter, HeaderPlacement, InviteTopology, RecipherTrigger,
 };
 use lattice_mesh::crypto::suite;
 use lattice_mesh::dataplane::MeshDataPlane;
@@ -1695,6 +1695,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             master_gated,
             expel,
             header,
+            exit_policy,
         } => create_mesh(
             st,
             name,
@@ -1705,6 +1706,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             master_gated,
             expel,
             header,
+            exit_policy,
         ),
 
         Request::ExpelMember { mesh, member } => expel_member(st, mesh, member),
@@ -2435,6 +2437,7 @@ fn create_mesh(
     master_gated: Option<bool>,
     expel: Option<String>,
     header: Option<String>,
+    exit_policy: Option<String>,
 ) -> (Response, Option<PostAction>) {
     // The mesh id is the real key, but a human picks a mesh by NAME and the GUI lists
     // meshes by name — so two same-named meshes render as indistinguishable "peer" rows
@@ -2483,6 +2486,11 @@ fn create_mesh(
         Ok(p) => p,
         Err(e) => return (err(&e), None),
     };
+    // Exit egress policy (docs/EXIT_POLICY.md) — isolate (default) vs chain.
+    let exit_policy = match parse_exit_policy(exit_policy.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return (err(&e), None),
+    };
     let master = MasterKey::generate();
     let my_key = MemberKey::generate();
     let charter = GenesisCharter {
@@ -2503,6 +2511,7 @@ fn create_mesh(
         },
         expel,
         header_placement,
+        exit_policy,
     };
     if let Err(e) = charter.validate() {
         return (err(&e.to_string()), None);
@@ -2828,6 +2837,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
         network_fp: fp(&ch.master_pubkey),
         expel: expel_name(ch.expel),
         header_placement: header_placement_name(ch.header_placement),
+        exit_policy: exit_policy_name(ch.exit_policy).to_string(),
     }
 }
 
@@ -2977,6 +2987,27 @@ fn parse_header_placement(s: Option<&str>) -> Result<HeaderPlacement, String> {
             }
         },
     })
+}
+
+/// Parse the `exit_policy` name (CreateMesh) into an [`ExitPolicy`]. `None`/"" ⇒ `Isolate`
+/// (forwarded traffic egresses the exit's real WAN — no chains/loops, the default).
+fn parse_exit_policy(s: Option<&str>) -> Result<ExitPolicy, String> {
+    let s = s.map(|x| x.trim().to_ascii_lowercase()).unwrap_or_default();
+    Ok(match s.as_str() {
+        "" | "isolate" | "isolated" | "direct" => ExitPolicy::Isolate,
+        "chain" | "chained" | "onion" => ExitPolicy::Chain,
+        other => {
+            return Err(format!("unknown exit policy '{other}' (isolate|chain)"));
+        }
+    })
+}
+
+/// Human name of an exit-egress policy (MeshInfo display).
+fn exit_policy_name(p: ExitPolicy) -> &'static str {
+    match p {
+        ExitPolicy::Isolate => "isolate (forwarded traffic → exit's real WAN)",
+        ExitPolicy::Chain => "chain (forwarded traffic → exit's full-tunnel)",
+    }
 }
 
 /// Human name of a header-placement policy (MeshInfo display).
