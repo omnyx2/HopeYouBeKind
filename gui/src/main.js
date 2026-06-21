@@ -454,8 +454,9 @@ el("mesh-create").addEventListener("click", async () => {
   const masterGated = el("mesh-mastergated").checked;
   const expel = el("mesh-expel")?.value || null;
   const header = el("mesh-header")?.value || null;
+  const exitPolicy = el("mesh-exit-policy")?.value || null;
   try {
-    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher, self_destruct: selfDestruct, master_gated: masterGated, expel, header } });
+    const r = await meshd({ CreateMesh: { name, my_name: myName, max_members: max, cipher, self_destruct: selfDestruct, master_gated: masterGated, expel, header, exit_policy: exitPolicy } });
     el("mesh-name").value = "";
     el("mesh-myname").value = "";
     toast(`mesh created (#${r.MeshCreated.mesh})`);
@@ -484,6 +485,7 @@ async function renderOverview(id) {
     <div class="kv"><span>network</span><b class="mono small">${esc(d.network_fp || "?")}</b></div>
     <div class="kv"><span>expel</span><b class="small">${esc(d.expel || "?")}</b></div>
     <div class="kv"><span>header (P-C5)</span><b class="small">${esc(d.header_placement || "?")}</b></div>
+    <div class="kv"><span>exit policy</span><b class="small">${esc(d.exit_policy || "?")}</b></div>
     <div class="kv"><span>cipher</span><b class="mono small">${esc(d.cipher)}</b></div>
     <div class="kv"><span>epoch</span><b>${d.epoch}</b></div>
     <div class="kv"><span>health</span><b>${d.live}/${d.members.length} live · floor ${d.threshold}${d.attack_armed_secs_left != null ? ` · <span style="color:#e44">⚠ ARMED ${d.attack_armed_secs_left}s</span>` : ""}</b></div>

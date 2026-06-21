@@ -150,6 +150,14 @@
                   <option value="back">Back — always at the end</option>
                 </select>
               </label>
+              <label style="display:block;margin-top:10px"
+                     title="When a node is used as a full-tunnel exit by others, where does that forwarded internet traffic leave? Member-to-member traffic is always direct regardless. Fixed at creation.">
+                <span><b>Exit egress policy</b> <span class="muted small">(when this node exits for others)</span></span>
+                <select id="mesh-exit-policy" class="select" style="margin-top:6px">
+                  <option value="isolate">Isolate — forwarded traffic leaves the exit's OWN real network (default; no chains/loops)</option>
+                  <option value="chain">Chain — forwarded traffic follows the exit's own full-tunnel (onion, multi-hop)</option>
+                </select>
+              </label>
             </div>
 
             <div class="add-row">

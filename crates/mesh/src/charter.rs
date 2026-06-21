@@ -90,6 +90,22 @@ pub enum HeaderPlacement {
     Fixed(u16),
 }
 
+/// **How a node egresses internet traffic it forwards AS AN EXIT for other members** —
+/// fixed at genesis. Member↔member traffic is always direct regardless (the flow table
+/// sends overlay packets straight to their owner); this governs only *forwarded internet*
+/// egress. See `docs/EXIT_POLICY.md`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ExitPolicy {
+    /// Traffic this node forwards for others always leaves its OWN real network, even if
+    /// the node full-tunnels its own traffic elsewhere. No multi-hop chains, no routing
+    /// loops — even cyclic exit selections can't loop. (default, recommended)
+    #[default]
+    Isolate,
+    /// Forwarded traffic follows the exit node's own full-tunnel → onion-style multi-hop
+    /// egress (`3 → 1 → 2`). Loop-freedom is the operator's responsibility.
+    Chain,
+}
+
 /// The 1-byte id space caps any mesh at 254 members (`0`/`255` reserved).
 pub const MAX_MEMBERS_CEILING: u8 = 254;
 
@@ -120,6 +136,10 @@ pub struct GenesisCharter {
     /// (the secret-derived per-frame float) for older charters.
     #[serde(default)]
     pub header_placement: HeaderPlacement,
+    /// How this node egresses internet traffic it forwards as an exit for others.
+    /// `#[serde(default)]` ⇒ `Isolate` for older charters that predate the field.
+    #[serde(default)]
+    pub exit_policy: ExitPolicy,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -166,6 +186,7 @@ mod tests {
             self_destruct: SelfDestruct::Off,
             expel: ExpelPolicy::CreatorOnly,
             header_placement: HeaderPlacement::Random,
+            exit_policy: ExitPolicy::Isolate,
         }
     }
 
@@ -175,6 +196,17 @@ mod tests {
             .validate()
             .is_ok());
         assert!(charter(8, RecipherTrigger::MasterOnly).validate().is_ok());
+    }
+
+    #[test]
+    fn exit_policy_defaults_to_isolate_for_old_charters() {
+        // A charter JSON predating the field must still deserialize — to Isolate, the
+        // safe no-chain default — so older invites/persisted state keep working.
+        let mut v = serde_json::to_value(charter(8, RecipherTrigger::MasterOnly)).unwrap();
+        v.as_object_mut().unwrap().remove("exit_policy");
+        let back: GenesisCharter = serde_json::from_value(v).unwrap();
+        assert_eq!(back.exit_policy, ExitPolicy::Isolate);
+        assert_eq!(ExitPolicy::default(), ExitPolicy::Isolate);
     }
 
     #[test]

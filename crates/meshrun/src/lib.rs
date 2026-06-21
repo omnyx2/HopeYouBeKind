@@ -297,6 +297,43 @@ fn pick_route(
     Route::None
 }
 
+/// Merge a gossiped endpoint table into our links. A peer we already know is updated only
+/// when we have NO fresh direct path to it: a directly-learned address is more accurate
+/// than a third party's gossip, but a stale entry must yield so a peer whose address
+/// changed can be re-discovered. (The old insert-only merge pinned a stale address forever,
+/// so once a node held a dead address for a peer, gossip could never correct it —
+/// docs/RELAY.md.)
+fn apply_gossip_table(
+    links: &mut HashMap<MemberId, Link>,
+    table: &[(MemberId, SocketAddr)],
+    my_id: MemberId,
+    now: u64,
+) {
+    for &(m, ep) in table {
+        if m == my_id {
+            continue; // never learn our own id from gossip (a self-entry pollutes the table)
+        }
+        match links.get_mut(&m) {
+            None => {
+                links.insert(
+                    m,
+                    Link {
+                        endpoint: ep,
+                        last_seen_ms: 0,
+                        last_direct_ms: 0,
+                    },
+                );
+            }
+            // Stale (no fresh direct path) → adopt the gossiped address; it may be current.
+            Some(existing) if !directly_reachable(existing, now) => {
+                existing.endpoint = ep;
+            }
+            // Fresh direct path → keep our own, more accurate address.
+            Some(_) => {}
+        }
+    }
+}
+
 /// Encode the gossip payload (sealed): the endpoint table as `id ip:port` lines,
 /// plus an optional `self ip:port` line = "where I observe YOU (the recipient)",
 /// the reflexion that lets a NAT'd peer learn its public address (P-D3).
@@ -559,15 +596,7 @@ pub async fn run<X: Transport + 'static>(
                             let (table, reflect) = decode_gossip(&payload[1..]);
                             {
                                 let mut l = links.lock().unwrap();
-                                for (m, ep) in table {
-                                    if m != my_id {
-                                        l.entry(m).or_insert(Link {
-                                            endpoint: ep,
-                                            last_seen_ms: 0,
-                                            last_direct_ms: 0,
-                                        });
-                                    }
-                                }
+                                apply_gossip_table(&mut l, &table, my_id, now_ms());
                             }
                             // P-D3: a peer reaching us from a PUBLIC source observed our
                             // public NAT mapping and reflected it back. Adopt it as our
@@ -1137,6 +1166,30 @@ mod tests {
         // Unknown member with no relay → nothing.
         links.clear();
         assert_eq!(pick_route(&links, 9, None, now), Route::None);
+    }
+
+    #[test]
+    fn gossip_updates_a_stale_endpoint_but_keeps_a_fresh_direct_one() {
+        let now = 1_000_000u64;
+        let mut links = HashMap::new();
+        links.insert(4u8, link("10.32.161.153:42001", 0)); // 4: stale — never heard directly
+        links.insert(5u8, link("10.0.0.5:42001", now)); // 5: fresh direct path
+        let table: Vec<(MemberId, SocketAddr)> = vec![
+            (1, "203.0.113.1:42001".parse().unwrap()), // our own id → must be ignored
+            (4, "203.0.113.4:42001".parse().unwrap()), // gossip: 4 moved
+            (5, "203.0.113.5:42001".parse().unwrap()), // gossip: 5 moved (but we have it direct)
+            (9, "203.0.113.9:42001".parse().unwrap()), // a brand-new member
+        ];
+        apply_gossip_table(&mut links, &table, 1, now);
+
+        // stale 4 → adopt the gossiped address (re-discovery the old or_insert couldn't do).
+        assert_eq!(links[&4].endpoint, "203.0.113.4:42001".parse().unwrap());
+        // fresh-direct 5 → keep our own, more accurate address (gossip ignored).
+        assert_eq!(links[&5].endpoint, "10.0.0.5:42001".parse().unwrap());
+        // brand-new 9 → inserted.
+        assert_eq!(links[&9].endpoint, "203.0.113.9:42001".parse().unwrap());
+        // our own id (1) → never learned from gossip.
+        assert!(!links.contains_key(&1));
     }
 
     #[test]

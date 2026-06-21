@@ -49,6 +49,12 @@ pub enum Request {
         /// Where the sealed wire header sits; `None`/`random` = the secret-derived float.
         #[serde(default)]
         header: Option<String>,
+        /// Exit egress policy (docs/EXIT_POLICY.md), fixed at genesis: how a node
+        /// egresses internet traffic it forwards as an exit for others. `isolate`(default)
+        /// = always the exit's real WAN (no chains) | `chain` = follow the exit's own
+        /// full-tunnel (onion). `None` ⇒ `isolate`.
+        #[serde(default)]
+        exit_policy: Option<String>,
     },
     /// List the data-plane ciphers a mesh can be created with (populates the dropbox).
     Ciphers,
@@ -343,6 +349,10 @@ pub struct MeshDetail {
     /// The header-placement (P-C5) policy: "random (P-C5 float)" / "front" / "fixed:N".
     #[serde(default)]
     pub header_placement: String,
+    /// The exit-egress policy (docs/EXIT_POLICY.md): "isolate …" / "chain …". Governs how
+    /// a node egresses internet traffic it forwards as an exit for others.
+    #[serde(default)]
+    pub exit_policy: String,
 }
 
 /// Live traffic for the monitor — totals + per-peer rows (summary view A) + recent overlay

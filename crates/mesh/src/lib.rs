@@ -130,6 +130,7 @@ mod tests {
             self_destruct: crate::charter::SelfDestruct::Off,
             expel: crate::charter::ExpelPolicy::CreatorOnly,
             header_placement: crate::charter::HeaderPlacement::Random,
+            exit_policy: crate::charter::ExitPolicy::Isolate,
         }
     }
 

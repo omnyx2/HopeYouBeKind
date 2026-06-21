@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use lattice_mesh::charter::{
-    ExpelPolicy, GenesisCharter, HeaderPlacement, InviteTopology, RecipherTrigger,
+    ExitPolicy, ExpelPolicy, GenesisCharter, HeaderPlacement, InviteTopology, RecipherTrigger,
 };
 use lattice_mesh::crypto::suite;
 use lattice_mesh::dataplane::MeshDataPlane;
@@ -1071,17 +1071,26 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     // make this node able to serve as an exit for others — ip_forward + NAT, which
     // is idempotent and unused unless a peer routes through us (reuses v1 exit.rs).
     let tun_name = tun.name().map(|s| s.to_string());
-    {
-        if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
+    // Exit-egress policy (docs/EXIT_POLICY.md): under Isolate, enable_nat also pins
+    // traffic we forward for others to our real WAN. Default Isolate if the mesh is gone.
+    let isolate = {
+        let mut st = state.lock().unwrap();
+        let isolate = st
+            .meshes
+            .get(&b.mesh_id)
+            .map(|ms| matches!(ms.mesh.charter.exit_policy, ExitPolicy::Isolate))
+            .unwrap_or(true);
+        if let Some(ms) = st.meshes.get_mut(&b.mesh_id) {
             ms.tun_name = tun_name.clone();
             ms.dp_port = port; // local data-plane port — advertised in the LAN beacon
             ms.dp_error = None; // bound cleanly — clear any prior "port busy" error
         }
-    }
+        isolate
+    };
     // enable_nat shells out (pfctl/sysctl on unix, several PowerShell cmdlets on
     // Windows) — synchronous + slow, so run it off the async runtime to avoid stalling
     // IPC while a mesh is brought up.
-    let _ = tokio::task::spawn_blocking(exit::enable_nat).await;
+    let _ = tokio::task::spawn_blocking(move || exit::enable_nat(isolate)).await;
     // This node's own reachable address, advertised in the endpoint gossip so peers
     // can reach us without a manual SetPeer (docs/DISCOVERY.md §2). A public node
     // (the Oracle exit) PINS it via MESHD_ADVERTISE=ip:port — never overridden;
@@ -1695,6 +1704,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             master_gated,
             expel,
             header,
+            exit_policy,
         } => create_mesh(
             st,
             name,
@@ -1705,6 +1715,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             master_gated,
             expel,
             header,
+            exit_policy,
         ),
 
         Request::ExpelMember { mesh, member } => expel_member(st, mesh, member),
@@ -2435,6 +2446,7 @@ fn create_mesh(
     master_gated: Option<bool>,
     expel: Option<String>,
     header: Option<String>,
+    exit_policy: Option<String>,
 ) -> (Response, Option<PostAction>) {
     // The mesh id is the real key, but a human picks a mesh by NAME and the GUI lists
     // meshes by name — so two same-named meshes render as indistinguishable "peer" rows
@@ -2483,6 +2495,11 @@ fn create_mesh(
         Ok(p) => p,
         Err(e) => return (err(&e), None),
     };
+    // Exit egress policy (docs/EXIT_POLICY.md) — isolate (default) vs chain.
+    let exit_policy = match parse_exit_policy(exit_policy.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return (err(&e), None),
+    };
     let master = MasterKey::generate();
     let my_key = MemberKey::generate();
     let charter = GenesisCharter {
@@ -2503,6 +2520,7 @@ fn create_mesh(
         },
         expel,
         header_placement,
+        exit_policy,
     };
     if let Err(e) = charter.validate() {
         return (err(&e.to_string()), None);
@@ -2828,6 +2846,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
         network_fp: fp(&ch.master_pubkey),
         expel: expel_name(ch.expel),
         header_placement: header_placement_name(ch.header_placement),
+        exit_policy: exit_policy_name(ch.exit_policy).to_string(),
     }
 }
 
@@ -2977,6 +2996,27 @@ fn parse_header_placement(s: Option<&str>) -> Result<HeaderPlacement, String> {
             }
         },
     })
+}
+
+/// Parse the `exit_policy` name (CreateMesh) into an [`ExitPolicy`]. `None`/"" ⇒ `Isolate`
+/// (forwarded traffic egresses the exit's real WAN — no chains/loops, the default).
+fn parse_exit_policy(s: Option<&str>) -> Result<ExitPolicy, String> {
+    let s = s.map(|x| x.trim().to_ascii_lowercase()).unwrap_or_default();
+    Ok(match s.as_str() {
+        "" | "isolate" | "isolated" | "direct" => ExitPolicy::Isolate,
+        "chain" | "chained" | "onion" => ExitPolicy::Chain,
+        other => {
+            return Err(format!("unknown exit policy '{other}' (isolate|chain)"));
+        }
+    })
+}
+
+/// Human name of an exit-egress policy (MeshInfo display).
+fn exit_policy_name(p: ExitPolicy) -> &'static str {
+    match p {
+        ExitPolicy::Isolate => "isolate (forwarded traffic → exit's real WAN)",
+        ExitPolicy::Chain => "chain (forwarded traffic → exit's full-tunnel)",
+    }
 }
 
 /// Human name of a header-placement policy (MeshInfo display).

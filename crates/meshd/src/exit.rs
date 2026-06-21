@@ -159,7 +159,7 @@ fn macos_default_iface() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn enable_nat() {
+pub fn enable_nat(isolate: bool) {
     run("sysctl", &["-w", "net.inet.ip.forwarding=1"]);
     let Some(wan) = macos_default_iface() else {
         tracing::warn!("no default interface; macOS exit NAT not applied");
@@ -168,7 +168,23 @@ pub fn enable_nat() {
     // Source-NAT tunnelled (overlay-range) traffic out the WAN. A ruleset with
     // only a nat rule leaves the filter ruleset empty == default-pass, so
     // forwarded packets (tun→WAN, enabled by ip.forwarding) pass and get NAT'd.
-    let conf = format!("nat on {wan} from 100.64.0.0/10 to any -> ({wan})\n");
+    let mut conf = format!("nat on {wan} from 100.64.0.0/10 to any -> ({wan})\n");
+    // Exit-policy ISOLATE (docs/EXIT_POLICY.md): force traffic we forward FOR OTHERS
+    // (sourced from the overlay range) out the real gateway via pf `route-to`, so it leaves
+    // our own WAN even if our own full-tunnel later diverts the default route to the tun.
+    // The gateway is captured now, while the default route is still the real one.
+    if isolate {
+        if let Some(gw) = macos_default_gateway() {
+            conf.push_str(&format!(
+                "pass out route-to ({wan} {gw}) inet from 100.64.0.0/10 to any\n"
+            ));
+            tracing::warn!(
+                wan,
+                gw,
+                "exit-policy isolate: pf route-to pins forwarded traffic to real WAN"
+            );
+        }
+    }
     if std::fs::write("/tmp/lattice-pf.conf", &conf).is_err() {
         tracing::warn!("could not write pf ruleset; exit NAT not applied");
         return;
@@ -388,10 +404,16 @@ fn linux_default_route() -> Option<(String, String)> {
     Some((gw, dev))
 }
 
+/// Side routing table + rule priority for exit-policy ISOLATE (docs/EXIT_POLICY.md).
 #[cfg(target_os = "linux")]
-pub fn enable_nat() {
+const ISO_TABLE: &str = "100";
+#[cfg(target_os = "linux")]
+const ISO_PRIO: &str = "1000";
+
+#[cfg(target_os = "linux")]
+pub fn enable_nat(isolate: bool) {
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"]);
-    if let Some((_, wan)) = linux_default_route() {
+    if let Some((gw, wan)) = linux_default_route() {
         run(
             "iptables",
             &[
@@ -419,6 +441,40 @@ pub fn enable_nat() {
             &["-I", "FORWARD", "1", "-d", "100.64.0.0/10", "-j", "ACCEPT"],
         );
         tracing::warn!(wan, "exit NAT enabled (masquerade)");
+        if isolate {
+            // Exit-policy ISOLATE: pin traffic we forward FOR OTHERS (sourced from the
+            // overlay range 100.64/10) to the REAL default gateway via a side table, so it
+            // leaves our own WAN even if our own full-tunnel later diverts the main-table
+            // default. Our own traffic (real src IP) is unaffected and still follows main.
+            run(
+                "ip",
+                &[
+                    "route", "replace", "default", "via", &gw, "dev", &wan, "table", ISO_TABLE,
+                ],
+            );
+            // `ip rule add` isn't idempotent — clear any stale duplicate first (ok if absent).
+            let _ = Command::new("ip")
+                .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
+                .status();
+            run(
+                "ip",
+                &[
+                    "rule",
+                    "add",
+                    "from",
+                    "100.64.0.0/10",
+                    "lookup",
+                    ISO_TABLE,
+                    "priority",
+                    ISO_PRIO,
+                ],
+            );
+            tracing::warn!(
+                gw,
+                table = ISO_TABLE,
+                "exit-policy isolate: forwarded traffic pinned to real WAN"
+            );
+        }
     }
 }
 
@@ -441,6 +497,13 @@ pub fn disable_nat() {
             ],
         );
     }
+    // Tear down the isolate source-routing (harmless if it was never installed).
+    let _ = Command::new("ip")
+        .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
+        .status();
+    let _ = Command::new("ip")
+        .args(["route", "flush", "table", ISO_TABLE])
+        .status();
     run("sysctl", &["-w", "net.ipv4.ip_forward=0"]);
 }
 
@@ -554,11 +617,23 @@ pub fn current_gateway() -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn enable_nat() {
+pub fn enable_nat(isolate: bool) {
     // Forward between interfaces + WinNAT for the overlay range.
     ps("Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue");
     ps("if (-not (Get-NetNat -Name Lattice -ErrorAction SilentlyContinue)) { New-NetNat -Name Lattice -InternalIPInterfaceAddressPrefix 100.64.0.0/10 }");
     tracing::warn!("windows exit NAT enabled (WinNAT 100.64.0.0/10)");
+    // Exit-policy ISOLATE on Windows is best-effort: WinNAT egresses via the system route
+    // to the destination, so when this node is NOT itself full-tunnelling, forwarded
+    // traffic already leaves the real adapter (isolate holds). But Windows has no simple
+    // source-based routing, so if this node ALSO full-tunnels its own traffic, forwarded
+    // traffic can follow that default (chain-like). Full source-pinning (a policy route /
+    // separate NAT scope) is a TODO — see docs/EXIT_POLICY.md §4. Linux/macOS pin it.
+    if isolate {
+        tracing::warn!(
+            "exit-policy isolate on windows is best-effort (no source-based routing); \
+             forwarded traffic may follow this node's own full-tunnel if one is set"
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -590,7 +665,7 @@ pub fn route_through(_tun: &str, _exit_ip: IpAddr) -> Result<(), String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn restore_routes() {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn enable_nat() {
+pub fn enable_nat(_isolate: bool) {
     tracing::warn!("exit-node NAT not implemented on this platform");
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
