@@ -149,7 +149,8 @@ This is an **early-access prototype**, built for **your own machines and trusted
   only people/devices you trust. (App-layer encryption like SSH/TLS still protects content
   end-to-end on top of the tunnel.)
 - The local control socket trusts **local processes** on that machine — run it on
-  machines you control.
+  machines you control. On a shared/multi-user host, set `LATTICE_ALLOW_UID=<uid>[,uid…]`
+  to restrict the socket to root + your own uid + the listed ones.
 - Not yet hardened for hostile multi-tenant use. For your own fleet, a home/lab/office
   setup, or a research deployment, it's ready to use today.
 
