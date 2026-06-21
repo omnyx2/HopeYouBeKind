@@ -91,6 +91,25 @@ async function renderTopologyFor(id) {
   renderTopology(d);
 }
 
+// Distinct colours for network groups (regions). Cycles if there are more groups.
+const NET_PALETTE = ["#22c55e", "#a78bfa", "#f59e0b", "#38bdf8", "#f472b6", "#34d399", "#fb7185", "#c084fc", "#facc15"];
+
+// The network a member sits behind = the IP of its public endpoint. Members behind the
+// same NAT share one public IP, so they group into one region (same wifi / office / LAN).
+function netKeyOf(m) {
+  if (!m.endpoint) return null;            // address unknown yet
+  return m.endpoint.replace(/:\d+$/, ""); // strip :port → bare IP (v4 or [v6])
+}
+// Human label for a network group. For now the public IP (the "wifi/LAN" level); a future
+// GeoIP layer can prepend country / org here (see netGeo).
+function netLabel(key) {
+  return key || "network unknown";
+}
+function hexA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
 function renderTopology(d) {
   const c = el("topo-canvas");
   if (!c) return;
@@ -101,13 +120,51 @@ function renderTopology(d) {
   const cx = W / 2, cy = H / 2;
   const me = d.members.find((m) => m.is_me);
   const others = d.members.filter((m) => !m.is_me);
-  const R = Math.min(W, H) / 2 - 56;
+  const R = Math.min(W, H) / 2 - 64;
+
+  // --- group the other members by the network (public IP) they sit behind ---
+  const groups = [];
+  const byKey = new Map();
+  for (const m of others) {
+    const k = netKeyOf(m);
+    let grp = byKey.get(k);
+    if (!grp) { grp = { key: k, label: netLabel(k), members: [] }; byKey.set(k, grp); groups.push(grp); }
+    grp.members.push(m);
+  }
+  groups.forEach((grp, gi) => (grp.color = NET_PALETTE[gi % NET_PALETTE.length]));
+
+  // --- angular layout: each group occupies a contiguous arc (∝ its size) ---
   const pos = {};
-  others.forEach((m, i) => {
-    const a = (i / Math.max(1, others.length)) * Math.PI * 2 - Math.PI / 2;
-    pos[m.id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) };
-  });
-  // edges: me → each member; exit edge violet, live links green+solid, the rest faint.
+  const n = Math.max(1, others.length);
+  let idx = 0;
+  for (const grp of groups) {
+    grp.a0 = (idx / n) * Math.PI * 2 - Math.PI / 2;
+    grp.a1 = ((idx + grp.members.length) / n) * Math.PI * 2 - Math.PI / 2;
+    grp.members.forEach((m, j) => {
+      const a = ((idx + j + 0.5) / n) * Math.PI * 2 - Math.PI / 2;
+      pos[m.id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) };
+    });
+    idx += grp.members.length;
+  }
+
+  // --- translucent wedge per network group (drawn first, behind nodes/edges) ---
+  for (const grp of groups) {
+    const pad = groups.length > 1 ? 0.05 : 0;
+    g.beginPath();
+    g.moveTo(cx, cy);
+    g.arc(cx, cy, R + 28, grp.a0 + pad, grp.a1 - pad);
+    g.closePath();
+    g.fillStyle = hexA(grp.color, 0.1);
+    g.fill();
+    const am = (grp.a0 + grp.a1) / 2;
+    const lx = cx + (R + 16) * Math.cos(am), ly = cy + (R + 16) * Math.sin(am);
+    g.fillStyle = grp.color; g.font = "10px ui-monospace, monospace";
+    g.textAlign = Math.cos(am) >= 0 ? "left" : "right";
+    g.fillText(grp.label, lx, ly);
+  }
+
+  // --- edges: me → each member; exit edge violet, live links green+solid, the rest faint ---
+  g.textAlign = "center";
   others.forEach((m) => {
     const p = pos[m.id];
     const isExit = d.exit === m.id;
@@ -118,17 +175,19 @@ function renderTopology(d) {
     g.beginPath(); g.moveTo(cx, cy); g.lineTo(p.x, p.y); g.stroke();
   });
   g.setLineDash([]);
-  const node = (x, y, label, fill, r) => {
+
+  const node = (x, y, label, fill, r, ring) => {
+    if (ring) { g.beginPath(); g.arc(x, y, r + 3, 0, 7); g.strokeStyle = ring; g.lineWidth = 2; g.stroke(); }
     g.beginPath(); g.arc(x, y, r, 0, 7);
     g.fillStyle = fill; g.fill();
     g.fillStyle = "#cbd5e1"; g.font = "11px ui-monospace, monospace"; g.textAlign = "center";
     g.fillText(label, x, y + r + 14);
   };
-  // node colour by role/liveness: exit violet, live peer green, otherwise slate.
-  others.forEach((m) => {
+  // nodes: fill by role/liveness (exit violet, live green, else slate), ringed by network colour.
+  for (const grp of groups) for (const m of grp.members) {
     const fill = d.exit === m.id ? "#a78bfa" : m.state === "live" ? "#22c55e" : "#475569";
-    node(pos[m.id].x, pos[m.id].y, `${m.name} #${m.id}`, fill, 12);
-  });
+    node(pos[m.id].x, pos[m.id].y, `${m.name} #${m.id}`, fill, 12, grp.color);
+  }
   node(cx, cy, me ? `${me.name} #${me.id}` : "me", "#3b82f6", 16);
 }
 
