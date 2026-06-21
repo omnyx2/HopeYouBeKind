@@ -11,6 +11,30 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.0] — 2026-06-21
+
+Topology insight, distributed-exit routing policy, and discovery robustness. Charter
+change is backward-compatible (serde-default); data plane stays wire-compatible.
+
+### Added
+- **Exit policy (genesis choice): `isolate` (default) vs `chain`** — how a node egresses
+  internet traffic it forwards *as an exit for others*. `isolate` pins forwarded traffic
+  to the exit's own real WAN (no multi-hop chains/loops, even if that node full-tunnels its
+  own traffic); `chain` lets it follow the exit's tunnel (onion). Member↔member traffic is
+  always direct regardless. Picked at `lattice new --exit-policy` / the GUI create screen,
+  shown in `info`. Mechanism: Linux `ip rule` (live-verified), macOS pf `route-to`, Windows
+  best-effort. Design + rationale: [`docs/EXIT_POLICY.md`](docs/EXIT_POLICY.md).
+- **Topology: true network grouping** — the GUI groups nodes by the physical network they
+  sit on (your LAN vs each remote NAT) into a clustered community graph with soft region
+  blobs and live per-node addresses. The daemon reports each node's real LAN address
+  (`getifaddrs`, not a route lookup, so full-tunnel doesn't distort it) and its own endpoint.
+- **CI opsec guard** — `scripts/opsec-scan.sh` fails CI if a real infra IP / credential /
+  personal path reaches a tracked file (the repo is public).
+
+### Fixed
+- **Discovery: gossip refreshes a stale peer endpoint** (was insert-only), so a peer that
+  changed address can be re-discovered instead of being pinned to a dead one forever.
+
 ## [0.6.1] — 2026-06-21
 
 Early-access hardening of the v2 data plane / daemon. Wire-compatible — new and old
