@@ -58,9 +58,9 @@ the branch and rolled it to two nodes while Mac/Windows stayed on the old build:
   false positives), then reverted clean.
 
 **Remaining design gaps (TODO):**
-- The CLI prints a raw Python traceback when the uid gate refuses a connection (the
-  daemon closes the socket); it should print a clean "not authorized — see
-  `LATTICE_ALLOW_UID`" message.
+- ~~The CLI prints a raw Python traceback when the uid gate refuses a connection.~~
+  *Fixed:* `call()` now catches the accept-then-close (BrokenPipe/reset/empty reply)
+  and prints a clean "not authorized — see `LATTICE_ALLOW_UID`" hint.
 - Lablinux runs the **installed app's** bundled `meshd` (`/usr/lib/lattice/resources/meshd`,
   launched by the GUI as root), not a git/systemd build — so a field update means
   replacing that binary (atomic rename to dodge `ETXTBSY`) + relaunch, not `git pull`.

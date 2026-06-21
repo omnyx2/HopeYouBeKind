@@ -58,16 +58,20 @@ def call(sock_path, request):
         s.connect(sock_path)
     except (FileNotFoundError, ConnectionRefusedError) as e:
         die(f"meshd not reachable at {sock_path} ({e}). Is the daemon running?")
-    s.sendall((json.dumps(request) + "\n").encode())
     buf = b""
-    while not buf.endswith(b"\n"):
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        buf += chunk
-    s.close()
+    try:
+        s.sendall((json.dumps(request) + "\n").encode())
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+        die(_refused_hint(f"meshd closed the connection ({e})"))
+    finally:
+        s.close()
     if not buf.strip():
-        die("empty reply from meshd")
+        die(_refused_hint("meshd accepted the connection then closed it with no reply"))
     reply = json.loads(buf.decode().strip())
     if isinstance(reply, dict) and "Error" in reply:
         die("meshd: " + reply["Error"].get("message", "unknown error"))
@@ -77,6 +81,14 @@ def call(sock_path, request):
 def die(msg):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def _refused_hint(what):
+    """Message for a connection the daemon accepted then dropped — usually the
+    LATTICE_ALLOW_UID access gate refusing this uid (meshd logs the refusal)."""
+    return (f"{what}. If LATTICE_ALLOW_UID is set on the daemon, this user is not "
+            f"allowed — run as an allowed uid (e.g. `sudo lattice …`) or add this "
+            f"uid to LATTICE_ALLOW_UID.")
 
 
 # ----------------------------- helpers -----------------------------
