@@ -1594,6 +1594,60 @@ fn local_ip() -> Option<std::net::IpAddr> {
     s.local_addr().ok().map(|a| a.ip())
 }
 
+/// This host's real **physical LAN address** (e.g. en0 `10.32.x.x`), read straight from
+/// the NIC list (`getifaddrs`) rather than a route lookup. Unlike [`local_ip`], this is NOT
+/// distorted when full-tunnel diverts the default route through the overlay — so it's a
+/// stable "which network am I physically on" signal for topology grouping. Picks the first
+/// up, non-loopback, RFC1918 IPv4, skipping the mesh overlay (`100.64.0.0/10`) and tunnels.
+#[cfg(unix)]
+fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return None;
+        }
+        let mut found: Option<Ipv4Addr> = None;
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null() {
+                continue;
+            }
+            let sa = &*ifa.ifa_addr;
+            if sa.sa_family as i32 != libc::AF_INET {
+                continue;
+            }
+            let flags = ifa.ifa_flags as i32;
+            if flags & libc::IFF_LOOPBACK != 0 || flags & libc::IFF_UP == 0 {
+                continue;
+            }
+            let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+            // s_addr is 4 bytes in network order = the octets a.b.c.d, in order.
+            let octets: [u8; 4] = sin.sin_addr.s_addr.to_ne_bytes();
+            let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+            let o = ip.octets();
+            let is_overlay = o[0] == 100 && (o[1] & 0xc0) == 64; // 100.64.0.0/10 (our overlay)
+            if ip.is_loopback() || ip.is_link_local() || is_overlay || !ip.is_private() {
+                continue;
+            }
+            found = Some(ip);
+            break;
+        }
+        libc::freeifaddrs(ifap);
+        found
+    }
+}
+
+#[cfg(not(unix))]
+fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    match local_ip() {
+        Some(std::net::IpAddr::V4(v4)) if v4.is_private() => Some(v4),
+        _ => None,
+    }
+}
+
 /// Kill-switch watchdog (from v1). Full tunnel diverts the host default route
 /// through the exit; if that path can't carry traffic the host is stranded OFFLINE.
 /// Every ~20s probe the internet THROUGH the tunnel (TCP connect to 1.1.1.1:443 —
@@ -2646,7 +2700,17 @@ fn detail(ms: &MeshState) -> MeshDetail {
         .map(|c| {
             let is_me = c.member == me;
             let link = links.get(&c.id).copied();
-            let endpoint = link.map(|l| l.endpoint.to_string());
+            // For peers, where we currently reach them. For us, our real physical LAN
+            // address (NIC list, not a route lookup) so the topology places us on our true
+            // network even when full-tunnel diverts the default route; fall back to the
+            // advertised/reflexive address only if no LAN address is found.
+            let endpoint = if is_me {
+                local_lan_ipv4()
+                    .map(|ip| format!("{ip}:{}", ms.dp_port))
+                    .or_else(|| ms.my_endpoint.lock().unwrap().map(|a| a.to_string()))
+            } else {
+                link.map(|l| l.endpoint.to_string())
+            };
             // `state` is the legacy badge ({me,live,idle,unknown}); `reason` explains an
             // idle/unknown peer in plain language so the user isn't left guessing why.
             let (state, reason): (String, Option<String>) = if is_me {

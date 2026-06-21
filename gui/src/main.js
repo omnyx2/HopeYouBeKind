@@ -94,15 +94,24 @@ async function renderTopologyFor(id) {
 // Distinct colours for network groups (regions). Cycles if there are more groups.
 const NET_PALETTE = ["#22c55e", "#a78bfa", "#f59e0b", "#38bdf8", "#f472b6", "#34d399", "#fb7185", "#c084fc", "#facc15"];
 
-// The network a member sits behind = the IP of its public endpoint. Members behind the
-// same NAT share one public IP, so they group into one region (same wifi / office / LAN).
-function netKeyOf(m) {
-  if (!m.endpoint) return null;            // address unknown yet
-  return m.endpoint.replace(/:\d+$/, ""); // strip :port → bare IP (v4 or [v6])
+// RFC1918 / link-local — a private address means we learned it over the LAN multicast
+// beacon, which only crosses the *same* local network. So any peer reachable at a private
+// address is on MY LAN (regardless of its exact host octet / subnet within that LAN).
+function isPrivateIp(ip) {
+  return /^10\./.test(ip) || /^192\.168\./.test(ip) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(ip) || /^169\.254\./.test(ip);
 }
-// Human label for a network group. For now the public IP (the "wifi/LAN" level); a future
-// GeoIP layer can prepend country / org here (see netGeo).
+// The network a member sits in. `me` and any peer reachable at a private address are on
+// my local network → one "LAN" group. A peer at a public address is remote, grouped by
+// its public IP (same NAT = same group).
+function netKeyOf(m) {
+  if (!m.endpoint) return m.is_me ? "LAN" : null; // me w/o a learned addr ⇒ assume local
+  const ip = m.endpoint.replace(/:\d+$/, "").replace(/[[\]]/g, "");
+  return isPrivateIp(ip) ? "LAN" : ip;            // private ⇒ same LAN as me; else by NAT IP
+}
+// Human label for a network group. A future GeoIP layer can map a public IP → country/org.
 function netLabel(key) {
+  if (key === "LAN") return "local network (LAN)";
   return key || "network unknown";
 }
 function hexA(hex, a) {
@@ -118,77 +127,92 @@ function renderTopology(d) {
   const H = (c.height = 360);
   g.clearRect(0, 0, W, H);
   const cx = W / 2, cy = H / 2;
-  const me = d.members.find((m) => m.is_me);
-  const others = d.members.filter((m) => !m.is_me);
-  const R = Math.min(W, H) / 2 - 64;
+  const members = d.members.slice();
+  const me = members.find((m) => m.is_me);
 
-  // --- group the other members by the network (public IP) they sit behind ---
+  // --- group ALL members (me included) by network: my LAN vs each remote NAT ---
+  // If any peer is reachable at a private address, I'm on that same LAN (the beacon is
+  // LAN-scoped), so put me in the LAN group too — even though my *own* endpoint is the
+  // public reflexive address (learned via STUN), which would otherwise split me off.
+  const onSharedLan = members.some((m) => !m.is_me && netKeyOf(m) === "LAN");
   const groups = [];
   const byKey = new Map();
-  for (const m of others) {
-    const k = netKeyOf(m);
+  for (const m of members) {
+    const k = m.is_me && onSharedLan ? "LAN" : netKeyOf(m);
     let grp = byKey.get(k);
     if (!grp) { grp = { key: k, label: netLabel(k), members: [] }; byKey.set(k, grp); groups.push(grp); }
     grp.members.push(m);
   }
   groups.forEach((grp, gi) => (grp.color = NET_PALETTE[gi % NET_PALETTE.length]));
 
-  // --- angular layout: each group occupies a contiguous arc (∝ its size) ---
+  // --- cluster layout: each network is its OWN cluster placed around the canvas, with
+  // its nodes packed together — so groups read as communities in a graph, not pie slices ---
   const pos = {};
-  const n = Math.max(1, others.length);
-  let idx = 0;
-  for (const grp of groups) {
-    grp.a0 = (idx / n) * Math.PI * 2 - Math.PI / 2;
-    grp.a1 = ((idx + grp.members.length) / n) * Math.PI * 2 - Math.PI / 2;
+  const GC = groups.length;
+  const Rx = Math.max(70, W / 2 - 155), Ry = Math.max(54, H / 2 - 90);
+  groups.forEach((grp, gi) => {
+    if (GC === 1) { grp.cx = cx; grp.cy = cy; }
+    else {
+      const a = (gi / GC) * Math.PI * 2; // 0 = right → spread around, using the width
+      grp.cx = cx + Rx * Math.cos(a);
+      grp.cy = cy + Ry * Math.sin(a);
+    }
+    const k = grp.members.length;
+    // spread wide enough that the name + address sublabels below each node don't collide
+    grp.rr = k === 1 ? 0 : Math.max(62, 30 + k * 18);
     grp.members.forEach((m, j) => {
-      const a = ((idx + j + 0.5) / n) * Math.PI * 2 - Math.PI / 2;
-      pos[m.id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) };
+      const a = (j / Math.max(1, k)) * Math.PI * 2 - Math.PI / 2;
+      pos[m.id] = { x: grp.cx + grp.rr * Math.cos(a), y: grp.cy + grp.rr * Math.sin(a) };
     });
-    idx += grp.members.length;
-  }
-
-  // --- translucent wedge per network group (drawn first, behind nodes/edges) ---
-  for (const grp of groups) {
-    const pad = groups.length > 1 ? 0.05 : 0;
-    g.beginPath();
-    g.moveTo(cx, cy);
-    g.arc(cx, cy, R + 28, grp.a0 + pad, grp.a1 - pad);
-    g.closePath();
-    g.fillStyle = hexA(grp.color, 0.1);
-    g.fill();
-    const am = (grp.a0 + grp.a1) / 2;
-    const lx = cx + (R + 16) * Math.cos(am), ly = cy + (R + 16) * Math.sin(am);
-    g.fillStyle = grp.color; g.font = "10px ui-monospace, monospace";
-    g.textAlign = Math.cos(am) >= 0 ? "left" : "right";
-    g.fillText(grp.label, lx, ly);
-  }
-
-  // --- edges: me → each member; exit edge violet, live links green+solid, the rest faint ---
-  g.textAlign = "center";
-  others.forEach((m) => {
-    const p = pos[m.id];
-    const isExit = d.exit === m.id;
-    const live = m.state === "live";
-    g.setLineDash(live || isExit ? [] : [4, 4]);
-    g.strokeStyle = isExit ? "#a78bfa" : live ? "rgba(34,197,94,.6)" : "rgba(148,163,184,.25)";
-    g.lineWidth = isExit ? 2.5 : live ? 2 : 1;
-    g.beginPath(); g.moveTo(cx, cy); g.lineTo(p.x, p.y); g.stroke();
   });
+
+  // --- soft organic "blob" per network: overlapping radial gradients merge into a region ---
+  for (const grp of groups) {
+    for (const m of grp.members) {
+      const p = pos[m.id];
+      const rad = 52;
+      const grad = g.createRadialGradient(p.x, p.y, 6, p.x, p.y, rad);
+      grad.addColorStop(0, hexA(grp.color, 0.22));
+      grad.addColorStop(1, hexA(grp.color, 0));
+      g.fillStyle = grad;
+      g.beginPath(); g.arc(p.x, p.y, rad, 0, 7); g.fill();
+    }
+    // network label above the cluster (clamped on-canvas)
+    g.fillStyle = grp.color; g.font = "11px ui-monospace, monospace"; g.textAlign = "center";
+    g.fillText(grp.label, grp.cx, Math.max(13, grp.cy - grp.rr - 20));
+  }
+
+  // --- edges: me → each other member (graph links); exit violet, live green, rest faint ---
+  if (me) {
+    const mp = pos[me.id];
+    for (const m of members) {
+      if (m.is_me) continue;
+      const p = pos[m.id];
+      const isExit = d.exit === m.id;
+      const live = m.state === "live";
+      g.setLineDash(live || isExit ? [] : [4, 4]);
+      g.strokeStyle = isExit ? "#a78bfa" : live ? "rgba(34,197,94,.5)" : "rgba(148,163,184,.22)";
+      g.lineWidth = isExit ? 2.5 : live ? 2 : 1;
+      g.beginPath(); g.moveTo(mp.x, mp.y); g.lineTo(p.x, p.y); g.stroke();
+    }
+  }
   g.setLineDash([]);
 
-  const node = (x, y, label, fill, r, ring) => {
+  const node = (x, y, label, sub, fill, r, ring) => {
     if (ring) { g.beginPath(); g.arc(x, y, r + 3, 0, 7); g.strokeStyle = ring; g.lineWidth = 2; g.stroke(); }
     g.beginPath(); g.arc(x, y, r, 0, 7);
     g.fillStyle = fill; g.fill();
-    g.fillStyle = "#cbd5e1"; g.font = "11px ui-monospace, monospace"; g.textAlign = "center";
+    g.textAlign = "center";
+    g.fillStyle = "#e2e8f0"; g.font = "11px ui-monospace, monospace";
     g.fillText(label, x, y + r + 14);
+    // current endpoint under the name — so a live address change is visible immediately.
+    if (sub) { g.fillStyle = "#64748b"; g.font = "9px ui-monospace, monospace"; g.fillText(sub, x, y + r + 26); }
   };
-  // nodes: fill by role/liveness (exit violet, live green, else slate), ringed by network colour.
+  // nodes: me blue, exit violet, live green, else slate; each ringed by its network colour.
   for (const grp of groups) for (const m of grp.members) {
-    const fill = d.exit === m.id ? "#a78bfa" : m.state === "live" ? "#22c55e" : "#475569";
-    node(pos[m.id].x, pos[m.id].y, `${m.name} #${m.id}`, fill, 12, grp.color);
+    const fill = m.is_me ? "#3b82f6" : d.exit === m.id ? "#a78bfa" : m.state === "live" ? "#22c55e" : "#475569";
+    node(pos[m.id].x, pos[m.id].y, `${m.name} #${m.id}${m.is_me ? " (me)" : ""}`, m.endpoint || "—", fill, m.is_me ? 14 : 12, grp.color);
   }
-  node(cx, cy, me ? `${me.name} #${me.id}` : "me", "#3b82f6", 16);
 }
 
 // ---- Mesh mode: Peers page (§4 — members now, live state later) ----
