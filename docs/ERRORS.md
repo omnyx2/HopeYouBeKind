@@ -7,6 +7,66 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ---
 
+## 2026-06-21 — four early-access hardening fixes (v0.6.1)
+
+**Context:** a pre-distribution audit flagged four ways the daemon could silently
+misbehave or be abused. None was a live incident yet; each was a latent gap closed
+before wider distribution. Documented here so the *why* survives.
+
+**The gaps and what shipped:**
+
+1. **Silent route/DNS failure (UX trap).** Full-tunnel set-up shells out to set the
+   default route + DNS; the helpers returned `()` and swallowed failures, so the GUI/CLI
+   showed "VPN on" while traffic silently went nowhere. → `route_through`/`set_dns` now
+   return `Result`; a failure is recorded in `dp_error` and shown by `lattice info` /
+   the GUI. macOS/Linux get per-command detection; Windows catches launch failures
+   (its PowerShell uses `SilentlyContinue`, so per-cmdlet failures still pass).
+
+2. **Nonce reuse on restart (crypto correctness).** The data-plane AEAD nonce is the
+   send counter (`seq`). It reset to **0** on every process start, but the body/header
+   keys derive from the *persisted* secret+epoch — so a restart kept the **same key**
+   and replayed nonces `0,1,2…` = ChaCha20-Poly1305 keystream reuse (an on-path observer
+   who captured pre- and post-restart traffic could recover plaintext). → `send_seq`
+   now seeds from a **random 63-bit per-boot start**. Wire-compatible: the receiver
+   derives the nonce from the transmitted `seq` and has no replay window, so a high
+   start "just works" and old nodes interoperate with new ones.
+
+3. **Unbounded gossip (insider DoS).** A roster cert is merged on a network-id match
+   *before* it validates to the master (`roster()` filters invalid ones later), so a
+   malicious/buggy member could grow `certs` without bound by gossiping junk. →
+   `MAX_GOSSIP_BYTES` (64 KiB) guard + per-collection caps
+   (certs 1024 / revocations 512 / flow-rules 512). Member ids are 1 byte (≤254 live),
+   so the caps sit far above any real mesh and only bite an abuse case.
+
+4. **World-open control socket.** The unix socket is `0o666` so the root daemon's
+   user-level GUI can reach it — which also let *any* local process drive the daemon.
+   The root-daemon/user-GUI split means a strict uid allow-list can't be the default
+   without breaking the GUI. → meshd now reads the peer uid (`SO_PEERCRED` on Linux,
+   `getpeereid` on macOS); **permissive by default**, with opt-in strict mode via
+   `LATTICE_ALLOW_UID=<uid>[,uid…]` (allows root + our uid + `$SUDO_UID` + listed) for
+   shared/multi-user hosts.
+
+**Live verification (2026-06-21, real internet + real data plane).** Built `meshd` on
+the branch and rolled it to two nodes while Mac/Windows stayed on the old build:
+- **Oracle** (`<PUBLIC_IP>`, seed+exit): restarted 3× — peers (Mac, Lablinux) re-linked
+  each time with **zero decrypt-fail** (validates #2-nonce wire-compat under the same
+  persisted key, incl. mixed old/new versions). `LATTICE_ALLOW_UID=0` → a uid-1001 client
+  was refused + logged, root allowed (validates #4); reverted to permissive. 4-member
+  roster still converged (validates #3 didn't break convergence).
+- **Lablinux** (overlay `100.80.1.4`): same build; full-tunnel through Oracle made its
+  egress = Oracle's IP **with no `dp_error`** on success (validates #1 surfacing has no
+  false positives), then reverted clean.
+
+**Remaining design gaps (TODO):**
+- The CLI prints a raw Python traceback when the uid gate refuses a connection (the
+  daemon closes the socket); it should print a clean "not authorized — see
+  `LATTICE_ALLOW_UID`" message.
+- Lablinux runs the **installed app's** bundled `meshd` (`/usr/lib/lattice/resources/meshd`,
+  launched by the GUI as root), not a git/systemd build — so a field update means
+  replacing that binary (atomic rename to dodge `ETXTBSY`) + relaunch, not `git pull`.
+
+---
+
 ## 2026-06-18 — mesh unreachable on an IPv6-only / NAT64 cellular network
 
 **Incident:** on an iPhone hotspot, the Mac couldn't reach Oracle (peer idle) AND SSH to

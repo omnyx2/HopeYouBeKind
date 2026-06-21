@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the major version is `0`, the API and on-wire protocol are unstable: minor
 bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixes.
 
+> **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
+> describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
+
+## [0.6.1] — 2026-06-21
+
+Early-access hardening of the v2 data plane / daemon. Wire-compatible — new and old
+nodes interoperate. See [`docs/SECURITY.md`](docs/SECURITY.md#hardening-v061) and
+[`docs/ERRORS.md`](docs/ERRORS.md) (2026-06-21) for rationale + live validation.
+
+### Fixed / Security
+- **No nonce reuse across restarts.** The data-plane AEAD counter (`seq`, the nonce)
+  reset to 0 on every start while the key persisted, replaying nonces under the same
+  key (keystream reuse). It now seeds from a random 63-bit per-boot start. Receiver
+  derives the nonce from the transmitted `seq`, so this needs no wire/peer change.
+- **No silent full-tunnel failure.** Route/DNS setup now surfaces OS-side failures via
+  `dp_error` (shown in `lattice info` / the GUI) instead of a silently-broken "VPN on".
+- **Bounded gossip.** Size guard (64 KiB) + caps on merged certs/revocations/flow-rules
+  so a member can't grow a peer's memory without bound.
+
+### Added
+- **`LATTICE_ALLOW_UID`** — opt-in control-socket access control. The daemon reads the
+  peer uid (`SO_PEERCRED`/`getpeereid`); default is permissive (the GUI connects as the
+  user), set this to restrict the socket to root + the daemon's uid + `$SUDO_UID` +
+  listed uids on shared/multi-user hosts.
+
+Validated live: rolled to Oracle (seed+exit) and a Linux node over the real internet
+while Mac/Windows stayed on the prior build — peers re-linked across restarts with zero
+decrypt failures, full-tunnel egress verified, uid gate refused/allowed as expected.
+
+## [0.6.0] — 2026-06-20
+
+First official public release of the v2 product. Serverless mesh VPN with per-node
+overlay IPs, public-node relay (NAT traversal fallback), DHT rendezvous, full/split
+tunnel exit, flow table, membership (invite-chain + expel + re-cipher), CLI + GUI.
+Live-verified across macOS, Linux, and Windows. New copy-paste README front page.
+
 ## [Unreleased]
 
 ### Added
