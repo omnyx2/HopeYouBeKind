@@ -625,6 +625,7 @@ dependencies = [
  "lattice-net",
  "lattice-proto",
  "lattice-tun",
+ "libc",
  "rand",
  "serde",
  "serde_json",

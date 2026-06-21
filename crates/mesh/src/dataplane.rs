@@ -66,8 +66,21 @@ pub struct MeshDataPlane {
     /// later carry a custom table in the manifest.
     flows: Vec<FlowRule>,
     /// Outbound counter — the per-message AEAD nonce. Atomic so the run loop can
-    /// seal and recv concurrently behind a shared `&MeshDataPlane`.
+    /// seal and recv concurrently behind a shared `&MeshDataPlane`. Seeded with a
+    /// random per-boot start (not 0): the body/header keys derive from the persisted
+    /// secret+epoch, so a process restart keeps the SAME key — restarting the counter
+    /// at 0 would replay nonces 0,1,2… under that key (ChaCha20-Poly1305 keystream
+    /// reuse, catastrophic). A random 63-bit start makes restart ranges effectively
+    /// never overlap; the receiver derives the nonce from the transmitted seq, so no
+    /// wire/receiver change is needed.
     send_seq: AtomicU64,
+}
+
+/// A random per-boot nonce start in `[0, 2^63)` — high enough that two restarts
+/// (same key) practically never reuse a nonce, low enough to never wrap a u64.
+fn random_seq_start() -> u64 {
+    use rand::RngCore;
+    rand::rngs::OsRng.next_u64() >> 1
 }
 
 impl MeshDataPlane {
@@ -88,7 +101,7 @@ impl MeshDataPlane {
             scramble: Scramble::new(secret, placement),
             placement,
             flows: flow::default_table(),
-            send_seq: AtomicU64::new(0),
+            send_seq: AtomicU64::new(random_seq_start()),
         }
     }
 
@@ -146,14 +159,16 @@ impl MeshDataPlane {
     }
 
     /// Swap to a new cipher epoch **in place** (P-C3 re-cipher): replace the body
-    /// suite + header crypto and reset the nonce counter (a fresh key restarts at
-    /// seq 0). The TUN/UDP, overlay, and member ids are untouched — only the keys
-    /// change, so the run loop can re-cipher without respawning.
+    /// suite + header crypto and re-seed the nonce counter to a fresh random start.
+    /// The new key makes seq 0 safe, but re-seeding (rather than resetting to 0) keeps
+    /// nonces unique even if a secret/epoch were ever reused. The TUN/UDP, overlay, and
+    /// member ids are untouched — only the keys change, so the run loop can re-cipher
+    /// without respawning.
     pub fn recipher(&mut self, suite: Box<dyn MeshSuite>, secret: &[u8; 32]) {
         self.suite = suite;
         self.header = HeaderCrypto::new(secret, self.mesh_id);
         self.scramble = Scramble::new(secret, self.placement);
-        self.send_seq.store(0, Ordering::Relaxed);
+        self.send_seq.store(random_seq_start(), Ordering::Relaxed);
     }
 
     /// Which member (if any) owns the overlay address `dst` in this mesh: the
@@ -438,6 +453,28 @@ mod tests {
             bob2.recv(&neu),
             Some((1, Inbound::Deliver(b"new-epoch".to_vec())))
         );
+    }
+
+    #[test]
+    fn nonce_start_is_randomized_per_boot() {
+        // Two planes built from the SAME secret+epoch (what happens across a daemon
+        // restart) must not both start the nonce counter at 0 — that would replay the
+        // low-nonce range under the same key (keystream reuse). The wire seq is the
+        // scramble-masked counter; same secret ⇒ same mask, so a differing first 8
+        // bytes proves the underlying start seq differs. (1/2^63 false-fail.)
+        let a = node(1);
+        let b = node(1);
+        let fa = a.seal_to(2, b"x");
+        let fb = b.seal_to(2, b"x");
+        assert_ne!(
+            &fa[0..8],
+            &fb[0..8],
+            "two fresh planes shared the same start seq — restart would reuse nonces"
+        );
+        // A peer still decodes either frame: the nonce travels in the seq field.
+        let bob = node(2);
+        assert_eq!(bob.recv(&fa), Some((1, Inbound::Deliver(b"x".to_vec()))));
+        assert_eq!(bob.recv(&fb), Some((1, Inbound::Deliver(b"x".to_vec()))));
     }
 
     #[test]

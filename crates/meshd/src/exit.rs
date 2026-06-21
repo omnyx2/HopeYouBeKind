@@ -37,22 +37,51 @@ fn run(cmd: &str, args: &[&str]) {
     }
 }
 
+/// Like [`run`] but returns the failure instead of swallowing it, so the apply
+/// paths (route/DNS) can surface a real error to the user (dp_error) rather than
+/// silently claiming success while the OS-side plumbing never took effect.
+#[cfg(any(unix, windows))]
+fn run_checked(cmd: &str, args: &[&str]) -> Result<(), String> {
+    match Command::new(cmd).args(args).status() {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => {
+            let m = format!("`{cmd} {}` exited {s}", args.join(" "));
+            tracing::warn!("{m}");
+            Err(m)
+        }
+        Err(e) => {
+            let m = format!("`{cmd}` failed to launch: {e}");
+            tracing::warn!("{m}");
+            Err(m)
+        }
+    }
+}
+
 // ----------------------------- macOS -----------------------------
 #[cfg(target_os = "macos")]
-pub fn route_through(tun: &str, exit_ip: IpAddr) {
+pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     let Some(gw) = macos_default_gateway() else {
-        tracing::warn!("no default gateway found; exit routes not applied");
-        return;
+        return Err("no default gateway found; exit routes not applied".into());
     };
     let _ = std::fs::write(SAVED, &gw);
     // Keep the path to the exit's physical endpoint off the tunnel (no loop). Record
     // it so restore_routes can delete it — a left-behind /32 to the exit IP makes a
     // later connect to that IP fail with EADDRNOTAVAIL.
     let _ = std::fs::write(EXIT_HOST_SAVED, exit_ip.to_string());
-    run("route", &["-q", "add", "-host", &exit_ip.to_string(), &gw]);
+    let mut errs = Vec::new();
+    if let Err(e) = run_checked("route", &["-q", "add", "-host", &exit_ip.to_string(), &gw]) {
+        errs.push(e);
+    }
     // Send everything else into the tunnel.
-    run("route", &["-q", "change", "default", "-interface", tun]);
-    tracing::warn!(%exit_ip, tun, "default route diverted through exit node");
+    if let Err(e) = run_checked("route", &["-q", "change", "default", "-interface", tun]) {
+        errs.push(e);
+    }
+    if errs.is_empty() {
+        tracing::warn!(%exit_ip, tun, "default route diverted through exit node");
+        Ok(())
+    } else {
+        Err(errs.join("; "))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -198,22 +227,22 @@ fn macos_primary_service() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn set_dns(servers: &[IpAddr]) {
+pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     if servers.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(svc) = macos_primary_service() else {
-        tracing::warn!("no primary network service; DNS not set");
-        return;
+        return Err("no primary network service; DNS not set".into());
     };
     let _ = std::fs::write(DNS_SAVED, &svc);
     let mut args = vec!["-setdnsservers".to_string(), svc.clone()];
     args.extend(servers.iter().map(|s| s.to_string()));
-    run(
+    run_checked(
         "networksetup",
         &args.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
+    )?;
     tracing::warn!(service = %svc, ?servers, "DNS pointed through the tunnel (full tunnel)");
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -228,16 +257,16 @@ pub fn restore_dns() {
 
 // ----------------------------- Linux -----------------------------
 #[cfg(target_os = "linux")]
-pub fn route_through(tun: &str, exit_ip: IpAddr) {
+pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     let Some((gw, dev)) = linux_default_route() else {
-        tracing::warn!("no default route found; exit routes not applied");
-        return;
+        return Err("no default route found; exit routes not applied".into());
     };
     let _ = std::fs::write(SAVED, format!("{gw} {dev}"));
     // Record the pinned host route so restore_routes can tear it down (else it
     // lingers and a later connect to the exit IP fails once default is restored).
     let _ = std::fs::write(EXIT_HOST_SAVED, exit_ip.to_string());
-    run(
+    let mut errs = Vec::new();
+    if let Err(e) = run_checked(
         "ip",
         &[
             "route",
@@ -248,9 +277,18 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) {
             "dev",
             &dev,
         ],
-    );
-    run("ip", &["route", "replace", "default", "dev", tun]);
-    tracing::warn!(%exit_ip, tun, "default route diverted through exit node");
+    ) {
+        errs.push(e);
+    }
+    if let Err(e) = run_checked("ip", &["route", "replace", "default", "dev", tun]) {
+        errs.push(e);
+    }
+    if errs.is_empty() {
+        tracing::warn!(%exit_ip, tun, "default route diverted through exit node");
+        Ok(())
+    } else {
+        Err(errs.join("; "))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -293,9 +331,9 @@ pub fn current_gateway() -> Option<String> {
 /// replaces it with a static one. So DNS goes through the tunnel to the exit's
 /// in-mesh resolver instead of a local/campus resolver the exit can't reach.
 #[cfg(target_os = "linux")]
-pub fn set_dns(servers: &[IpAddr]) {
+pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     if servers.is_empty() {
-        return;
+        return Ok(());
     }
     if let Ok(target) = std::fs::read_link("/etc/resolv.conf") {
         let _ = std::fs::write(DNS_SAVED, format!("link:{}", target.display()));
@@ -309,9 +347,10 @@ pub fn set_dns(servers: &[IpAddr]) {
         conf.push_str(&format!("nameserver {s}\n"));
     }
     let _ = std::fs::remove_file("/etc/resolv.conf");
-    if std::fs::write("/etc/resolv.conf", conf).is_ok() {
-        tracing::warn!(?servers, "DNS pointed through the tunnel (full tunnel)");
-    }
+    std::fs::write("/etc/resolv.conf", conf)
+        .map_err(|e| format!("could not write /etc/resolv.conf: {e}"))?;
+    tracing::warn!(?servers, "DNS pointed through the tunnel (full tunnel)");
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -424,8 +463,21 @@ fn ps(script: &str) {
     );
 }
 
+/// Like [`ps`] but returns whether powershell.exe could be launched and exited 0.
+/// Note: the apply scripts use `$ErrorActionPreference='SilentlyContinue'`, so this
+/// catches "powershell not found / not elevated", not per-cmdlet failures.
 #[cfg(target_os = "windows")]
-pub fn route_through(tun: &str, exit_ip: IpAddr) {
+fn ps_checked(script: &str) -> Result<(), String> {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let pwsh = format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe");
+    run_checked(
+        &pwsh,
+        &["-NoProfile", "-NonInteractive", "-Command", script],
+    )
+}
+
+#[cfg(target_os = "windows")]
+pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     // Save the current default route (gateway + ifIndex), pin a host route to the
     // exit's physical endpoint via that gateway (so the tunnel doesn't loop), then
     // override the default with two /1 routes via the TUN (more specific than
@@ -444,8 +496,9 @@ New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $idx -NextHop 0.0.
         tun = tun,
         exit = exit_ip
     );
-    ps(&script);
+    ps_checked(&script)?;
     tracing::warn!(%exit_ip, tun, "default route diverted through exit node (windows)");
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -514,13 +567,14 @@ pub fn disable_nat() {
 }
 
 #[cfg(target_os = "windows")]
-pub fn set_dns(servers: &[IpAddr]) {
+pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     if let Some(first) = servers.first() {
         // Set the Lattice adapter's DNS; full-tunnel routes it through the exit.
-        ps(&format!(
+        ps_checked(&format!(
             "Set-DnsClientServerAddress -InterfaceAlias 'Lattice' -ServerAddresses '{first}' -ErrorAction SilentlyContinue"
-        ));
+        ))?;
     }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -530,8 +584,8 @@ pub fn restore_dns() {
 
 // ------------------------- other platforms -------------------------
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn route_through(_tun: &str, _exit_ip: IpAddr) {
-    tracing::warn!("exit-node routing not implemented on this platform");
+pub fn route_through(_tun: &str, _exit_ip: IpAddr) -> Result<(), String> {
+    Err("exit-node routing not implemented on this platform".into())
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn restore_routes() {}
@@ -542,7 +596,9 @@ pub fn enable_nat() {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn disable_nat() {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn set_dns(_servers: &[IpAddr]) {}
+pub fn set_dns(_servers: &[IpAddr]) -> Result<(), String> {
+    Ok(())
+}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn restore_dns() {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
