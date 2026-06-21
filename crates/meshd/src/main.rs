@@ -75,6 +75,15 @@ const DHT_RECONNECT_TICK_SECS: u64 = 25;
 /// How often to gossip our membership roster (signed certs) to peers so a member
 /// admitted via a third node propagates to everyone (the roster converges).
 const ROSTER_GOSSIP_TICK_SECS: u64 = 20;
+/// Defensive caps on gossiped state. A roster cert is merged on a network match
+/// even before it validates to the master (`roster()` filters invalid ones out),
+/// so without a cap a malicious/buggy member could grow `certs` without bound by
+/// gossiping junk. Member ids are 1 byte (≤254 live members), so these ceilings sit
+/// far above any legitimate mesh and only ever bite an abuse case.
+const MAX_GOSSIP_BYTES: usize = 64 * 1024;
+const MAX_ROSTER_CERTS: usize = 1024;
+const MAX_REVOCATIONS: usize = 512;
+const MAX_FLOW_RULES: usize = 512;
 /// How often to poll the host's default gateway for a network change (Wi-Fi↔cellular,
 /// sleep/wake, a new network after an outage). Cheap; routes/endpoints only refresh on an
 /// actual change.
@@ -751,7 +760,72 @@ async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<(
     }
     loop {
         let (stream, _) = listener.accept().await?;
+        if !peer_allowed(&stream) {
+            continue; // peer_allowed logs the rejection
+        }
         tokio::spawn(serve_conn(stream, Arc::clone(&state)));
+    }
+}
+
+/// The connecting process's uid, read from the socket (Linux `SO_PEERCRED`,
+/// macOS/BSD `getpeereid`). `None` if it can't be determined (we then fail open).
+#[cfg(target_os = "linux")]
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(cred.uid)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+    (rc == 0).then_some(uid)
+}
+
+/// Local-access policy for the control socket. meshd runs as root but the desktop
+/// app legitimately connects as the logged-in user, so the DEFAULT is permissive
+/// (trust local processes — matches the documented threat model). Setting
+/// `LATTICE_ALLOW_UID=<uid>[,uid…]` opts into STRICT mode: only root, our own uid,
+/// `$SUDO_UID`, and the listed uids may connect — others are refused and logged.
+/// Use it on shared/multi-user hosts to stop another local user driving the daemon.
+#[cfg(unix)]
+fn peer_allowed(stream: &tokio::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let allow = match std::env::var("LATTICE_ALLOW_UID") {
+        Ok(v) => v,
+        Err(_) => return true, // permissive default — no per-connection logging (the GUI polls often)
+    };
+    let uid = match peer_uid(stream.as_raw_fd()) {
+        Some(u) => u,
+        None => return true, // can't read creds → don't lock ourselves out
+    };
+    let mut allowed: Vec<u32> = vec![0, unsafe { libc::geteuid() }];
+    if let Ok(Ok(u)) = std::env::var("SUDO_UID").map(|s| s.parse()) {
+        allowed.push(u);
+    }
+    allowed.extend(
+        allow
+            .split(',')
+            .filter_map(|p| p.trim().parse::<u32>().ok()),
+    );
+    if allowed.contains(&uid) {
+        true
+    } else {
+        elog!(
+            "meshd: refused control connection from uid {uid} (not in LATTICE_ALLOW_UID={allow:?})"
+        );
+        false
     }
 }
 
@@ -1083,23 +1157,31 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                 // pushing is safe (an invalid cert just never counts). This is what makes
                 // a member added via a third node propagate to everyone.
                 LoopEvent::Roster(bytes) => {
-                    if let Ok(incoming) = bincode::deserialize::<Vec<Cert>>(&bytes) {
-                        let net = ms.mesh.charter.master_pubkey;
-                        let before = ms.roster().len();
-                        for c in incoming {
-                            if c.network == net
-                                && !ms
-                                    .certs
-                                    .iter()
-                                    .any(|h| h.member == c.member && h.id == c.id)
-                            {
-                                ms.certs.push(c);
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = bincode::deserialize::<Vec<Cert>>(&bytes) {
+                            let net = ms.mesh.charter.master_pubkey;
+                            let before = ms.roster().len();
+                            for c in incoming {
+                                if ms.certs.len() >= MAX_ROSTER_CERTS {
+                                    elog!("meshd: mesh {mid} roster cert cap ({MAX_ROSTER_CERTS}) reached — dropping further gossiped certs");
+                                    break;
+                                }
+                                if c.network == net
+                                    && !ms
+                                        .certs
+                                        .iter()
+                                        .any(|h| h.member == c.member && h.id == c.id)
+                                {
+                                    ms.certs.push(c);
+                                }
                             }
-                        }
-                        let after = ms.roster().len();
-                        if after > before {
-                            elog!("meshd: mesh {mid} roster grew {before} -> {after} via gossip");
-                            persist_after = true;
+                            let after = ms.roster().len();
+                            if after > before {
+                                elog!(
+                                    "meshd: mesh {mid} roster grew {before} -> {after} via gossip"
+                                );
+                                persist_after = true;
+                            }
                         }
                     }
                 }
@@ -1107,27 +1189,33 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                 // existing one, so a quorum expulsion accumulates votes). `roster()`
                 // re-checks authorization, so an unauthorized revocation simply never bites.
                 LoopEvent::Revoke(bytes) => {
-                    if let Ok(incoming) = bincode::deserialize::<Vec<Revocation>>(&bytes) {
-                        let net = ms.mesh.charter.master_pubkey;
-                        let before = ms.roster().len();
-                        let mut changed = false;
-                        for r in incoming {
-                            if r.network != net {
-                                continue;
-                            }
-                            match ms.revocations.iter_mut().find(|e| e.member == r.member) {
-                                Some(existing) => changed |= existing.merge_signers(&r),
-                                None => {
-                                    ms.revocations.push(r);
-                                    changed = true;
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = bincode::deserialize::<Vec<Revocation>>(&bytes) {
+                            let net = ms.mesh.charter.master_pubkey;
+                            let before = ms.roster().len();
+                            let mut changed = false;
+                            for r in incoming {
+                                if r.network != net {
+                                    continue;
+                                }
+                                match ms.revocations.iter_mut().find(|e| e.member == r.member) {
+                                    Some(existing) => changed |= existing.merge_signers(&r),
+                                    None => {
+                                        if ms.revocations.len() >= MAX_REVOCATIONS {
+                                            elog!("meshd: mesh {mid} revocation cap ({MAX_REVOCATIONS}) reached — dropping further gossiped revocations");
+                                            break;
+                                        }
+                                        ms.revocations.push(r);
+                                        changed = true;
+                                    }
                                 }
                             }
-                        }
-                        let after = ms.roster().len();
-                        if changed {
-                            persist_after = true;
-                            if after < before {
-                                elog!("meshd: mesh {mid} roster shrank {before} -> {after} via revocation gossip");
+                            let after = ms.roster().len();
+                            if changed {
+                                persist_after = true;
+                                if after < before {
+                                    elog!("meshd: mesh {mid} roster shrank {before} -> {after} via revocation gossip");
+                                }
                             }
                         }
                     }
@@ -1136,12 +1224,16 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                 // Newest version wins; ties are ignored. On adopting a newer table we
                 // store it, persist it, and push it down to the live data plane.
                 LoopEvent::Flows(bytes) => {
-                    if bytes.len() >= 8 {
+                    if (8..=MAX_GOSSIP_BYTES).contains(&bytes.len()) {
                         let mut v = [0u8; 8];
                         v.copy_from_slice(&bytes[..8]);
                         let version = u64::from_be_bytes(v);
                         if version > ms.flow_version {
                             if let Ok(flows) = bincode::deserialize::<Vec<FlowRule>>(&bytes[8..]) {
+                                if flows.len() > MAX_FLOW_RULES {
+                                    elog!("meshd: mesh {mid} ignored gossiped flow table v{version} — {} rules exceeds cap {MAX_FLOW_RULES}", flows.len());
+                                    continue;
+                                }
                                 elog!(
                                     "meshd: mesh {mid} adopted flow table v{version} ({} rules) via gossip",
                                     flows.len()
@@ -1276,14 +1368,29 @@ fn spawn_netchange_watcher(state: Arc<Mutex<State>>) {
                     Some((tun, ip))
                 })
             };
-            let _ = tokio::task::spawn_blocking(move || match full_tunnel {
+            let route_res = tokio::task::spawn_blocking(move || match full_tunnel {
                 Some((tun, ip)) => {
                     exit::clear_exit_pin();
-                    exit::route_through(&tun, ip);
+                    Some(exit::route_through(&tun, ip))
                 }
-                None => exit::clear_exit_pin(),
+                None => {
+                    exit::clear_exit_pin();
+                    None
+                }
             })
             .await;
+            // Don't let a failed re-route after a network change look like success:
+            // record it on the current mesh so `lattice info` / the GUI show it.
+            if let Ok(Some(Err(e))) = route_res {
+                let mut st = state.lock().unwrap();
+                if let Some(id) = st.current {
+                    if let Some(ms) = st.meshes.get_mut(&id) {
+                        ms.dp_error = Some(format!(
+                            "full-tunnel re-route after network change failed: {e}"
+                        ));
+                    }
+                }
+            }
             // (2) Re-learn our local address so peers re-find us (unless a pinned public node).
             if !pinned {
                 if let Some(ip) = local_ip() {
@@ -1835,10 +1942,28 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                         // it derives from the current default interface — once the
                         // route is on the TUN that lookup finds the tunnel (no service)
                         // and DNS is silently left on the now-unreachable LAN resolver.
+                        let mut errs: Vec<String> = Vec::new();
                         if let Ok(dns) = FULL_TUNNEL_DNS.parse() {
-                            exit::set_dns(&[dns]);
+                            if let Err(e) = exit::set_dns(&[dns]) {
+                                errs.push(format!("DNS: {e}"));
+                            }
                         }
-                        exit::route_through(&tun, ip);
+                        if let Err(e) = exit::route_through(&tun, ip) {
+                            errs.push(format!("route: {e}"));
+                        }
+                        // Don't claim full-tunnel is on when the OS-side plumbing
+                        // failed — surface it so the GUI/CLI show why traffic isn't
+                        // flowing instead of a silently-broken "VPN on".
+                        if let Some(ms) = st.meshes.get_mut(&id) {
+                            ms.dp_error = if errs.is_empty() {
+                                None
+                            } else {
+                                Some(format!(
+                                    "full-tunnel not fully applied — {}",
+                                    errs.join("; ")
+                                ))
+                            };
+                        }
                         // Arm the kill-switch: auto-revert if the exit can't carry traffic.
                         Some(PostAction::ArmKillSwitch(id))
                     }
