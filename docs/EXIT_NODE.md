@@ -162,13 +162,13 @@ that client's internet out through that exit; egress IP must equal the exit's.
 | **Mac**     | direct | ✅ 203.0.113.30 | ⚠️ Win | ✅ <PUBLIC_IP> |
 | **Ubuntu**  | ✅ 203.0.113.20 | direct | ⚠️ Win | ✅ <PUBLIC_IP> |
 | **Windows** | ⚠️ Win | ⚠️ Win | direct | ⚠️ Win |
-| **Oracle**  | ✅ 118.235.x | ✅ 203.0.113.30 | ⚠️ Win | direct |
+| **Oracle**  | ✅ <CELLULAR_IP> | ✅ 203.0.113.30 | ⚠️ Win | direct |
 
 ✅ = verified live 2026-06-14. The whole **macOS + Linux 3-node sub-matrix
 (Mac/Ubuntu/Oracle) is complete — all 6 cross cells pass**: each client's egress
 IP becomes the exit's public IP. Probes were DNS-free (`1.1.1.1/cdn-cgi/trace`,
 `dig @208.67.222.222`); Mac-client cells via full-tunnel, Linux-client cells via
-split-tunnel. Mac↔Oracle was verified with Mac on cellular (egress 118.235.x);
+split-tunnel. Mac↔Oracle was verified with Mac on cellular (egress <CELLULAR_IP>);
 the rest on campus WiFi. Mac and Windows both NAT behind the campus gateway
 (203.0.113.20), so those two exits share an egress IP — the `exit use <id>`
 target disambiguates which node forwarded.

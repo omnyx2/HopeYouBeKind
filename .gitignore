@@ -38,5 +38,6 @@ Thumbs.db
 !.vscode/extensions.json
 *.swp
 /legacy/dist-linux
-ssh-key-2026-06-13.key*
+ssh-key-*.key*
+*.pem
 gui/src-tauri/resources/meshd
