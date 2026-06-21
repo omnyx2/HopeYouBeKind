@@ -10,6 +10,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Block any real infrastructure IP / credential / personal path from reaching the
+  # PUBLIC repo. Fast + standalone so a leak fails the PR immediately (scripts/opsec-scan.sh).
+  opsec:
+    name: opsec (no real IPs / credentials)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/opsec-scan.sh
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
