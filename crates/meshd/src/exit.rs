@@ -42,10 +42,25 @@ fn run(cmd: &str, args: &[&str]) {
 /// silently claiming success while the OS-side plumbing never took effect.
 #[cfg(any(unix, windows))]
 fn run_checked(cmd: &str, args: &[&str]) -> Result<(), String> {
-    match Command::new(cmd).args(args).status() {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => {
-            let m = format!("`{cmd} {}` exited {s}", args.join(" "));
+    // Capture output (not inherit) so a non-zero exit can surface the tool's own
+    // stderr — e.g. PowerShell's reason — instead of a bare "exited exit code: 1".
+    match Command::new(cmd).args(args).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let reason = String::from_utf8_lossy(&o.stderr);
+            let reason = reason.trim();
+            let reason = if reason.is_empty() {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            } else {
+                reason.to_string()
+            };
+            // Keep the message short: the exit code plus the first line of any reason.
+            let head = reason.lines().next().unwrap_or("").trim();
+            let m = if head.is_empty() {
+                format!("`{cmd}` exited {}", o.status)
+            } else {
+                format!("`{cmd}` exited {}: {head}", o.status)
+            };
             tracing::warn!("{m}");
             Err(m)
         }
@@ -545,15 +560,32 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     // exit's physical endpoint via that gateway (so the tunnel doesn't loop), then
     // override the default with two /1 routes via the TUN (more specific than
     // 0.0.0.0/0, so they win without deleting the real default — OpenVPN-style).
+    // `Stop` makes errors terminating so try/catch can report a real reason and a
+    // distinct exit code. The `$def`/`$idx` guards turn the two silent-null traps
+    // (no default route, missing TUN) into clear messages. Deleting any pre-existing
+    // routes first makes a re-apply idempotent: a leftover 0.0.0.0/1 or {exit}/32
+    // from a prior run made `New-NetRoute` fail with "already exists" → exit 1, which
+    // is exactly the "full-tunnel not fully applied" the user hit on the second toggle.
     let script = format!(
         r#"
-$ErrorActionPreference='SilentlyContinue'
-$def = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1
-'{exit}' | Set-Content -Path '{saved}'
-$idx = (Get-NetAdapter -Name '{tun}').ifIndex
-New-NetRoute -DestinationPrefix '{exit}/32' -NextHop $def.NextHop -InterfaceIndex $def.ifIndex -RouteMetric 1 -PolicyStore ActiveStore
-New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $idx -NextHop 0.0.0.0 -RouteMetric 1 -PolicyStore ActiveStore
-New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $idx -NextHop 0.0.0.0 -RouteMetric 1 -PolicyStore ActiveStore
+$ErrorActionPreference='Stop'
+try {{
+  $def = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1
+  if (-not $def) {{ throw 'no default route (0.0.0.0/0) found; not connected to a network?' }}
+  $idx = (Get-NetAdapter -Name '{tun}' -ErrorAction SilentlyContinue).ifIndex
+  if (-not $idx) {{ throw 'Lattice TUN adapter "{tun}" not found; is the data plane up?' }}
+  '{exit}' | Set-Content -Path '{saved}'
+  Remove-NetRoute -DestinationPrefix '{exit}/32' -Confirm:$false -ErrorAction SilentlyContinue
+  Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue
+  Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue
+  New-NetRoute -DestinationPrefix '{exit}/32' -NextHop $def.NextHop -InterfaceIndex $def.ifIndex -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+  New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $idx -NextHop 0.0.0.0 -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+  New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $idx -NextHop 0.0.0.0 -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+  exit 0
+}} catch {{
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}}
 "#,
         saved = WIN_SAVED,
         tun = tun,
