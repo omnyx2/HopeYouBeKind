@@ -219,11 +219,16 @@ def cmd_id(sock, a):
 def cmd_invite(sock, a):
     mid = resolve_mesh(sock, a.mesh)
     ident = unb64(read_code(a.id_code))
+    # Accept BOTH the CLI/daemon form {member_pubkey_hex,...} AND the GUI short form
+    # {m,e,t} so a GUI-minted identity code works in the CLI and vice versa.
+    mpk = ident.get("member_pubkey_hex") or ident.get("m")
+    epk = ident.get("enc_pubkey_hex") or ident.get("e")
+    iat = ident.get("issued_at", ident.get("t", 0))
+    if not mpk or not epk:
+        die("invalid identity code (missing member/enc pubkey)")
     req = {"CreateInvite": {
         "mesh": mid, "name": a.name,
-        "member_pubkey_hex": ident["member_pubkey_hex"],
-        "enc_pubkey_hex": ident["enc_pubkey_hex"],
-        "issued_at": ident.get("issued_at", 0)}}
+        "member_pubkey_hex": mpk, "enc_pubkey_hex": epk, "issued_at": iat}}
     if a.algo:
         req["CreateInvite"]["algo"] = a.algo
     inv = call(sock, req)["Invite"]

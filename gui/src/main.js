@@ -29,7 +29,14 @@ function toast(msg) {
 function b64encode(obj) { return btoa(unescape(encodeURIComponent(JSON.stringify(obj)))); }
 function b64decode(s) { try { return JSON.parse(decodeURIComponent(escape(atob((s || "").trim())))); } catch { return null; } }
 function encodeIdentity(id) { return b64encode({ m: id.member_pubkey_hex, e: id.enc_pubkey_hex, t: id.issued_at || 0 }); }
-function decodeIdentity(code) { const o = b64decode(code); return o && o.m && o.e ? o : null; }
+function decodeIdentity(code) {
+  const o = b64decode(code);
+  if (!o) return null;
+  // Accept BOTH the GUI short form {m,e,t} AND the CLI/daemon form
+  // {member_pubkey_hex, enc_pubkey_hex, issued_at} so CLI ↔ GUI invites interoperate.
+  const m = o.m || o.member_pubkey_hex, e = o.e || o.enc_pubkey_hex, t = o.t ?? o.issued_at ?? 0;
+  return m && e ? { m, e, t } : null;
+}
 function encodeInvite(w) { return b64encode(w); }
 // P-C6: the invite is now a WrappedInvite {salt, n, ct}.
 function decodeInvite(code) { const o = b64decode(code); return o && o.ct != null && o.salt != null ? o : null; }
