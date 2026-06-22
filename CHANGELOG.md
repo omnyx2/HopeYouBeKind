@@ -11,6 +11,15 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.1] — 2026-06-22
+
+### Fixed
+- **Invite: CLI ↔ GUI identity-code interop** — the CLI minted identity codes with
+  `{member_pubkey_hex, enc_pubkey_hex, issued_at}` while the GUI only accepted the short
+  `{m,e,t}` form, so a code made on one tool failed on the other with “invalid join code”.
+  Both sides now accept either form. (Workaround on older builds: keep the whole
+  identity→invite→join chain on a single tool.)
+
 ## [0.7.0] — 2026-06-21
 
 Topology insight, distributed-exit routing policy, and discovery robustness. Charter
