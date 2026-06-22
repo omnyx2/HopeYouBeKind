@@ -9,29 +9,64 @@
 
 ---
 
-## 0. TL;DR (명령 4줄로 서버 띄우기)
+## 0. 두 가지 설치 경로 — 처음이면 **경로 A**
+
+서버에 노드를 올리는 길은 두 가지입니다. **빌드가 처음이거나 그냥 빨리 돌리고 싶으면
+경로 A**를 쓰세요 — Rust도, 컴파일도 필요 없습니다. 코드를 직접 고치거나 최신 커밋을
+빌드해야 할 때만 경로 B로 가세요.
+
+### 경로 A — 빌드 없이 (권장 · 초보자) ⭐
+
+[Releases](https://github.com/omnyx2/HopeYouBeKind/releases/latest)에서 OS/arch에 맞는
+**미리 빌드된 `meshd`** 바이너리를 받아 그대로 실행합니다. Ubuntu(x86-64) 예시:
 
 ```sh
-# 1. 데몬 빌드
-git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
-cargo build --release -p lattice-meshd
+# 1. 미리 빌드된 데몬 + CLI 받기 (한 줄씩 복사해 실행)
+mkdir -p ~/lattice && cd ~/lattice
+curl -fL -o meshd https://github.com/omnyx2/HopeYouBeKind/releases/latest/download/meshd-Linux-X64
+chmod +x meshd
+curl -fL -o lattice https://raw.githubusercontent.com/omnyx2/HopeYouBeKind/main/scripts/lattice
+chmod +x lattice
 
-# 2. CLI를 PATH에 등록
-sudo ./scripts/lattice install
+# 2. CLI가 이 데몬을 쓰도록 알려주기 (이 줄을 ~/.bashrc 에도 넣어두면 편함)
+export LATTICE_MESHD=~/lattice/meshd
+export PATH="$HOME/lattice:$PATH"
 
-# 3. 부팅 서비스로 시작(공개 출구/시드: 공인 IP 고정 + 포트 개방)
-sudo lattice install-service --advertise <공인IP>:41000 --bind-port 41000 --dht-port 41001
+# 3. 부팅 서비스로 시작 (공개 출구/시드: 공인 IP 고정 + 포트 개방)
+sudo -E lattice install-service --advertise <공인IP>:41000 --bind-port 41000 --dht-port 41001
 
 # 4. 확인
 lattice status
 ```
 
-이걸로 부팅에도 살아남는 데몬이 돕니다. 이제 메쉬를 만들거나 가입하세요(§3).
+> ARM 서버(라즈베리파이, Ampere/Graviton)는 `meshd-Linux-X64` 대신
+> **`meshd-Linux-ARM64`** 를 받으세요. `uname -m` 이 `aarch64`/`arm64`면 ARM입니다.
 
-> **서버에 Rust가 없다?** [Releases](https://github.com/omnyx2/HopeYouBeKind/releases)에서
-> OS/arch에 맞는 **standalone `meshd`**(예: `meshd-Linux-X64`, `meshd-Linux-ARM64`)를
-> 받아 `chmod +x` 후 CLI가 가리키게 하세요: `export LATTICE_MESHD=/경로/meshd`.
-> 2~4단계는 동일합니다.
+이게 끝입니다 — 부팅에도 살아남는 데몬이 돕니다. 이제 §1(포트)·§3(메쉬)로 가세요.
+
+### 경로 B — 소스에서 빌드 (코드 수정/최신 커밋이 필요할 때)
+
+빌드엔 **Rust 툴체인과 C 링커**가 필요합니다. 깡통 서버라면 보통 둘 다 없어서
+`cargo: command not found` 나 `linker 'cc' not found` 로 막힙니다 — 먼저 깔아주세요:
+
+```sh
+# Ubuntu/Debian: 빌드 도구 + Rust (한 번만)
+sudo apt update && sudo apt install -y build-essential git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"          # 현재 셸에 cargo 등록 (새 SSH 창은 자동 적용)
+
+# 그다음 클론 + 빌드 (CPU에 따라 수 분 걸립니다)
+git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
+cargo build --release -p lattice-meshd      # 결과물: target/release/meshd
+sudo ./scripts/lattice install              # `lattice` CLI를 PATH에 등록
+
+# 부팅 서비스로 시작
+sudo lattice install-service --advertise <공인IP>:41000 --bind-port 41000 --dht-port 41001
+lattice status
+```
+
+> 빌드가 메모리 부족(`signal: 9, SIGKILL`)으로 죽으면 — 1GB 램 VM에서 흔합니다 —
+> 스왑을 잠깐 켜세요: `sudo fallocate -l 2G /swap && sudo chmod 600 /swap && sudo mkswap /swap && sudo swapon /swap`.
 
 ---
 
@@ -43,7 +78,8 @@ lattice status
   - **41000** — 메쉬 데이터 플레인(`--bind-port`).
   - **41001** — DHT 랑데부(`--dht-port`), 이 노드가 디스커버리 시드가 되려면.
   - DHT 기본값은 `42900`이니 — 실제로 열어둔 포트로 고정하세요.
-- 서버에서 빌드하려면 Rust(`rustup`, stable) 필요 — 또는 위의 prebuilt 바이너리 사용.
+- **대부분은 빌드가 필요 없습니다** — 경로 A(§0)는 미리 빌드된 바이너리를 씁니다. 소스
+  빌드(경로 B)만 Rust + `build-essential`가 필요하고, 설치법은 §0에 적혀 있습니다.
 
 ```sh
 # Oracle Cloud / Ubuntu 예시 — 호스트 방화벽 개방(클라우드 보안 목록은 별도)

@@ -9,29 +9,65 @@ This page is the "just get me running" path.
 
 ---
 
-## 0. TL;DR (a server in 4 commands)
+## 0. Two install paths — new here? Use **Path A**
+
+There are two ways to stand up a server node. **If you've never built from source, or you
+just want it running fast, use Path A** — no Rust, no compiling. Only take Path B when you
+need to edit the code or build the very latest commit.
+
+### Path A — no build (recommended · beginners) ⭐
+
+Grab the **prebuilt `meshd`** binary for your OS/arch from the
+[Releases page](https://github.com/omnyx2/HopeYouBeKind/releases/latest) and run it as-is.
+Ubuntu (x86-64) example:
 
 ```sh
-# 1. build the daemon
-git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
-cargo build --release -p lattice-meshd
+# 1. download the prebuilt daemon + CLI (copy line by line)
+mkdir -p ~/lattice && cd ~/lattice
+curl -fL -o meshd https://github.com/omnyx2/HopeYouBeKind/releases/latest/download/meshd-Linux-X64
+chmod +x meshd
+curl -fL -o lattice https://raw.githubusercontent.com/omnyx2/HopeYouBeKind/main/scripts/lattice
+chmod +x lattice
 
-# 2. put the CLI on PATH
-sudo ./scripts/lattice install
+# 2. tell the CLI which daemon to use (also put these two lines in ~/.bashrc)
+export LATTICE_MESHD=~/lattice/meshd
+export PATH="$HOME/lattice:$PATH"
 
 # 3. start at boot as a service (public exit/seed: pin your public ip + open ports)
-sudo lattice install-service --advertise <PUBLIC_IP>:41000 --bind-port 41000 --dht-port 41001
+sudo -E lattice install-service --advertise <PUBLIC_IP>:41000 --bind-port 41000 --dht-port 41001
 
 # 4. check it
 lattice status
 ```
 
-That's a running, boot-persistent daemon. Now create or join a mesh (§3).
+> On an ARM server (Raspberry Pi, Ampere/Graviton) download **`meshd-Linux-ARM64`**
+> instead of `meshd-Linux-X64`. If `uname -m` says `aarch64`/`arm64`, you're on ARM.
 
-> **No Rust on the box?** Download the prebuilt **standalone `meshd`** for your
-> OS/arch from the [Releases page](https://github.com/omnyx2/HopeYouBeKind/releases)
-> (e.g. `meshd-Linux-X64`, `meshd-Linux-ARM64`), `chmod +x` it, and point the CLI at
-> it: `export LATTICE_MESHD=/path/to/meshd`. Steps 2–4 are unchanged.
+That's it — a running, boot-persistent daemon. Continue to §1 (ports) and §3 (mesh).
+
+### Path B — build from source (when you need to edit code / latest commit)
+
+Building needs the **Rust toolchain and a C linker**. A bare server usually has neither, so
+you'll hit `cargo: command not found` or `linker 'cc' not found` — install them first:
+
+```sh
+# Ubuntu/Debian: build tools + Rust (one time)
+sudo apt update && sudo apt install -y build-essential git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"          # add cargo to the current shell (new SSH sessions get it automatically)
+
+# then clone + build (a few minutes depending on CPU)
+git clone https://github.com/omnyx2/HopeYouBeKind.git && cd HopeYouBeKind
+cargo build --release -p lattice-meshd      # produces target/release/meshd
+sudo ./scripts/lattice install              # put the `lattice` CLI on PATH
+
+# start at boot as a service
+sudo lattice install-service --advertise <PUBLIC_IP>:41000 --bind-port 41000 --dht-port 41001
+lattice status
+```
+
+> If the build is killed for out-of-memory (`signal: 9, SIGKILL`) — common on 1 GB VMs —
+> add temporary swap: `sudo fallocate -l 2G /swap && sudo chmod 600 /swap && sudo mkswap /swap && sudo swapon /swap`.
 
 ---
 
@@ -43,7 +79,8 @@ That's a running, boot-persistent daemon. Now create or join a mesh (§3).
   - **41000** — the mesh data plane (`--bind-port`).
   - **41001** — DHT rendezvous (`--dht-port`), so this node can be a discovery seed.
   - The DHT default is `42900`; pin it to a port you've actually opened.
-- To build on the box you need Rust (`rustup`, stable) — or use the prebuilt binary above.
+- **No build needed** for the common case — Path A (§0) uses a prebuilt binary. Only Path B
+  (from source) needs Rust + `build-essential`, and §0 spells out installing them.
 
 ```sh
 # Oracle Cloud / Ubuntu example — open the host firewall (cloud security list is separate)

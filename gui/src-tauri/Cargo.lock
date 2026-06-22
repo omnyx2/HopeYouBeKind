@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-ipc"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "lattice-proto",
  "libc",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-proto"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "serde",
  "thiserror 1.0.69",

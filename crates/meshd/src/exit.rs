@@ -598,21 +598,33 @@ try {{
 
 #[cfg(target_os = "windows")]
 pub fn restore_routes() {
+    // Symmetric with `route_through`: removing the two /1 overrides is what hands the
+    // default back to the real gateway. If this silently fails (e.g. not elevated) the
+    // /1 routes survive and ALL traffic stays pointed at the now-dead tunnel — internet
+    // looks broken with no clue why. So each remove is independent (a failure on one
+    // can't skip the rest) and a real failure is logged with its reason.
     let script = format!(
         r#"
-$ErrorActionPreference='SilentlyContinue'
-Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -Confirm:$false
-Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false
+$ErrorActionPreference='Continue'
+$errs = @()
+foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
+  try {{ Remove-NetRoute -DestinationPrefix $p -Confirm:$false -ErrorAction Stop }}
+  catch {{ if ($_.Exception.Message -notmatch 'No matching|not found') {{ $errs += "$p: $($_.Exception.Message)" }} }}
+}}
 if (Test-Path '{saved}') {{
   $exit = (Get-Content '{saved}').Trim()
-  Remove-NetRoute -DestinationPrefix "$exit/32" -Confirm:$false
-  Remove-Item '{saved}'
+  try {{ Remove-NetRoute -DestinationPrefix "$exit/32" -Confirm:$false -ErrorAction Stop }} catch {{}}
+  Remove-Item '{saved}' -ErrorAction SilentlyContinue
 }}
+if ($errs.Count -gt 0) {{ [Console]::Error.WriteLine(($errs -join '; ')); exit 1 }}
+exit 0
 "#,
         saved = WIN_SAVED
     );
-    ps(&script);
-    tracing::info!("default route restored (windows)");
+    match ps_checked(&script) {
+        Ok(()) => tracing::info!("default route restored (windows)"),
+        Err(e) => tracing::warn!("restore_routes failed — internet may stay on a dead tunnel: {e}"),
+    }
 }
 
 #[cfg(target_os = "windows")]

@@ -64,6 +64,10 @@ No Rust toolchain? Download the prebuilt daemon from the release
 also macOS-ARM64 / Windows-X64), then `export LATTICE_MESHD=/path/to/meshd` and
 `sudo lattice up`. (The CLI needs only Python 3.)
 
+> **New to this?** The [server setup guide](docs/guides/server-setup.en.md) ·
+> [(한국어)](docs/guides/server-setup.ko.md) walks both paths step by step —
+> **Path A (no build)** and **Path B (from source)** with every prerequisite spelled out.
+
 ## Quick start — two machines in one mesh
 
 **Machine A** — create the mesh:
