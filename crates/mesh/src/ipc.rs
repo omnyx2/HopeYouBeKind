@@ -170,6 +170,63 @@ pub enum Request {
         #[serde(default)]
         algo: Option<String>,
     },
+
+    // --- extensions / connectors (docs/EXTENSIONS.md) -------------------------------
+    /// (Connector) Authenticate this connection as an enabled extension. The daemon
+    /// checks `token` against the grant created by `EnableExtension`; on success the
+    /// connection gains the granted scopes (returned in [`Response::HelloOk`]) and may
+    /// `Subscribe` / `Advertise`. Must be the connector's first request.
+    Hello {
+        id: String,
+        #[serde(default)]
+        version: String,
+        token: String,
+    },
+    /// (Connector) Turn this connection into an event stream for the given bus `topics`
+    /// (`peer` | `service` | `exit` | `health`), each gated by the matching granted scope.
+    /// After this, the daemon pushes [`Response::Event`] lines on the same connection while
+    /// the connection still serves normal request/response. Requires a prior `Hello`.
+    Subscribe { topics: Vec<String> },
+    /// (Management/GUI) Enable an extension and grant it a subset of the scopes it
+    /// requested. Mints (or refreshes) a local token the connector authenticates with.
+    /// Returns [`Response::Extension`]. `meshes` scopes the grant to specific meshes (an
+    /// allow-list of mesh ids); `all_meshes` grants every mesh incl. ones joined later.
+    /// With both empty/false the extension is enabled but allowed on NO mesh — so a
+    /// connector can't silently reach a mesh the user didn't pick (docs/EXTENSIONS.md §3).
+    EnableExtension {
+        id: String,
+        scopes: Vec<String>,
+        #[serde(default)]
+        all_meshes: bool,
+        #[serde(default)]
+        meshes: Vec<MeshId>,
+    },
+    /// (Management/GUI) Disable an extension: revoke its grant so its token stops working
+    /// and live connector connections lose their scopes on next check.
+    DisableExtension { id: String },
+    /// (Management/GUI) List installed extension grants. Returns [`Response::Extensions`].
+    ListExtensions,
+    /// (Connector) Advertise that THIS node offers `proto` on its overlay IP at `port`,
+    /// so peers' connectors discover it. Gossips mesh-wide (newest wins) and expires if
+    /// not refreshed. Requires the `registry:advertise` scope. Returns [`Response::Ok`].
+    Advertise {
+        mesh: MeshId,
+        proto: String,
+        port: u16,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        meta: serde_json::Value,
+    },
+    /// (Connector) Withdraw a service this node advertised. Requires `registry:advertise`.
+    Unadvertise { mesh: MeshId, proto: String },
+    /// Discover services advertised in a mesh (optionally filtered to one `proto`), each
+    /// with the owner's overlay IP + online state. Returns [`Response::Services`].
+    ListServices {
+        mesh: MeshId,
+        #[serde(default)]
+        proto: Option<String>,
+    },
 }
 
 /// A P-C6 wrapped invite: the serialized [`InviteBlob`] sealed under (algo, salt, n).
@@ -215,6 +272,61 @@ pub enum Response {
     Error {
         message: String,
     },
+
+    // --- extensions / connectors (docs/EXTENSIONS.md) -------------------------------
+    /// `Hello` accepted — the scopes this connection now holds.
+    HelloOk {
+        scopes: Vec<String>,
+    },
+    /// One extension grant (from `EnableExtension` / `ListExtensions`).
+    Extension(ExtensionView),
+    /// Installed extension grants (from `ListExtensions`).
+    Extensions(Vec<ExtensionView>),
+    /// Discovered services (from `ListServices`).
+    Services(Vec<ServiceView>),
+    /// A pushed event on a `Subscribe`'d connection — NOT a reply to a request. `seq` is
+    /// monotonic per connection; a gap means events were dropped (the connector lagged)
+    /// and it should re-query current state. A `topic` of `"_lagged"` is the explicit
+    /// drop marker.
+    Event {
+        topic: String,
+        seq: u64,
+        ts_ms: u64,
+        data: serde_json::Value,
+    },
+}
+
+/// One extension grant, projected for the management UI (from `EnableExtension` /
+/// `ListExtensions`). The `token` is local-only (0600 state) — it authenticates which
+/// connector a connection claims to be, not a network credential.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExtensionView {
+    pub id: String,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+    pub token: String,
+    /// The grant is allowed on every mesh (incl. future) — overrides `meshes`.
+    #[serde(default)]
+    pub all_meshes: bool,
+    /// The specific meshes this grant is allowed on (when `all_meshes` is false).
+    #[serde(default)]
+    pub meshes: Vec<MeshId>,
+}
+
+/// One discovered service (from `ListServices`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceView {
+    pub mesh: MeshId,
+    pub member: MemberId,
+    pub member_name: String,
+    /// The owner's overlay IP — where a connector connects to reach the service.
+    pub overlay_ip: String,
+    pub proto: String,
+    pub port: u16,
+    pub name: String,
+    pub meta: serde_json::Value,
+    /// Whether the owner is currently live (recent data-plane contact); self = always true.
+    pub online: bool,
 }
 
 /// A self-contained invite: everything a joiner needs to install the mesh and key

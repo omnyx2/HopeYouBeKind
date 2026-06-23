@@ -11,6 +11,29 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [Unreleased]
+
+### Added
+- **Extensions / connector framework (daemon side)** — `meshd` can now host external
+  connector programs over its existing IPC socket (docs/EXTENSIONS.md). Connectors are
+  separate processes that authenticate with `Hello{id,token}`, `Subscribe` to scope-gated
+  event topics (`peer`/`service`/`exit`/`health`) to receive a server-pushed `Event`
+  stream, and use a mesh-wide **service registry** (`Advertise`/`Unadvertise`/
+  `ListServices`, gossiped via `CTRL_REGISTRY` 0x08, soft-state with TTL expiry) to
+  discover each other on the overlay. Grants are created with `EnableExtension{id,scopes}`
+  and persisted to `extensions.json` (0600); a bounded `broadcast` event bus keeps a slow
+  connector from ever back-pressuring the data plane. Wire-compatible (additive IPC +
+  control tag).
+- **Extensions GUI page** — a User-mode **Extensions** tab to enable connectors with
+  per-scope approval (risk-labelled), see/disable existing grants and copy their token,
+  and browse services discovered across all meshes. The first connector (MiniSync) is
+  still to come.
+- **Per-mesh extension scoping** — an extension grant now carries which meshes it may
+  touch (`all_meshes` or an explicit `meshes` allow-list), chosen at enable time. The
+  daemon enforces it on `Advertise`/`Unadvertise`/`ListServices` and filters the event
+  stream by mesh, so enabling one connector never silently exposes a mesh the user didn't
+  pick. Grants written before this load as "no meshes" (must be re-granted).
+
 ## [0.7.1] — 2026-06-22
 
 ### Fixed

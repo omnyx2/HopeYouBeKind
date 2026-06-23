@@ -25,18 +25,19 @@ use lattice_mesh::charter::{
 use lattice_mesh::crypto::suite;
 use lattice_mesh::dataplane::MeshDataPlane;
 use lattice_mesh::ipc::{
-    FlowView, InviteBlob, MemberView, MeshDetail, MeshSummary, PeerTrafficView, PolicyView,
-    Request, Response, TrafficView,
+    ExtensionView, FlowView, InviteBlob, MemberView, MeshDetail, MeshSummary, PeerTrafficView,
+    PolicyView, Request, Response, ServiceView, TrafficView,
 };
 use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{
     effective_members, valid_members, Cert, MasterKey, MemberKey, PubKey, Revocation,
 };
+use lattice_mesh::registry::{self, ServiceEntry, ServiceRecord};
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
     SharedEndpoint, SharedExit, SharedTraffic, Traffic, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_FLOWS,
-    CTRL_REVOKE, CTRL_ROSTER,
+    CTRL_REGISTRY, CTRL_REVOKE, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::flow::FlowRule;
@@ -210,6 +211,13 @@ struct MeshState {
     /// live data plane and persisted. `flow::default_table()` = the classic behavior.
     flows: Vec<FlowRule>,
     flow_version: u64,
+    /// Connector service registry (docs/EXTENSIONS.md §6): services THIS node advertises
+    /// plus those learned from peers. Soft state — not persisted; peer entries expire if
+    /// not re-gossiped. Gossiped via `CTRL_REGISTRY`.
+    services: Vec<ServiceEntry>,
+    /// Monotonic counter for OUR advertised services' `seq`, so a re-advertise supersedes
+    /// the previous record at every peer.
+    service_seq: u64,
 }
 
 impl MeshState {
@@ -260,6 +268,88 @@ struct State {
     /// Node-wide DHT rendezvous (`MESHD_DHT=1`); `None` = off. Re-finds a peer whose
     /// address changed with no overlapping live window — docs/DHT_RENDEZVOUS.md.
     dht: Option<Arc<dht::DhtService>>,
+    /// Extension event bus (docs/EXTENSIONS.md §1). Subsystems publish [`MeshEvent`]s;
+    /// each subscribed connector connection drains a `broadcast::Receiver` and forwards
+    /// scope-matching events. Bounded — a slow connector lags and drops events, it never
+    /// back-pressures the data plane. Set once at startup (`None` only before that).
+    bus: Option<tokio::sync::broadcast::Sender<MeshEvent>>,
+    /// Installed extension grants (docs/EXTENSIONS.md §3), keyed by extension id. Created
+    /// by `EnableExtension`, persisted to `extensions.json` (0600). A connector's `Hello`
+    /// token is checked against these; a grant gates which scopes the connection holds.
+    extensions: HashMap<String, ExtensionGrant>,
+}
+
+/// One enabled extension's grant — the local record a connector authenticates against.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ExtensionGrant {
+    id: String,
+    /// Local secret the connector presents in `Hello`. Not a network credential — it
+    /// only identifies which extension a local connection claims to be.
+    token: String,
+    /// The scopes the user granted (subset of what the extension requested).
+    scopes: Vec<String>,
+    enabled: bool,
+    /// Allowed on every mesh, including ones joined later. `#[serde(default)]` so grants
+    /// written before per-mesh scoping load as "no meshes" (safe — must be re-granted).
+    #[serde(default)]
+    all_meshes: bool,
+    /// The specific meshes this grant may touch (when `all_meshes` is false). A connector
+    /// can advertise/list/receive events ONLY for these — so enabling one connector never
+    /// silently exposes a mesh the user didn't pick (docs/EXTENSIONS.md §3).
+    #[serde(default)]
+    meshes: Vec<MeshId>,
+}
+
+impl ExtensionGrant {
+    fn view(&self) -> ExtensionView {
+        ExtensionView {
+            id: self.id.clone(),
+            scopes: self.scopes.clone(),
+            enabled: self.enabled,
+            token: self.token.clone(),
+            all_meshes: self.all_meshes,
+            meshes: self.meshes.clone(),
+        }
+    }
+    /// Whether this grant is allowed to touch `mesh`.
+    fn allows_mesh(&self, mesh: MeshId) -> bool {
+        self.all_meshes || self.meshes.contains(&mesh)
+    }
+}
+
+/// An event published on the extension bus (docs/EXTENSIONS.md §5). `topic` is the bus
+/// channel (`peer` | `service` | `exit` | `health`); `data` is a topic-specific JSON
+/// payload. `mesh` is the mesh the event concerns (so a subscriber only gets events for
+/// meshes its grant allows); `None` = node-level, delivered to any subscriber. Events are
+/// coarse — a connector that sees one re-queries authoritative state (e.g. `ListServices`).
+#[derive(Clone, Debug)]
+struct MeshEvent {
+    topic: &'static str,
+    mesh: Option<MeshId>,
+    ts_ms: u64,
+    data: serde_json::Value,
+}
+
+/// Bus capacity. A connector that falls this far behind gets a `Lagged` (we surface it as
+/// a `_lagged` marker so it re-queries) rather than stalling the publisher.
+const EVENT_BUS_CAP: usize = 1024;
+/// Per-connection outbound queue depth. Bounds memory if a connector stops reading its
+/// socket: responses backpressure the request loop, pushed events are dropped past this.
+const OUT_CHAN_CAP: usize = 256;
+/// Cap on registry entries per mesh (own + learned), mirroring the roster/flow caps.
+const MAX_SERVICES: usize = 256;
+
+/// Publish an event to the extension bus, if it is up and has subscribers. Best-effort:
+/// `send` errors only when there are zero receivers, which we ignore.
+fn emit(st: &State, topic: &'static str, mesh: Option<MeshId>, data: serde_json::Value) {
+    if let Some(bus) = &st.bus {
+        let _ = bus.send(MeshEvent {
+            topic,
+            mesh,
+            ts_ms: now_ms(),
+            data,
+        });
+    }
 }
 
 /// Work the IPC handler defers to the async caller (it can't `.await` or spawn
@@ -420,6 +510,7 @@ fn load_backup(path: &std::path::Path) -> Vec<PersistedMesh> {
 /// self-destruct / RemoveMesh erases the on-disk copy too).
 fn persist(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
+    persist_extensions(st);
     for ms in st.meshes.values() {
         let p = to_persisted(ms);
         if let Ok(json) = serde_json::to_vec_pretty(&p) {
@@ -450,6 +541,38 @@ fn persist(st: &State) {
             }
         }
     }
+}
+
+/// Path of the extension-grant store (docs/EXTENSIONS.md §3) within the persist dir.
+fn extensions_file(dir: &std::path::Path) -> PathBuf {
+    dir.join("extensions.json")
+}
+
+/// Persist the extension grants to `extensions.json` (0600). Called from [`persist`].
+fn persist_extensions(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    let grants: Vec<&ExtensionGrant> = st.extensions.values().collect();
+    if let Ok(json) = serde_json::to_vec_pretty(&grants) {
+        let f = extensions_file(dir);
+        if std::fs::write(&f, &json).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// Load the extension grants at startup (id → grant). Missing/corrupt file ⇒ empty.
+fn load_extensions(dir: &std::path::Path) -> HashMap<String, ExtensionGrant> {
+    let f = extensions_file(dir);
+    let Ok(bytes) = std::fs::read(&f) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<Vec<ExtensionGrant>>(&bytes)
+        .map(|v| v.into_iter().map(|g| (g.id.clone(), g)).collect())
+        .unwrap_or_default()
 }
 
 /// Load persisted meshes from disk (startup).
@@ -542,6 +665,8 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         traffic,
         flows: restored_flows,
         flow_version: p.flow_version,
+        services: Vec::new(),
+        service_seq: 0,
     };
     (ms, bringup)
 }
@@ -560,6 +685,8 @@ fn request_mutates(req: &Request) -> bool {
             | Request::Recipher { .. }
             | Request::AllClear { .. }
             | Request::ExpelMember { .. }
+            | Request::EnableExtension { .. }
+            | Request::DisableExtension { .. }
     )
 }
 
@@ -591,6 +718,16 @@ async fn main() -> anyhow::Result<()> {
         let mut st = state.lock().unwrap();
         st.data_plane = data_plane;
         st.persist_dir.clone_from(&pdir);
+        // Extension event bus + persisted grants (docs/EXTENSIONS.md). The bus lives for
+        // the daemon's lifetime; connector connections subscribe on demand.
+        let (bus, _) = tokio::sync::broadcast::channel::<MeshEvent>(EVENT_BUS_CAP);
+        st.bus = Some(bus);
+        if let Some(dir) = &pdir {
+            st.extensions = load_extensions(dir);
+            if !st.extensions.is_empty() {
+                elog!("meshd: loaded {} extension grant(s)", st.extensions.len());
+            }
+        }
     }
     elog!(
         "meshd: data-plane mode {}",
@@ -899,56 +1036,321 @@ async fn pipe_worker(
     }
 }
 
+/// Per-connection extension session (docs/EXTENSIONS.md §3). Plain GUI/CLI clients leave
+/// this empty; a connector's `Hello` fills it and `Subscribe` attaches a forwarder.
+#[derive(Default)]
+struct ConnSession {
+    /// Set once a valid `Hello` authenticated this connection as an extension. All
+    /// authorization (scopes, per-mesh allow-list, `enabled`) is re-read from the LIVE grant
+    /// (`State::extensions`) on every gated request/event — never snapshotted here — so
+    /// `DisableExtension` / scope- or mesh-narrowing takes effect on an already-connected
+    /// connector (docs/EXTENSIONS.md §3).
+    ext_id: Option<String>,
+    /// Abort handle for the event-forwarder task spawned by `Subscribe` (one per
+    /// connection; a re-subscribe replaces it; connection close aborts it).
+    sub_abort: Option<tokio::task::AbortHandle>,
+}
+
+/// Random 16-byte hex grant token (docs/EXTENSIONS.md §3). Local secret, not a network
+/// credential — it only identifies which extension a local connection claims to be.
+fn gen_token() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The scope a bus `topic` requires (docs/EXTENSIONS.md §4/§5). `None` = unknown topic.
+fn scope_for_topic(topic: &str) -> Option<&'static str> {
+    match topic {
+        "peer" => Some("events:peer"),
+        "exit" => Some("events:exit"),
+        "health" => Some("events:health"),
+        "service" => Some("registry:read"),
+        _ => None,
+    }
+}
+
+/// Authenticate a connector connection from its `Hello` (docs/EXTENSIONS.md §3): match the
+/// token against the enabled grant for `id`, and on success bind the session to that grant
+/// id. Scopes/meshes are NOT snapshotted — they're re-read from the live grant on every
+/// gated request/event so a later disable/narrow takes effect. `version` is informational.
+fn ext_hello(
+    state: &Arc<Mutex<State>>,
+    sess: &mut ConnSession,
+    id: String,
+    _version: String,
+    token: String,
+) -> Response {
+    let st = state.lock().unwrap();
+    match st.extensions.get(&id) {
+        Some(g) if !g.enabled => err("extension is disabled"),
+        Some(g) if g.token == token => {
+            let scopes = g.scopes.clone();
+            sess.ext_id = Some(id);
+            Response::HelloOk { scopes }
+        }
+        Some(_) => err("invalid extension token"),
+        None => err("unknown extension — enable it first"),
+    }
+}
+
+/// Attach an event-forwarder to a `Subscribe`'d connection (docs/EXTENSIONS.md §5). Each
+/// requested topic must map to a granted scope; on success a task drains the bus and pushes
+/// scope-matching events (with a per-connection `seq`) onto the connection's outbound
+/// channel. A lag drops events and emits a `_lagged` marker so the connector re-queries.
+fn ext_subscribe(
+    state: &Arc<Mutex<State>>,
+    sess: &mut ConnSession,
+    out_tx: &tokio::sync::mpsc::Sender<String>,
+    topics: Vec<String>,
+) -> Response {
+    let Some(ext_id) = sess.ext_id.clone() else {
+        return err("not authenticated — send Hello first");
+    };
+    // Validate the requested topics against the LIVE grant (so a just-narrowed grant is
+    // honored at subscribe time too); the forwarder re-checks every event against it.
+    let mut wanted: HashSet<String> = HashSet::new();
+    {
+        let st = state.lock().unwrap();
+        let Some(g) = st.extensions.get(&ext_id).filter(|g| g.enabled) else {
+            return err("extension is disabled");
+        };
+        for t in &topics {
+            match scope_for_topic(t) {
+                Some(scope) if g.scopes.iter().any(|s| s == scope) => {
+                    wanted.insert(t.clone());
+                }
+                Some(scope) => return err(&format!("scope {scope} not granted for topic {t}")),
+                None => return err(&format!("unknown topic {t}")),
+            }
+        }
+    }
+    let rx = match state.lock().unwrap().bus.as_ref() {
+        Some(b) => b.subscribe(),
+        None => return err("event bus unavailable"),
+    };
+    // One subscription per connection — a re-subscribe replaces the prior forwarder.
+    if let Some(h) = sess.sub_abort.take() {
+        h.abort();
+    }
+    let tx = out_tx.clone();
+    let state = Arc::clone(state);
+    let fwd = tokio::spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
+        use tokio::sync::mpsc::error::TrySendError;
+        let mut rx = rx;
+        let mut seq: u64 = 0;
+        loop {
+            let env = match rx.recv().await {
+                Ok(ev) => {
+                    if !wanted.contains(ev.topic) {
+                        continue;
+                    }
+                    // Re-validate against the LIVE grant so DisableExtension / scope- or
+                    // mesh-narrowing takes effect on this already-attached stream: a removed
+                    // or disabled grant tears the stream down; a now-ungranted topic or an
+                    // out-of-scope mesh just drops the event.
+                    let decision = {
+                        let st = state.lock().unwrap();
+                        match st.extensions.get(&ext_id).filter(|g| g.enabled) {
+                            None => None, // disabled / removed → stop forwarding
+                            Some(g) => {
+                                let scope_ok = scope_for_topic(ev.topic)
+                                    .is_some_and(|sc| g.scopes.iter().any(|s| s == sc));
+                                let mesh_ok = ev.mesh.map_or(true, |m| g.allows_mesh(m));
+                                Some(scope_ok && mesh_ok)
+                            }
+                        }
+                    };
+                    match decision {
+                        None => break,
+                        Some(false) => continue,
+                        Some(true) => {}
+                    }
+                    seq += 1;
+                    Response::Event {
+                        topic: ev.topic.to_string(),
+                        seq,
+                        ts_ms: ev.ts_ms,
+                        data: ev.data,
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    seq += 1;
+                    Response::Event {
+                        topic: "_lagged".to_string(),
+                        seq,
+                        ts_ms: now_ms(),
+                        data: serde_json::json!({ "dropped": true }),
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            };
+            let line = match serde_json::to_string(&env) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            // Bounded outbound queue: a connector that stops draining its socket must not
+            // grow the daemon's memory without limit. Drop the event when the queue is full
+            // — the jump in `seq` is the documented signal to the connector to re-query.
+            match tx.try_send(line) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => break,
+            }
+        }
+    });
+    sess.sub_abort = Some(fwd.abort_handle());
+    Response::Ok
+}
+
+/// Deny connector-only requests that lack the required scope/auth/mesh (docs/EXTENSIONS.md
+/// §3/§4). `None` = allowed. Management calls (Enable/Disable/List) stay open to trusted
+/// local clients. `ListServices` is open to the management GUI (no `Hello`) but, for a
+/// connector, is gated by `registry:read` + the per-mesh allow-list — so a connector can't
+/// read services from a mesh it wasn't enabled for.
+fn scope_gate(req: &Request, sess: &ConnSession, st: &State) -> Option<Response> {
+    // Re-validate connector requests against the LIVE grant (not a Hello-time snapshot) so
+    // DisableExtension / scope- or mesh-narrowing takes effect on an already-connected
+    // connector (docs/EXTENSIONS.md §3). `None` once a connector is authenticated means its
+    // grant was disabled or removed out from under it.
+    let live = sess
+        .ext_id
+        .as_ref()
+        .and_then(|id| st.extensions.get(id))
+        .filter(|g| g.enabled);
+    match req {
+        Request::Advertise { mesh, .. } | Request::Unadvertise { mesh, .. } => {
+            if sess.ext_id.is_none() {
+                Some(err("not authenticated — send Hello first"))
+            } else {
+                match live {
+                    None => Some(err("extension is disabled")),
+                    Some(g) if !g.scopes.iter().any(|s| s == "registry:advertise") => {
+                        Some(err("scope registry:advertise not granted"))
+                    }
+                    Some(g) if !g.allows_mesh(*mesh) => {
+                        Some(err("extension not enabled for this mesh"))
+                    }
+                    Some(_) => None,
+                }
+            }
+        }
+        // A connector (authenticated) is mesh-gated; the management GUI (no Hello) is not.
+        Request::ListServices { mesh, .. } if sess.ext_id.is_some() => match live {
+            None => Some(err("extension is disabled")),
+            Some(g) if !g.scopes.iter().any(|s| s == "registry:read") => {
+                Some(err("scope registry:read not granted"))
+            }
+            Some(g) if !g.allows_mesh(*mesh) => Some(err("extension not enabled for this mesh")),
+            Some(_) => None,
+        },
+        _ => None,
+    }
+}
+
 /// One IPC connection: newline-JSON [`Request`] in, [`Response`] out, until close.
+///
+/// A plain client (GUI/CLI) gets strict request→response. A connector that sends
+/// [`Request::Subscribe`] turns the connection into a stream: the daemon keeps answering
+/// its commands AND pushes [`Response::Event`] lines as mesh events occur. To let those
+/// interleave safely, every outbound line goes through one writer task fed by an mpsc, so
+/// the request loop and the event forwarder never half-write over each other.
 async fn serve_conn<S>(stream: S, state: Arc<Mutex<State>>)
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = BufReader::new(rd).lines();
+    // Bounded so a connector that stops draining its socket backpressures (responses) or is
+    // dropped (events) instead of growing the daemon's memory without limit.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(OUT_CHAN_CAP);
+    let writer = tokio::spawn(async move {
+        while let Some(mut line) = out_rx.recv().await {
+            line.push('\n');
+            if wr.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut sess = ConnSession::default();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
         let mut shutdown = false;
         let resp = match serde_json::from_str::<Request>(&line) {
+            // Session/streaming requests need the per-connection session + outbound channel,
+            // so they're handled here rather than in the stateless `handle`.
+            Ok(Request::Hello { id, version, token }) => {
+                ext_hello(&state, &mut sess, id, version, token)
+            }
+            Ok(Request::Subscribe { topics }) => ext_subscribe(&state, &mut sess, &out_tx, topics),
             Ok(req) => {
-                // Handle under the lock; do any async data-plane bringup AFTER
-                // releasing it (TUN/UDP open is async and must not block IPC).
-                let mutates = request_mutates(&req);
-                let (resp, action) = {
-                    let mut st = state.lock().unwrap();
-                    handle(req, &mut st)
+                let denied = {
+                    let st = state.lock().unwrap();
+                    scope_gate(&req, &sess, &st)
                 };
-                match action {
-                    Some(PostAction::Bringup(b)) => bringup_dataplane(b, Arc::clone(&state)).await,
-                    Some(PostAction::ArmKillSwitch(mesh)) => {
-                        arm_kill_switch(mesh, Arc::clone(&state))
+                if let Some(denied) = denied {
+                    denied
+                } else {
+                    // Handle under the lock; do any async data-plane bringup AFTER
+                    // releasing it (TUN/UDP open is async and must not block IPC).
+                    let mutates = request_mutates(&req);
+                    let (resp, action) = {
+                        let mut st = state.lock().unwrap();
+                        handle(req, &mut st)
+                    };
+                    match action {
+                        Some(PostAction::Bringup(b)) => {
+                            bringup_dataplane(b, Arc::clone(&state)).await
+                        }
+                        Some(PostAction::ArmKillSwitch(mesh)) => {
+                            arm_kill_switch(mesh, Arc::clone(&state))
+                        }
+                        Some(PostAction::Shutdown) => shutdown = true,
+                        None => {}
                     }
-                    Some(PostAction::Shutdown) => shutdown = true,
-                    None => {}
+                    if mutates {
+                        persist(&state.lock().unwrap()); // P-S1: save after a state change
+                    }
+                    resp
                 }
-                if mutates {
-                    persist(&state.lock().unwrap()); // P-S1: save after a state change
-                }
-                resp
             }
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
         };
-        let mut out = serde_json::to_string(&resp)
+        let out = serde_json::to_string(&resp)
             .unwrap_or_else(|_| "{\"Error\":{\"message\":\"encode failed\"}}".to_string());
-        out.push('\n');
-        let wrote = wr.write_all(out.as_bytes()).await.is_ok();
-        // Acknowledge the request first, THEN tear the daemon down cleanly.
+        // Responses use the blocking (await) send: if the client stops reading, this
+        // backpressures the request loop rather than queueing unboundedly.
+        let sent = out_tx.send(out).await.is_ok();
+        // Acknowledge the request first, THEN tear the daemon down cleanly. The ack is
+        // queued to the writer task, so on shutdown we FLUSH it (drop our sender + await
+        // the writer) before stopping the daemon — preserving the original write-then-
+        // shutdown ordering so the client always receives its Shutdown ack.
         if shutdown {
+            if let Some(h) = sess.sub_abort.take() {
+                h.abort();
+            }
+            drop(out_tx);
+            let _ = writer.await;
             shutdown_daemon(&state).await;
+            return;
         }
-        if !wrote {
+        if !sent {
             break;
         }
     }
+    // Connection closed: stop the event forwarder + the writer so neither task leaks.
+    if let Some(h) = sess.sub_abort.take() {
+        h.abort();
+    }
+    drop(out_tx);
+    let _ = writer.await;
 }
 
 /// Cleanly stop the daemon (the `Shutdown` request): if a full tunnel is up, restore the
@@ -1141,6 +1543,11 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                 continue;
             };
             let mut persist_after = false;
+            // Deferred event emits: `ms` (a &mut into `state`) is alive across the match,
+            // so we can't borrow `state` for `emit` until after it. NLL frees `ms` once the
+            // match ends, so we flag here and emit below.
+            let mut emit_peer = false;
+            let mut emit_service = false;
             match ev {
                 LoopEvent::Recipher(r) => {
                     ms.secret = r.secret;
@@ -1190,6 +1597,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                                     "meshd: mesh {mid} roster grew {before} -> {after} via gossip"
                                 );
                                 persist_after = true;
+                                emit_peer = true;
                             }
                         }
                     }
@@ -1222,6 +1630,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                             let after = ms.roster().len();
                             if changed {
                                 persist_after = true;
+                                emit_peer = true;
                                 if after < before {
                                     elog!("meshd: mesh {mid} roster shrank {before} -> {after} via revocation gossip");
                                 }
@@ -1257,9 +1666,41 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                         }
                     }
                 }
+                // A peer gossiped its advertised services — merge them (soft state,
+                // newest-per-(member, proto) wins) so the registry converges mesh-wide. Not
+                // persisted; a `service` event tells subscribed connectors to re-query.
+                LoopEvent::Registry(bytes) => {
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = serde_json::from_slice::<Vec<ServiceRecord>>(&bytes) {
+                            let me = ms.my_id();
+                            // Don't let a peer's batch overwrite our OWN records.
+                            let incoming = incoming.into_iter().filter(|r| r.member != me);
+                            if registry::merge(&mut ms.services, incoming, now_ms(), MAX_SERVICES) {
+                                emit_service = true;
+                            }
+                        }
+                    }
+                }
             }
             if persist_after {
                 persist(&state);
+            }
+            // `ms` is dead after the match (NLL), so `state` can be shared-borrowed now.
+            if emit_peer {
+                emit(
+                    &state,
+                    "peer",
+                    Some(mid),
+                    serde_json::json!({ "kind": "roster_changed", "mesh": mid }),
+                );
+            }
+            if emit_service {
+                emit(
+                    &state,
+                    "service",
+                    Some(mid),
+                    serde_json::json!({ "kind": "changed", "mesh": mid }),
+                );
             }
         }
     });
@@ -1277,7 +1718,14 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(ROSTER_GOSSIP_TICK_SECS)).await;
             let sends: Vec<(u8, Vec<u8>, Vec<MemberId>, UnboundedSender<LoopCmd>)> = {
-                let st = state.lock().unwrap();
+                let mut st = state.lock().unwrap();
+                // Drop peer service records that stopped refreshing (crash / unadvertise)
+                // before building this round's gossip (docs/EXTENSIONS.md §6).
+                let now = now_ms();
+                for ms in st.meshes.values_mut() {
+                    let me = ms.my_id();
+                    registry::expire(&mut ms.services, me, now);
+                }
                 st.meshes
                     .values()
                     .flat_map(|ms| {
@@ -1309,7 +1757,22 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
                             if let Ok(enc) = bincode::serialize(&ms.flows) {
                                 let mut body = ms.flow_version.to_be_bytes().to_vec();
                                 body.extend_from_slice(&enc);
-                                out.push((CTRL_FLOWS, body, peers, tx));
+                                out.push((CTRL_FLOWS, body, peers.clone(), tx.clone()));
+                            }
+                        }
+                        // Service registry — gossip only OUR OWN advertised services (never
+                        // re-broadcast peers', or a crashed node's record would never die).
+                        // Each node advertises its own; peers expire what stops arriving.
+                        let me = ms.my_id();
+                        let own: Vec<ServiceRecord> = ms
+                            .services
+                            .iter()
+                            .filter(|e| e.rec.member == me)
+                            .map(|e| e.rec.clone())
+                            .collect();
+                        if !own.is_empty() {
+                            if let Ok(body) = serde_json::to_vec(&own) {
+                                out.push((CTRL_REGISTRY, body, peers, tx));
                             }
                         }
                         out
@@ -2055,6 +2518,12 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     exit::restore_routes();
                     exit::restore_dns();
                 }
+                emit(
+                    st,
+                    "peer",
+                    Some(mesh),
+                    serde_json::json!({ "kind": "mesh_removed", "mesh": mesh }),
+                );
                 (Response::Ok, None)
             } else {
                 (no_mesh(mesh), None)
@@ -2145,6 +2614,34 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             ),
             None,
         ),
+
+        // --- extensions / connectors (docs/EXTENSIONS.md) --------------------------
+        Request::EnableExtension {
+            id,
+            scopes,
+            all_meshes,
+            meshes,
+        } => (enable_extension(st, id, scopes, all_meshes, meshes), None),
+        Request::DisableExtension { id } => match st.extensions.get_mut(&id) {
+            Some(g) => {
+                g.enabled = false;
+                (Response::Ok, None)
+            }
+            None => (err("unknown extension"), None),
+        },
+        Request::ListExtensions => (
+            Response::Extensions(st.extensions.values().map(|g| g.view()).collect()),
+            None,
+        ),
+        Request::Advertise {
+            mesh,
+            proto,
+            port,
+            name,
+            meta,
+        } => (advertise(st, mesh, proto, port, name, meta), None),
+        Request::Unadvertise { mesh, proto } => (unadvertise(st, mesh, proto), None),
+        Request::ListServices { mesh, proto } => (list_services(st, mesh, proto), None),
 
         Request::CreateInvite {
             mesh,
@@ -2312,6 +2809,13 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 Err(e) => (err(&format!("bad invite contents: {e}")), None),
             }
         }
+
+        // Per-connection session requests are intercepted in `serve_conn` (they need the
+        // connection's session + outbound channel); they never reach the stateless handler.
+        Request::Hello { .. } | Request::Subscribe { .. } => (
+            err("session request must be sent on a connector connection"),
+            None,
+        ),
     }
 }
 
@@ -2426,7 +2930,15 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             traffic,
             flows: lattice_proto::flow::default_table(),
             flow_version: 0,
+            services: Vec::new(),
+            service_seq: 0,
         },
+    );
+    emit(
+        st,
+        "peer",
+        Some(invite.mesh_id),
+        serde_json::json!({ "kind": "mesh_added", "mesh": invite.mesh_id }),
     );
     (
         Response::MeshCreated {
@@ -2580,7 +3092,15 @@ fn create_mesh(
             traffic,
             flows: lattice_proto::flow::default_table(),
             flow_version: 0,
+            services: Vec::new(),
+            service_seq: 0,
         },
+    );
+    emit(
+        st,
+        "peer",
+        Some(id),
+        serde_json::json!({ "kind": "mesh_added", "mesh": id }),
     );
     (
         Response::MeshCreated { mesh: id },
@@ -2945,6 +3465,167 @@ fn err(message: &str) -> Response {
     Response::Error {
         message: message.to_string(),
     }
+}
+
+// ---- extensions / connectors (docs/EXTENSIONS.md) ----------------------------------
+
+/// Enable an extension and (re)grant it `scopes` + the meshes it may touch (`all_meshes`
+/// or the `meshes` allow-list). A first enable mints a token; re-enabling keeps the existing
+/// token so a running connector's `Hello` keeps working, and just updates the scope/mesh set
+/// + flips `enabled` on. Returns the grant view (carries the token).
+fn enable_extension(
+    st: &mut State,
+    id: String,
+    scopes: Vec<String>,
+    all_meshes: bool,
+    mut meshes: Vec<MeshId>,
+) -> Response {
+    // Keep only meshes that actually exist on this node (drop stale/typo ids).
+    meshes.retain(|m| st.meshes.contains_key(m));
+    meshes.sort_unstable();
+    meshes.dedup();
+    let grant = st
+        .extensions
+        .entry(id.clone())
+        .or_insert_with(|| ExtensionGrant {
+            id,
+            token: gen_token(),
+            scopes: Vec::new(),
+            enabled: false,
+            all_meshes: false,
+            meshes: Vec::new(),
+        });
+    grant.scopes = scopes;
+    grant.all_meshes = all_meshes;
+    grant.meshes = meshes;
+    grant.enabled = true;
+    Response::Extension(grant.view())
+}
+
+/// Advertise that THIS node offers `proto` on its overlay IP at `port` (docs/EXTENSIONS.md
+/// §6). Supersedes our prior record for the same proto (bumped `seq`); the next gossip tick
+/// carries it mesh-wide. Emits a `service` event so subscribed connectors re-query.
+fn advertise(
+    st: &mut State,
+    mesh: MeshId,
+    proto: String,
+    port: u16,
+    name: String,
+    meta: serde_json::Value,
+) -> Response {
+    let now = now_ms();
+    {
+        let Some(ms) = st.meshes.get_mut(&mesh) else {
+            return no_mesh(mesh);
+        };
+        let member = ms.my_id();
+        ms.service_seq += 1;
+        let rec = ServiceRecord {
+            member,
+            proto: proto.clone(),
+            port,
+            name,
+            meta,
+            seq: ms.service_seq,
+        };
+        match ms
+            .services
+            .iter_mut()
+            .find(|e| e.rec.member == member && e.rec.proto == proto)
+        {
+            Some(e) => {
+                e.rec = rec;
+                e.last_refresh_ms = now;
+            }
+            None => {
+                if ms.services.len() >= MAX_SERVICES {
+                    return err("service registry full");
+                }
+                ms.services.push(ServiceEntry {
+                    rec,
+                    last_refresh_ms: now,
+                });
+            }
+        }
+    }
+    emit(
+        st,
+        "service",
+        Some(mesh),
+        serde_json::json!({ "kind": "advertised", "mesh": mesh, "proto": proto }),
+    );
+    Response::Ok
+}
+
+/// Withdraw a service this node advertised (docs/EXTENSIONS.md §6). Removed locally and no
+/// longer gossiped; peers expire it after [`registry::SERVICE_TTL_MS`].
+fn unadvertise(st: &mut State, mesh: MeshId, proto: String) -> Response {
+    {
+        let Some(ms) = st.meshes.get_mut(&mesh) else {
+            return no_mesh(mesh);
+        };
+        let member = ms.my_id();
+        let before = ms.services.len();
+        ms.services
+            .retain(|e| !(e.rec.member == member && e.rec.proto == proto));
+        if ms.services.len() == before {
+            return err("no such advertised service");
+        }
+    }
+    emit(
+        st,
+        "service",
+        Some(mesh),
+        serde_json::json!({ "kind": "withdrawn", "mesh": mesh, "proto": proto }),
+    );
+    Response::Ok
+}
+
+/// Discover services advertised in `mesh` (optionally one `proto`), each resolved to the
+/// owner's overlay IP + online state (docs/EXTENSIONS.md §6). Expired peer entries are
+/// hidden; our own entries never expire.
+fn list_services(st: &State, mesh: MeshId, proto: Option<String>) -> Response {
+    let Some(ms) = st.meshes.get(&mesh) else {
+        return no_mesh(mesh);
+    };
+    let now = now_ms();
+    let me = ms.my_id();
+    let p = ms.mesh.charter.overlay_prefix;
+    let roster = ms.roster();
+    let links = ms.links.lock().unwrap();
+    let mut out = Vec::new();
+    for e in &ms.services {
+        if let Some(f) = &proto {
+            if &e.rec.proto != f {
+                continue;
+            }
+        }
+        if e.rec.member != me && now.saturating_sub(e.last_refresh_ms) >= registry::SERVICE_TTL_MS {
+            continue;
+        }
+        let member_name = roster
+            .iter()
+            .find(|c| c.id == e.rec.member)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let online = e.rec.member == me
+            || links
+                .get(&e.rec.member)
+                .map(|l| l.last_seen_ms != 0 && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS)
+                .unwrap_or(false);
+        out.push(ServiceView {
+            mesh,
+            member: e.rec.member,
+            member_name,
+            overlay_ip: format!("{}.{}.{}.{}", p[0], p[1], ms.mesh.id, e.rec.member),
+            proto: e.rec.proto.clone(),
+            port: e.rec.port,
+            name: e.rec.name.clone(),
+            meta: e.rec.meta.clone(),
+            online,
+        });
+    }
+    Response::Services(out)
 }
 
 fn fp(pk: &PubKey) -> String {

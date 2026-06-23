@@ -28,6 +28,7 @@ pub mod ipc;
 pub mod keydist;
 pub mod membership;
 pub mod policy;
+pub mod registry;
 pub mod roster;
 
 pub use charter::{CharterError, GenesisCharter, InviteTopology, RecipherTrigger};

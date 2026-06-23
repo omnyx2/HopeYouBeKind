@@ -347,6 +347,201 @@ async function renderTraffic(scope) {
   el(`${scope}-traffic-toggle`).onclick = () => { TRAFFIC_DETAIL[scope] = !TRAFFIC_DETAIL[scope]; renderTraffic(scope); };
 }
 
+// ---- Extensions / connectors (docs/EXTENSIONS.md) ----
+// What each grantable scope means + its risk, so the enable UI is honest about exposure.
+const SCOPE_INFO = {
+  "events:peer":        { label: "Mesh & member changes",            risk: "low" },
+  "events:exit":        { label: "Exit / full-tunnel status",        risk: "low" },
+  "events:health":      { label: "Health & attack warnings",         risk: "low" },
+  "registry:read":      { label: "Discover advertised services",     risk: "low" },
+  "registry:advertise": { label: "Advertise a service on this node", risk: "low" },
+  "command:exit":       { label: "Change egress/exit programmatically", risk: "high" },
+  "command:flows":      { label: "Edit routing (flow) rules",        risk: "high" },
+  "data:packet-meta":   { label: "Per-flow metadata (no payload)",   risk: "med" },
+  "data:packet-raw":    { label: "Raw packet payloads",              risk: "high" },
+};
+// Bundled connectors the GUI knows how to enable. meshd has no catalog of its own — a
+// connector only exists once enabled — so the requested scopes live here.
+const CONNECTOR_CATALOG = [
+  { id: "minisync", name: "MiniSync — folder sync",
+    desc: "Keep a folder in sync across mesh members, peer-to-peer over the overlay.",
+    scopes: ["events:peer", "registry:read", "registry:advertise"] },
+];
+const riskTag = (r) => r === "high"
+  ? '<span class="pill warn" style="font-size:10px">high risk</span>'
+  : r === "med" ? '<span class="pill warn" style="font-size:10px">caution</span>' : "";
+const scopeChip = (s) => {
+  const info = SCOPE_INFO[s] || { risk: "low" };
+  const cls = info.risk === "low" ? "off" : "warn";
+  return `<span class="pill ${cls}" title="${esc(info.label || s)}">${esc(s)}</span>`;
+};
+const metaShort = (meta) => {
+  if (!meta || typeof meta !== "object") return "";
+  try { return Object.entries(meta).map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(", "); }
+  catch { return ""; }
+};
+
+function meshScopeChips(g, meshById) {
+  if (g.all_meshes) return '<span class="pill on" title="every mesh, incl. future">all meshes</span>';
+  if (!g.meshes || !g.meshes.length) return '<span class="pill warn" title="no mesh selected — connector can reach none">no meshes</span>';
+  return g.meshes.map((id) => `<span class="pill off">${esc(meshById[id] || "#" + id)}</span>`).join(" ");
+}
+
+function extGrantRow(g, meshById) {
+  const chips = g.scopes.map(scopeChip).join(" ") || '<span class="muted small">no scopes</span>';
+  const tok = esc((g.token || "").slice(0, 8)) + "…";
+  const toggle = g.enabled
+    ? `<button class="small-btn" data-act="disable" data-id="${esc(g.id)}">Disable</button>`
+    : `<button class="small-btn" data-act="enable" data-id="${esc(g.id)}" data-scopes='${esc(JSON.stringify(g.scopes))}' data-allmeshes='${g.all_meshes ? 1 : 0}' data-meshes='${esc(JSON.stringify(g.meshes || []))}'>Enable</button>`;
+  return `<div class="ext-row" style="padding:10px 0;border-top:1px solid var(--line)">
+    <div style="display:flex;align-items:center;gap:8px">
+      <b>${esc(g.id)}</b>
+      <span class="pill ${g.enabled ? "on" : "off"}">${g.enabled ? "enabled" : "disabled"}</span>
+      <span style="margin-left:auto">${toggle}</span>
+    </div>
+    <div style="margin-top:6px">${chips}</div>
+    <div class="kv" style="margin-top:6px"><span>meshes</span><span>${meshScopeChips(g, meshById)}</span></div>
+    <div class="kv" style="margin-top:4px"><span>token</span>
+      <span><code>${tok}</code>
+        <button class="small-btn" data-act="copytoken" data-token="${esc(g.token || "")}">copy</button></span></div>
+  </div>`;
+}
+
+function extCatalogCard(c, meshes) {
+  const checks = c.scopes.map((s) => {
+    const info = SCOPE_INFO[s] || { label: s, risk: "low" };
+    return `<label class="toggle-row" style="margin:2px 0">
+      <input type="checkbox" data-scope="${esc(s)}" checked />
+      <span><code>${esc(s)}</code> — ${esc(info.label)} ${riskTag(info.risk)}</span></label>`;
+  }).join("");
+  // Per-mesh allow-list — the connector can ONLY touch the meshes ticked here. Default to
+  // nothing ticked so enabling never silently exposes every mesh; pre-tick when there's
+  // exactly one mesh (the unambiguous case).
+  const one = meshes.length === 1;
+  const meshChecks = meshes.length
+    ? meshes.map((m) => `<label class="toggle-row" style="margin:2px 0">
+        <input type="checkbox" data-mesh="${m.id}" ${one ? "checked" : ""} />
+        <span>${esc(m.name)} <span class="muted small">#${m.id}</span></span></label>`).join("")
+    : `<div class="muted small">No meshes yet — tick “All meshes”, or create/join one first.</div>`;
+  return `<div class="ext-cat" data-conn="${esc(c.id)}" style="padding:10px 0;border-top:1px solid var(--line)">
+    <div><b>${esc(c.name)}</b> <span class="muted small">(${esc(c.id)})</span></div>
+    <p class="muted small" style="margin:4px 0">${esc(c.desc)}</p>
+    <div class="muted small" style="margin-top:6px">What it may see:</div>
+    <div>${checks}</div>
+    <div class="muted small" style="margin-top:6px">Which meshes it may use:</div>
+    <label class="toggle-row" style="margin:2px 0">
+      <input type="checkbox" data-allmeshes />
+      <span><b>All meshes</b> <span class="muted small">(incl. any joined later)</span></span></label>
+    <div data-meshpicks>${meshChecks}</div>
+    <div class="add-row" style="margin-top:6px">
+      <button class="small-btn" data-act="enableconn" data-id="${esc(c.id)}">Enable</button>
+    </div>
+  </div>`;
+}
+
+async function onExtAction(e) {
+  const b = e.currentTarget;
+  try {
+    switch (b.dataset.act) {
+      case "copytoken":
+        await navigator.clipboard.writeText(b.dataset.token || "");
+        return toast("token copied — paste it into the connector");
+      case "disable":
+        await meshd({ DisableExtension: { id: b.dataset.id } });
+        toast("disabled");
+        return renderExtensions();
+      case "enable":
+        await meshd({ EnableExtension: {
+          id: b.dataset.id,
+          scopes: JSON.parse(b.dataset.scopes || "[]"),
+          all_meshes: b.dataset.allmeshes === "1",
+          meshes: JSON.parse(b.dataset.meshes || "[]"),
+        } });
+        toast("re-enabled");
+        return renderExtensions();
+      case "enableconn": {
+        const card = b.closest(".ext-cat");
+        const scopes = [...card.querySelectorAll("input[data-scope]:checked")].map((c) => c.dataset.scope);
+        if (!scopes.length) return toast("pick at least one scope");
+        const all_meshes = !!card.querySelector("input[data-allmeshes]:checked");
+        const meshes = all_meshes ? [] : [...card.querySelectorAll("input[data-mesh]:checked")].map((c) => parseInt(c.dataset.mesh, 10));
+        if (!all_meshes && !meshes.length) return toast("pick at least one mesh (or “All meshes”)");
+        await meshd({ EnableExtension: { id: b.dataset.id, scopes, all_meshes, meshes } });
+        toast("enabled — copy the token from the list above");
+        return renderExtensions();
+      }
+    }
+  } catch (err) { toast(String(err)); }
+}
+
+async function renderExtensions() {
+  const body = el("ext-body");
+  let grants = [];
+  try { grants = (await meshd("ListExtensions")).Extensions || []; }
+  catch (e) { body.innerHTML = `<div class="card"><div class="empty">meshd unreachable — ${esc(String(e))}</div></div>`; return; }
+  let meshes = [];
+  try { meshes = (await meshd("ListMeshes")).Meshes || []; } catch { /* show with no names */ }
+  const meshById = Object.fromEntries(meshes.map((m) => [m.id, m.name]));
+  const byId = Object.fromEntries(grants.map((g) => [g.id, g]));
+  const grantsHtml = grants.length
+    ? grants.map((g) => extGrantRow(g, meshById)).join("")
+    : `<div class="muted small">No extensions enabled yet — enable one below.</div>`;
+  const avail = CONNECTOR_CATALOG.filter((c) => !byId[c.id]);
+  const availHtml = avail.length
+    ? avail.map((c) => extCatalogCard(c, meshes)).join("")
+    : `<div class="muted small">All bundled connectors are enabled.</div>`;
+  body.innerHTML = `
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">Enabled extensions</h2></div>
+      <div id="ext-grants">${grantsHtml}</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">Available connectors</h2></div>
+      <p class="muted small">Pick what a connector may see, then enable it. It gets a
+        <b>token</b> — give that to the connector so it can authenticate.</p>
+      <div id="ext-catalog">${availHtml}</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">Discovered services
+        <span class="muted small">(advertised on the mesh)</span></h2></div>
+      <div id="ext-services" class="muted small">loading…</div>
+    </div>`;
+  body.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", onExtAction));
+  renderExtServices();
+}
+
+// Aggregate advertised services across every mesh on this computer. Refreshed on the live
+// poll; only touches its own card, so the enable checkboxes above are never disturbed.
+async function renderExtServices() {
+  const box = el("ext-services");
+  if (!box) return;
+  let meshes = [];
+  try { meshes = (await meshd("ListMeshes")).Meshes || []; }
+  catch { box.innerHTML = `<span class="muted small">meshd unreachable</span>`; return; }
+  const rows = [];
+  for (const m of meshes) {
+    try {
+      const svcs = (await meshd({ ListServices: { mesh: m.id } })).Services || [];
+      for (const s of svcs) rows.push({ mesh: m, s });
+    } catch { /* skip a mesh that errored */ }
+  }
+  if (!rows.length) {
+    box.innerHTML = `<span class="muted small">No services advertised yet. A connector with
+      <code>registry:advertise</code> publishes them here.</span>`;
+    return;
+  }
+  box.innerHTML = `<table class="topo-table"><thead><tr>
+      <th>mesh</th><th>service</th><th>owner</th><th>overlay address</th><th>state</th><th>info</th>
+    </tr></thead><tbody>${rows.map(({ mesh, s }) => `<tr>
+      <td>${esc(mesh.name)}</td>
+      <td><b>${esc(s.proto)}</b>${s.name ? ` <span class="muted small">${esc(s.name)}</span>` : ""}</td>
+      <td>${esc(s.member_name || "#" + s.member)}</td>
+      <td><code>${esc(s.overlay_ip)}:${s.port}</code></td>
+      <td><i class="tdot ${s.online ? "live" : "peer"}"></i> ${s.online ? "online" : "offline"}</td>
+      <td class="small">${esc(metaShort(s.meta))}</td>
+    </tr>`).join("")}</tbody></table>`;
+}
+
 document.querySelectorAll(".nav-item").forEach((b) =>
   b.addEventListener("click", () => {
     const tab = b.dataset.tab;
@@ -354,6 +549,7 @@ document.querySelectorAll(".nav-item").forEach((b) =>
     if (tab === "create-mesh") { populateCiphers(); return activateTab("create-mesh"); }
     if (tab === "join-mesh") { return activateTab("join-mesh"); }
     if (tab === "traffic") { activateTab("traffic"); return renderTraffic("user"); }
+    if (tab === "extensions") { activateTab("extensions"); return renderExtensions(); }
     activateTab(tab);
     if (tab === "mesh-overview") return CURRENT_MESH != null ? renderOverview(CURRENT_MESH) : renderMeshPlain();
     if (CURRENT_MESH == null) return;
@@ -942,6 +1138,7 @@ function typingInPeers() {
 }
 setInterval(() => {
   if (ACTIVE_TAB === "traffic") return renderTraffic("user"); // this computer (user mode)
+  if (ACTIVE_TAB === "extensions") return renderExtServices(); // refresh only the services card
   if (MODE !== "mesh" || CURRENT_MESH == null) return;
   if (ACTIVE_TAB === "mesh-peers") { if (!typingInPeers()) renderPeersFor(CURRENT_MESH); }
   else if (ACTIVE_TAB === "mesh-topology") renderTopologyFor(CURRENT_MESH);

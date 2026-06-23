@@ -409,6 +409,10 @@ pub enum LoopEvent {
     /// A peer gossiped its SDN flow table (`CTRL_FLOWS`): `version(8 BE) ‖ bincode(flows)`.
     /// The supervisor adopts it if the version is newer, then applies it to the data plane.
     Flows(Vec<u8>),
+    /// A peer gossiped its advertised services (`CTRL_REGISTRY`): `json(Vec<ServiceRecord>)`.
+    /// The supervisor merges them (newest-per-(member, proto) wins, soft-state) so the
+    /// service registry converges across the mesh (docs/EXTENSIONS.md §6).
+    Registry(Vec<u8>),
 }
 
 /// meshd→loop command channel (re-cipher, attack signals).
@@ -429,6 +433,9 @@ pub const CTRL_REVOKE: u8 = 0x06;
 /// SDN flow-table gossip: `version(8 BE) ‖ bincode(Vec<FlowRule>)`. Newest version wins;
 /// the supervisor applies an adopted table to the data plane (docs/FLOW_TABLE.md).
 pub const CTRL_FLOWS: u8 = 0x07;
+/// Service-registry gossip: `json(Vec<ServiceRecord>)`. Soft state, newest-per-(member,
+/// proto) wins; the supervisor merges it for connector discovery (docs/EXTENSIONS.md §6).
+pub const CTRL_REGISTRY: u8 = 0x08;
 
 /// Encode a re-cipher announce: `[epoch(8 BE)][cipher_len(1)][cipher][secret(32)]`.
 fn encode_recipher(r: &Recipher) -> Vec<u8> {
@@ -647,6 +654,11 @@ pub async fn run<X: Transport + 'static>(
                         // sends it back down via LoopCmd::SetFlows to apply to the data plane.
                         Some(CTRL_FLOWS) => {
                             let _ = loop_event.send(LoopEvent::Flows(payload[1..].to_vec()));
+                        }
+                        // Service-registry gossip — hand the advertised services up to the
+                        // supervisor to merge (soft state, newest-per-(member, proto) wins).
+                        Some(CTRL_REGISTRY) => {
+                            let _ = loop_event.send(LoopEvent::Registry(payload[1..].to_vec()));
                         }
                         _ => {}
                     },
