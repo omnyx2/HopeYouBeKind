@@ -32,6 +32,26 @@ socket + `MESHD_STATE_DIR`, no `DATA_PLANE`) or on a test mesh. Swap the live da
 explicitly agreed, via `lattice off` → `lattice shutdown` → quit app → relaunch once → re-auth.
 Diagnose reachability with `curl`/TCP, not `ping` (ICMP is blocked on campus). See BUILD.md §5.
 
+## When something breaks — diff the last stable baseline FIRST
+
+Before hypothesizing a wedge, an OS quirk, infra, or a deep bug, **localize the change**: a
+feature that used to work and now doesn't almost always broke in code that changed since the
+last version it worked in. So step 1 of any regression is:
+
+```bash
+git diff <last-working-tag>..HEAD -- <the relevant area>     # e.g. v0.6.1..HEAD -- crates/meshd/src/exit.rs
+git log --oneline <last-working-tag>..HEAD -- <area>
+```
+
+The changed lines are the prime suspects — read them before anything else. This is exactly how
+the macOS full-tunnel regression (`cb6c868`) was found; a "utun wedge" was wrongly assumed for
+hours first. Order of suspicion: **(1) config/state** (`lattice ls/info` — is the exit a LIVE
+member? is the running build's `version … build <sha>` == HEAD? are all fleet nodes the same
+version?) → **(2) the stable↔current diff** of the area → **(3) only then** OS/kernel/infra.
+Don't trust a metric whose semantics you haven't verified (e.g. `netstat -I -b` column order,
+`ip route get` needing `iif`); cross-check against a ground-truth signal (the egress IP, not an
+interface counter).
+
 ## Before editing — check the regression map
 
 `docs/ERRORS.md` opens with a **blast-radius map** ("if you edit X, re-test Y, because…") plus a
