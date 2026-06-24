@@ -5,6 +5,10 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## Release v0.7.4 pushed + tagged (2026-06-24)
+
+- **Pushed `feat/extensions-meshd` (e069aa7..c00836b) + annotated tag `v0.7.4` at c00836b** → Release workflow triggered (run 28096210159, in_progress). NOTE: v0.7.3 release build had failed.
+
 ## Code documentation pass + process hardening (2026-06-24)
 
 - **meshd/src/main.rs: module edit-risk map + RISK tags on the dangerous fns + `///` on every

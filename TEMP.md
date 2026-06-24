@@ -16,8 +16,8 @@ regressions are easy to localize, and set up the working-memory workflow.
 1. **Open verification (separate thread)** — clean-reboot the Mac, launch the fixed bundle
    (≥19465bb / now 0.7.4) once, re-verify full-tunnel egress=Oracle + Ipkts>0 against the
    version-matched Oracle. Confirms the macOS fixes on a non-churned system.
-2. **Release decisions (pending user)** — (a) push session commits to `origin`; (b) tag `v0.7.4`
-   (triggers the release-installer build).
+2. **Watch the v0.7.4 release build** — run 28096210159 in_progress. ⚠ the v0.7.3 release run
+   FAILED, so this one may too; check `gh run view 28096210159` and fix release.yml if it fails.
 
 ### Docs pass status
 exit.rs ✅ · meshrun/lib.rs ✅ · meshd/main.rs ✅ — the data-plane/exit/IPC trio is documented
