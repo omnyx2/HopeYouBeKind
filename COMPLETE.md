@@ -7,7 +7,9 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ## Code documentation pass + process hardening (2026-06-24)
 
-- **CLAUDE.md: working-memory charter** (TEMP.md / COMPLETE.md / docs/ERRORS.md workflow). — this commit
+- **meshrun/src/lib.rs: module edit-risk + wire-compat invariant + RISK tags** (🔴6/🟡5/🟢2 on the
+  hot loop, wire encode/decode, CTRL_* tags, route/relay, parsers). — this commit
+- **CLAUDE.md: working-memory charter** (TEMP.md / COMPLETE.md / docs/ERRORS.md workflow). — `cab97cd`
 - **exit.rs: edit-risk ratings on every fn** (🔴 HIGH 14 / 🟡 MED 18 + legend). — `8851c46`
 - **exit.rs: module API contract + `///` on every public fn** (3 OS branches; 0% → full). — `9f69ace`
 - **CLAUDE.md: "diff the stable baseline first" diagnostic rule.** — `9f69ace`

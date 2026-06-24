@@ -7,6 +7,18 @@
 //! handles: the loop updates a peer's endpoint + last-seen as frames arrive, and a
 //! supervisor (the standalone binary, or `meshd`) reads them for live status and
 //! writes the exit live. This is the seam P6.3c/d builds the daemon + GUI on.
+//!
+//! ## Edit-risk (each fn's `///` carries a `RISK:` tag — same scheme as `exit.rs`)
+//! - 🔴 **HIGH** — the data-plane hot path or the ON-WIRE FORMAT. Blast radius = ALL overlay +
+//!   exit traffic, AND cross-version interop. **Wire-compat invariant: frame/payload layouts and
+//!   `CTRL_*` tag VALUES are append-only.** Changing the bytes of [`encode_gossip`]/[`encode_recipher`]/
+//!   the seal format, or renumbering a `CTRL_*`, breaks every node still on the old build (the
+//!   mesh runs MIXED versions — Oracle was 3 minor versions behind this session). Add new tags at
+//!   the end; never reorder/repurpose. Test a new↔old node pair before shipping.
+//! - 🟡 **MED** — routing/relay decisions and parsers ([`pick_route`]/[`pick_relay`]/
+//!   [`apply_gossip_table`]/[`parse_flow`]/[`ipv4_dst`]). Wrong logic silently mis-routes or drops
+//!   overlay packets (e.g. the old insert-only gossip merge pinned a dead address forever).
+//! - 🟢 **LOW** — pure helpers ([`now_ms`]/[`is_public`]/[`seed_links`]).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -123,6 +135,7 @@ impl Traffic {
 /// Shared traffic handle (run loop writes, supervisor reads).
 pub type SharedTraffic = Arc<Mutex<Traffic>>;
 
+/// **RISK 🟡 MED** (parser — only feeds the traffic monitor; a wrong parse mis-labels a flow, no routing impact).
 /// Parse the IPv4 5-tuple of a raw overlay packet for the flow-detail view. Fields
 /// `at_ms/out/member/via_exit` are filled by the caller. `None` if not IPv4.
 fn parse_flow(p: &[u8]) -> Option<FlowEvent> {
@@ -164,6 +177,7 @@ pub type SharedExit = Arc<Mutex<Option<MemberId>>>;
 /// changes when a public peer reflects our public (reflexive) address to us (P-D3).
 pub type SharedEndpoint = Arc<Mutex<Option<SocketAddr>>>;
 
+/// **RISK 🟢 LOW** (pure predicate).
 /// Is `ip` a globally-routable (public) address? Used to decide whether to trust a
 /// peer's reflexion of our address: only a peer reaching us over the public internet
 /// observes our public NAT mapping (P-D3). Private/loopback/link-local/CGNAT = not.
@@ -183,7 +197,7 @@ fn is_public(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Unix epoch milliseconds (best-effort; 0 if the clock is before the epoch).
+/// **RISK 🟢 LOW** (pure clock read). Unix epoch milliseconds (best-effort; 0 if the clock is before the epoch).
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -209,6 +223,7 @@ pub fn seed_links(endpoints: HashMap<MemberId, SocketAddr>) -> PeerLinks {
     Arc::new(Mutex::new(map))
 }
 
+/// **RISK 🟡 MED** (parser on the hot path — used to route every outbound packet).
 /// The IPv4 destination of a raw IP packet (`TunDevice` yields raw IP — the macOS
 /// AF header is stripped by `lattice-tun`). `None` if it isn't IPv4.
 pub fn ipv4_dst(p: &[u8]) -> Option<Ipv4Addr> {
@@ -249,6 +264,7 @@ fn directly_reachable(lk: &Link, now: u64) -> bool {
     lk.last_direct_ms != 0 && now.saturating_sub(lk.last_direct_ms) < DIRECT_OK_MS
 }
 
+/// **RISK 🟡 MED** (relay selection — feeds [`pick_route`]).
 /// Pick a relay for `to`: a **directly-reachable, public** member (≠ `to`). The `exit`
 /// (the designated always-on public node) is preferred; otherwise any live public peer.
 fn pick_relay(
@@ -273,6 +289,7 @@ fn pick_relay(
         .map(|(m, lk)| (*m, lk.endpoint))
 }
 
+/// **RISK 🟡 MED** (routing decision — wrong → overlay packets to a peer go nowhere / loop).
 /// Decide how to reach `to`: direct if its direct path is fresh; else relay through a
 /// public node; else best-effort direct (so NAT punching can still establish it); else
 /// nothing (docs/RELAY.md).
@@ -297,6 +314,7 @@ fn pick_route(
     Route::None
 }
 
+/// **RISK 🟡 MED** (regression site: the old insert-only merge pinned a dead address forever).
 /// Merge a gossiped endpoint table into our links. A peer we already know is updated only
 /// when we have NO fresh direct path to it: a directly-learned address is more accurate
 /// than a third party's gossip, but a stale entry must yield so a peer whose address
@@ -334,6 +352,7 @@ fn apply_gossip_table(
     }
 }
 
+/// **RISK 🔴 HIGH** (ON-WIRE FORMAT — see module header; append-only, old nodes must still parse).
 /// Encode the gossip payload (sealed): the endpoint table as `id ip:port` lines,
 /// plus an optional `self ip:port` line = "where I observe YOU (the recipient)",
 /// the reflexion that lets a NAT'd peer learn its public address (P-D3).
@@ -348,6 +367,7 @@ fn encode_gossip(table: &[(MemberId, SocketAddr)], reflect: Option<SocketAddr>) 
     s.into_bytes()
 }
 
+/// **RISK 🔴 HIGH** (ON-WIRE FORMAT — inverse of [`encode_gossip`]; must tolerate old/garbage lines).
 /// Decode a gossip payload → (endpoint table, our reflexive address if the sender
 /// reported one). Unknown/garbage lines are skipped (older senders sent no `self`).
 fn decode_gossip(payload: &[u8]) -> (Vec<(MemberId, SocketAddr)>, Option<SocketAddr>) {
@@ -420,6 +440,8 @@ pub type LoopCmdRx = tokio::sync::mpsc::UnboundedReceiver<LoopCmd>;
 /// loop→meshd event channel (re-cipher applied, attack signal received).
 pub type LoopEventTx = tokio::sync::mpsc::UnboundedSender<LoopEvent>;
 
+/// **RISK 🔴 HIGH** (ON-WIRE tag values — APPEND-ONLY; renumbering breaks mixed-version meshes.
+/// Old nodes ignore an unknown tag via the `_ => {}` dispatch, so new tags are safe at the end).
 /// Control-frame sub-tags for the attack-response control plane (P-C7).
 pub const CTRL_ATTACK: u8 = 0x03;
 pub const CTRL_ALLCLEAR: u8 = 0x04;
@@ -437,6 +459,7 @@ pub const CTRL_FLOWS: u8 = 0x07;
 /// proto) wins; the supervisor merges it for connector discovery (docs/EXTENSIONS.md §6).
 pub const CTRL_REGISTRY: u8 = 0x08;
 
+/// **RISK 🔴 HIGH** (ON-WIRE FORMAT — this byte layout is also the meshd→loop command; append-only).
 /// Encode a re-cipher announce: `[epoch(8 BE)][cipher_len(1)][cipher][secret(32)]`.
 fn encode_recipher(r: &Recipher) -> Vec<u8> {
     let cb = r.cipher.as_bytes();
@@ -448,6 +471,7 @@ fn encode_recipher(r: &Recipher) -> Vec<u8> {
     v
 }
 
+/// **RISK 🔴 HIGH** (ON-WIRE FORMAT — inverse of [`encode_recipher`]; length-checks the buffer).
 fn decode_recipher(b: &[u8]) -> Option<Recipher> {
     if b.len() < 9 {
         return None;
@@ -467,6 +491,8 @@ fn decode_recipher(b: &[u8]) -> Option<Recipher> {
     })
 }
 
+/// **RISK 🔴 HIGH** — the data-plane HOT LOOP (TUN↔transport, seal/open, route/relay, gossip).
+/// Blast radius = all overlay + exit traffic; a wrong edit can drop/mis-route every packet.
 /// Run the data-plane loop until the TUN or transport closes. `links` maps a member
 /// id → where to reach it + liveness (seeded from the invite, learned + gossiped
 /// thereafter); `exit` is the egress member for non-mesh traffic. `my_endpoint` is

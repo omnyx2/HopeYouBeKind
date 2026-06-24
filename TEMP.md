@@ -13,15 +13,12 @@ regressions are easy to localize, and set up the working-memory workflow.
 
 ### Requirements (open)
 
-1. **meshrun/src/lib.rs docs** — module-header contract for the run loop + per-fn `///` +
-   edit-risk tags (same pattern as exit.rs). Files: `crates/meshrun/src/lib.rs` (~40 fns, 33%
-   documented now). Focus: TUN read/write, Deliver/Forward, MTU, `CTRL_*` frames.
-2. **meshd/src/main.rs docs** — add the missing module overview (`//!`) + `///` on the
+1. **meshd/src/main.rs docs** — add the missing module overview (`//!`) + `///` on the
    undocumented functions (~24 of 69) + edit-risk on the dataplane/route/kill-switch ones.
-3. **Open verification (separate thread)** — clean-reboot the Mac, launch the fixed bundle
+2. **Open verification (separate thread)** — clean-reboot the Mac, launch the fixed bundle
    (≥19465bb / now 0.7.4) once, re-verify full-tunnel egress=Oracle + Ipkts>0 against the
    version-matched Oracle. Confirms the macOS fixes on a non-churned system.
-4. **Release decisions (pending user)** — (a) push session commits to `origin`; (b) tag `v0.7.4`
+3. **Release decisions (pending user)** — (a) push session commits to `origin`; (b) tag `v0.7.4`
    (triggers the release-installer build).
 
 ### Notes / context to not lose
