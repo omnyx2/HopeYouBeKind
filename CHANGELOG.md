@@ -11,7 +11,19 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
-## [Unreleased]
+## [0.7.4] — 2026-06-24
+
+### Fixed
+- **macOS full-tunnel broken by two exit-routing regressions** (latent since v0.7.0, exposed
+  once a non-stale build was deployed). (1) The `isolate` exit policy installed a pf `route-to`
+  rule selecting `100.64.0.0/10` on **every** node; that range also matches the node's OWN
+  overlay IP, so on a full-tunnel client pf diverted its own egress back out the physical WAN
+  (utun saw no packets → kill-switch reverted). (2) `route_through` diverted the default route
+  into the tunnel **even when the exit /32 pin failed**, and the macOS pin wasn't idempotent, so
+  a stale /32 from a prior cycle made the exit's own outer packets loop back into the tunnel.
+  Fixes: the isolate `route-to` rule only installs on a node that actually serves as an exit
+  (publicly-reachable / `MESHD_ADVERTISE` pinned); the macOS pin is now delete-first idempotent
+  and the default is diverted **only after** the pin succeeds (fail closed). See `docs/ERRORS.md`.
 
 ### Added
 - **Extensions / connector framework (daemon side)** — `meshd` can now host external
@@ -33,6 +45,15 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
   daemon enforces it on `Advertise`/`Unadvertise`/`ListServices` and filters the event
   stream by mesh, so enabling one connector never silently exposes a mesh the user didn't
   pick. Grants written before this load as "no meshes" (must be re-granted).
+
+### Tooling / docs
+- **Build-identity stamp** — `meshd` logs `version vX.Y.Z build <git-sha>` at startup, so the
+  running binary is always identifiable (a stale binary had been masking regressions for hours).
+- **`scripts/build-app.sh`** — one correct desktop build with anti-stale / anti-mix gates;
+  **BUILD.md** build charter, **CLAUDE.md** working agreement, and a **blast-radius regression
+  map** in `docs/ERRORS.md` ("edit X → re-test Y, because…").
+- **Windows `meshd.exe` VERSIONINFO** (via `winres`) to cut Defender false-positives on the
+  unsigned sidecar.
 
 ## [0.7.1] — 2026-06-22
 
