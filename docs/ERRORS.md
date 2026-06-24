@@ -5,6 +5,35 @@ A running log of real failures we hit, their root cause, what we shipped to fix 
 membership / discovery / health). Newest first. Each entry: Incident → Root cause →
 Why it was hard to diagnose → Shipped → Remaining design gaps.
 
+> **READ THIS FILE BEFORE STARTING WORK** (CLAUDE.md "Working memory" step 0): the quick-log
+> just below + the blast-radius map. Don't re-make a logged mistake. When a fix causes/reveals an
+> error during implementation, add a one-line quick-log entry here.
+
+---
+
+## Quick log — "modified X → got error Y → fixed by Z" (newest first)
+
+Granular implementation errors from active work (the design-lesson write-ups are further down).
+
+- **2026-06-24** · ran `cargo build -p meshd` in the bundle script → **no-op** (`error: package
+  ID 'meshd' did not match`; package is `lattice-meshd`, binary is `meshd`) → the following `cp`
+  shipped a **months-old stale binary**. Fix: build `-p lattice-meshd`; `scripts/build-app.sh`
+  now gates on the embedded `build <sha>` == HEAD.
+- **2026-06-24** · read utun throughput as `netstat -I utun6 -b` column **`$7`** → that's
+  **Ibytes, not Opkts** → chased a phantom "2.3M Opkts flood" for ages. Fix: `$5`=Ipkts `$8`=Opkts;
+  and trust the **egress IP** (ground truth) over interface counters (macOS utun counters are
+  unreliable).
+- **2026-06-24** · `ip route get 1.1.1.1 from 100.80.1.7` (no `iif`) → **"Network unreachable"**
+  → wrongly concluded "Oracle forwarding is broken". With `iif tun0` it resolves fine — the
+  no-iif form can't validate a non-local source. Fix: always pass `iif` when simulating forwarding.
+- **2026-06-24** · assumed a **utun kernel wedge** for `Opkts=0` (a real prior failure mode) →
+  spent hours before checking config. The actual causes were a pf rule stealing packets (cb6c868)
+  + a route loop + the exit set to the wrong member. Fix: `Opkts=0` has ≥3 causes — discriminate
+  (in-mesh overlay test, read `/tmp/lattice-pf.conf`, `route get <exit>`), and **check
+  `lattice ls/info` config FIRST** (the exit was mis-set to an idle member the whole time).
+- **2026-06-24** · BSD `sed '0,/re/s//.../'` silently didn't replace in `Cargo.toml` (GNU-ism).
+  Fix: use the Edit tool / a portable `sed` for version bumps.
+
 ---
 
 ## Blast-radius map — "if you edit X, re-test Y, because…"

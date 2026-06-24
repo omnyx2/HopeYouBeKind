@@ -3,6 +3,25 @@
 Lattice is a serverless mesh VPN (Rust core crates + Tauri GUI). These are binding rules for
 any automated change. Keep them; they encode mistakes already made here.
 
+## Working memory — TEMP.md / COMPLETE.md / docs/ERRORS.md (follow this every task)
+
+A disciplined scratchpad so long multi-step work doesn't drift or repeat mistakes. The charter:
+
+0. **Before starting ANY work, READ `docs/ERRORS.md` first** — the blast-radius map + the
+   "modify → error → fix" quick-log at the top. Restart from what it tells you; never re-make a
+   logged mistake.
+1. **At task start, index the work into `TEMP.md`.** Write the feature you're building and its
+   detailed implementation requirements as a numbered checklist. `TEMP.md` is the single live
+   answer to "what am I doing right now" — keep it current; only OPEN items live here.
+2. **When a requirement is done, MOVE it from `TEMP.md` to `COMPLETE.md`** (with the date + the
+   commit sha that finished it). `TEMP.md` shrinks as work completes; `COMPLETE.md` is the record.
+3. **When an error happens while implementing, append to `docs/ERRORS.md`** in the form
+   *"modified `<file:area>` this way → `<the error that occurred>` → fixed by `<what>`"*. Factual
+   and granular. This is read in step 0 next time.
+
+How to write entries: concise, numbered/indexed, dated, link the commit. Keep `TEMP.md` short —
+it's scratch, not prose. When `TEMP.md` is empty, the task is done.
+
 ## Building — ALWAYS follow BUILD.md
 
 **Before any build, bundle, or release action, read [BUILD.md](BUILD.md) and follow it.**
