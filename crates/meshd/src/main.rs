@@ -700,6 +700,13 @@ async fn main() -> anyhow::Result<()> {
         std::process::id(),
         &argv[1..]
     );
+    // Identify exactly which build this is, so "old vs new binary got mixed up" is answerable
+    // straight from the log (CARGO_PKG_VERSION + git SHA stamped by build.rs).
+    elog!(
+        "meshd: version v{} build {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("LATTICE_BUILD")
+    );
     // The socket is the first non-flag argument; flags (`--data-plane`) may come in any
     // order. Falling back to the platform default lets a bare `meshd` still work.
     let socket = std::env::args()

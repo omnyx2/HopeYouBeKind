@@ -87,6 +87,30 @@ cd gui && RUSTUP_TOOLCHAIN=stable npm run tauri build
 
 Dev (hot-reload) instead of a bundle: `cd gui && RUSTUP_TOOLCHAIN=stable npm run tauri dev`.
 
+### 3.1 One command (use this) — `scripts/build-app.sh`
+
+```bash
+scripts/build-app.sh
+```
+
+Does §3 atomically with the §4 gates baked in: builds with the right package name, **fails
+loudly if the binary doesn't carry the current commit's SHA** (stale-build guard), bundles,
+**hash-compares the bundled meshd against the freshly built one** (anti-mix guard), prints the
+app version, and warns if a now-outdated meshd is still running. Prefer this over hand-typing
+the steps — that is what shipped a stale binary in the first place.
+
+### 3.2 Which build is actually running?
+
+`meshd` logs its identity on the first lines of `/tmp/lattice-meshd.log`:
+
+```
+meshd: version v0.7.3 build 0457b74      # CARGO_PKG_VERSION + git short SHA (from build.rs)
+```
+
+So "old vs new binary" is never a guess: compare that SHA to `git rev-parse --short HEAD`.
+The running daemon is whatever was launched — building to disk does NOT change it until the
+app is relaunched (§5).
+
 ---
 
 ## 4. Verification gate — DO NOT trust a build you didn't verify
