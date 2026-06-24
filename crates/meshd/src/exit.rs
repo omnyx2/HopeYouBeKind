@@ -84,12 +84,23 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     // later connect to that IP fail with EADDRNOTAVAIL.
     let _ = std::fs::write(EXIT_HOST_SAVED, exit_ip.to_string());
     let mut errs = Vec::new();
-    if let Err(e) = run_checked("route", &["-q", "add", "-host", &exit_ip.to_string(), &gw]) {
+    // Idempotent pin: drop any stale /32 to the exit first (a prior full-tunnel cycle whose
+    // restore raced a kill-switch revert can leave one — possibly via the OLD tun). Without
+    // this, `route add -host` fails with "File exists" and the stale (often tun-pointing)
+    // route stays, so the exit's own outer tunnel packets loop back into the tun.
+    let es = exit_ip.to_string();
+    run("route", &["-q", "delete", "-host", &es]);
+    if let Err(e) = run_checked("route", &["-q", "add", "-host", &es, &gw]) {
         errs.push(e);
     }
-    // Send everything else into the tunnel.
-    if let Err(e) = run_checked("route", &["-q", "change", "default", "-interface", tun]) {
-        errs.push(e);
+    // Only divert the default INTO the tunnel once the exit endpoint is pinned OFF it. If the
+    // pin failed, diverting would route the outer tunnel packets (to the exit's public IP)
+    // back into the tun → a packet flood that never reaches the exit and a kill-switch revert.
+    // Fail closed instead: leave the default alone and surface the error.
+    if errs.is_empty() {
+        if let Err(e) = run_checked("route", &["-q", "change", "default", "-interface", tun]) {
+            errs.push(e);
+        }
     }
     if errs.is_empty() {
         tracing::warn!(%exit_ip, tun, "default route diverted through exit node");
