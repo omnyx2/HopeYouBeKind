@@ -13,13 +13,16 @@ regressions are easy to localize, and set up the working-memory workflow.
 
 ### Requirements (open)
 
-1. **meshd/src/main.rs docs** — add the missing module overview (`//!`) + `///` on the
-   undocumented functions (~24 of 69) + edit-risk on the dataplane/route/kill-switch ones.
-2. **Open verification (separate thread)** — clean-reboot the Mac, launch the fixed bundle
+1. **Open verification (separate thread)** — clean-reboot the Mac, launch the fixed bundle
    (≥19465bb / now 0.7.4) once, re-verify full-tunnel egress=Oracle + Ipkts>0 against the
    version-matched Oracle. Confirms the macOS fixes on a non-churned system.
-3. **Release decisions (pending user)** — (a) push session commits to `origin`; (b) tag `v0.7.4`
+2. **Release decisions (pending user)** — (a) push session commits to `origin`; (b) tag `v0.7.4`
    (triggers the release-installer build).
+
+### Docs pass status
+exit.rs ✅ · meshrun/lib.rs ✅ · meshd/main.rs ✅ — the data-plane/exit/IPC trio is documented
+(contract + `///` + edit-risk). Remaining crates (mesh/*, tun, net) not yet given the risk-tag
+treatment; do on demand.
 
 ### Notes / context to not lose
 - Fleet right now: Mac = local, running build `19465bb` (0.7.3 code) with full-tunnel ON via

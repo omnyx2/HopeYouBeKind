@@ -7,6 +7,9 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ## Code documentation pass + process hardening (2026-06-24)
 
+- **meshd/src/main.rs: module edit-risk map + RISK tags on the dangerous fns + `///` on every
+  previously-undocumented fn** (🔴 bringup_dataplane/arm_kill_switch/shutdown_daemon; 🟡 handle/
+  serve_conn/scope_gate/peer_allowed/main/accept_loop/join_mesh/create_mesh; 🟢 helpers). — this commit
 - **meshrun/src/lib.rs: module edit-risk + wire-compat invariant + RISK tags** (🔴6/🟡5/🟢2 on the
   hot loop, wire encode/decode, CTRL_* tags, route/relay, parsers). — this commit
 - **CLAUDE.md: working-memory charter** (TEMP.md / COMPLETE.md / docs/ERRORS.md workflow). — `cab97cd`

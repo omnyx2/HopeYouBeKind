@@ -9,6 +9,23 @@
 //! loop (`lattice_meshrun::run`): a per-mesh TUN + UDP socket carrying sealed
 //! packets. The loop shares a peer table + exit selection with this control plane,
 //! so the IPC reports live endpoints/liveness (P6.3d) and steers egress live.
+//!
+//! ## Edit-risk (key fns carry a `RISK:` tag — same scheme as `exit.rs`/`meshrun`)
+//! Most of this file is control-plane bookkeeping (🟢/🟡). The dangerous parts:
+//! - 🔴 [`bringup_dataplane`] — opens the per-mesh TUN/UDP, applies routes/NAT, arms the
+//!   kill-switch. Where full-tunnel is wired; touches the live host network.
+//! - 🔴 [`arm_kill_switch`] — the probe that reverts full-tunnel if the exit "isn't passing
+//!   traffic"; a false revert (or a missing one) is a connectivity bug. (`Opkts=0` has many
+//!   causes — see docs/ERRORS.md before touching.)
+//! - 🔴 [`shutdown_daemon`] — restores routes/DNS before aborting the data plane; if it skips a
+//!   restore the host is left on a dead tunnel.
+//! - 🟡 [`handle`] — the central IPC request dispatcher; mutates ALL mesh state and emits the
+//!   `PostAction`s (bringup / kill-switch / shutdown). Big match; easy to mis-wire a new request.
+//! - 🟡 [`serve_conn`]/[`scope_gate`]/[`ext_subscribe`] — the IPC connection: bounded outbound
+//!   channel (backpressure), shutdown-ack flush, and connector scope checks re-read from the LIVE
+//!   grant (not a snapshot). See the extensions-framework notes.
+//! - 🟡 [`peer_allowed`] — the socket-peer uid gate (who may talk to the daemon).
+//! The data-plane loop itself lives in `lattice_meshrun` (its own edit-risk legend).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -380,6 +397,7 @@ struct Bringup {
     flows: Vec<FlowRule>,
 }
 
+/// 🟢 Unix epoch milliseconds (control-plane timestamps).
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -456,6 +474,7 @@ fn persist_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// 🟢 On-disk JSON path for mesh `id` under the state dir.
 fn mesh_file(dir: &std::path::Path, id: MeshId) -> PathBuf {
     dir.join(format!("mesh-{id}.json"))
 }
@@ -691,6 +710,9 @@ fn request_mutates(req: &Request) -> bool {
 }
 
 #[tokio::main]
+/// **RISK 🟡 MED** — daemon startup: log the build id, set up the event bus + extension grants,
+/// load persisted meshes (and bring up their data planes if `DATA_PLANE`), then serve the IPC
+/// socket/pipe. The single-instance behaviour + restore-from-disk live here.
 async fn main() -> anyhow::Result<()> {
     // First line in the log: proves meshd actually launched (vs the GUI's launcher
     // failing before this point), and records the args we got.
@@ -882,6 +904,8 @@ async fn main() -> anyhow::Result<()> {
 /// Accept IPC connections forever. The transport is platform-specific (unix socket
 /// vs named pipe) but the per-connection protocol ([`serve_conn`]) is shared.
 #[cfg(unix)]
+/// 🟡 IPC accept loop (unix socket): bind, then for each connection check [`peer_allowed`] and
+/// spawn [`serve_conn`]. Includes the single-instance / stale-socket handling.
 async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     // Single-instance guard. Blindly `remove_file` + re-`bind` would steal the socket
     // from a meshd that is ALREADY running — but that old instance keeps its TUNs and
@@ -913,6 +937,7 @@ async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<(
 
 /// The connecting process's uid, read from the socket (Linux `SO_PEERCRED`,
 /// macOS/BSD `getpeereid`). `None` if it can't be determined (we then fail open).
+/// 🟢 The connected peer's uid (Linux `SO_PEERCRED`) — for [`peer_allowed`].
 #[cfg(target_os = "linux")]
 fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -929,6 +954,7 @@ fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
     (rc == 0).then_some(cred.uid)
 }
 
+/// 🟢 The connected peer's uid (BSD/macOS `LOCAL_PEERCRED`) — for [`peer_allowed`].
 #[cfg(all(unix, not(target_os = "linux")))]
 fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
     let mut uid: libc::uid_t = 0;
@@ -944,6 +970,8 @@ fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
 /// `$SUDO_UID`, and the listed uids may connect — others are refused and logged.
 /// Use it on shared/multi-user hosts to stop another local user driving the daemon.
 #[cfg(unix)]
+/// **RISK 🟡 MED** — the socket-peer authorization gate: decides who may talk to the daemon
+/// (the opt-in `LATTICE_ALLOW_UID` policy over `SO_PEERCRED`). Loosening this exposes the IPC.
 fn peer_allowed(stream: &tokio::net::UnixStream) -> bool {
     use std::os::unix::io::AsRawFd;
     let allow = match std::env::var("LATTICE_ALLOW_UID") {
@@ -974,6 +1002,8 @@ fn peer_allowed(stream: &tokio::net::UnixStream) -> bool {
 }
 
 #[cfg(windows)]
+/// 🟡 IPC accept loop (Windows named pipe): a pool of pipe instances, each handed to a
+/// [`pipe_worker`]. (`max_instances` must be ≤254 — see the Windows meshd saga.)
 async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
     // A POOL of concurrent pipe instances so several simultaneous GUI requests don't get
@@ -1018,6 +1048,7 @@ async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()>
 /// One pipe-pool worker: wait for a client, immediately re-arm a fresh listening
 /// instance (so the pool's listener count never dips), then serve the connection.
 #[cfg(windows)]
+/// 🟡 Serve one Windows named-pipe connection (the per-instance worker), then loop to accept.
 async fn pipe_worker(
     mut server: tokio::net::windows::named_pipe::NamedPipeServer,
     pipe: String,
@@ -1212,6 +1243,8 @@ fn ext_subscribe(
     Response::Ok
 }
 
+/// **RISK 🟡 MED** — connector authorization; re-reads the LIVE grant (not a Hello-time snapshot)
+/// so a disable/narrow takes effect on an open connection. A gap here = a privilege leak.
 /// Deny connector-only requests that lack the required scope/auth/mesh (docs/EXTENSIONS.md
 /// §3/§4). `None` = allowed. Management calls (Enable/Disable/List) stay open to trusted
 /// local clients. `ListServices` is open to the management GUI (no `Hello`) but, for a
@@ -1257,6 +1290,8 @@ fn scope_gate(req: &Request, sess: &ConnSession, st: &State) -> Option<Response>
     }
 }
 
+/// **RISK 🟡 MED** — bounded outbound channel (backpressure vs leak), the Shutdown-ack must FLUSH
+/// before teardown, and an event-forwarder interleaves with request/response. Subtle ordering.
 /// One IPC connection: newline-JSON [`Request`] in, [`Response`] out, until close.
 ///
 /// A plain client (GUI/CLI) gets strict request→response. A connector that sends
@@ -1360,6 +1395,8 @@ where
     let _ = writer.await;
 }
 
+/// **RISK 🔴 HIGH** — restores routes/DNS BEFORE aborting the data plane; skipping a restore
+/// leaves the host on a dead tunnel (no internet). Keep the restore-then-teardown order.
 /// Cleanly stop the daemon (the `Shutdown` request): if a full tunnel is up, restore the
 /// host's routes/DNS first so closing the TUN doesn't strand the default route on a dead
 /// interface; otherwise just clear any stale exit pin. Then abort every mesh's data-plane
@@ -1389,6 +1426,8 @@ async fn shutdown_daemon(state: &Arc<Mutex<State>>) {
     std::process::exit(0);
 }
 
+/// **RISK 🔴 HIGH** — opens the live TUN/UDP, applies routes/NAT, arms the kill-switch; where
+/// full-tunnel is wired (the macOS regressions surfaced through here). Touches the host network.
 /// Open the per-mesh TUN + UDP and spawn the data-plane loop. Failures (e.g. no
 /// root for the TUN) are logged and non-fatal: meshd keeps serving the control
 /// plane. The `links`/`exit_sel` handles are shared with [`MeshState`].
@@ -2086,6 +2125,7 @@ fn local_ip() -> Option<std::net::IpAddr> {
 /// distorted when full-tunnel diverts the default route through the overlay — so it's a
 /// stable "which network am I physically on" signal for topology grouping. Picks the first
 /// up, non-loopback, RFC1918 IPv4, skipping the mesh overlay (`100.64.0.0/10`) and tunnels.
+/// 🟢 This host's primary private LAN IPv4 (for the LAN beacon / advertise address). Unix.
 #[cfg(unix)]
 fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     use std::net::Ipv4Addr;
@@ -2127,6 +2167,7 @@ fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
+/// 🟢 This host's primary private LAN IPv4 (for the LAN beacon / advertise address). Non-unix.
 #[cfg(not(unix))]
 fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     match local_ip() {
@@ -2135,6 +2176,9 @@ fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
+/// **RISK 🔴 HIGH** — auto-reverts full-tunnel if the exit "isn't passing traffic". A false
+/// revert cuts a working VPN; a missing one strands the host. `Opkts=0`/"not passing" has MANY
+/// causes (pf rule, route loop, wrong exit, wedge) — read docs/ERRORS.md before changing the probe.
 /// Kill-switch watchdog (from v1). Full tunnel diverts the host default route
 /// through the exit; if that path can't carry traffic the host is stranded OFFLINE.
 /// Every ~20s probe the internet THROUGH the tunnel (TCP connect to 1.1.1.1:443 —
@@ -2171,6 +2215,11 @@ fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
     });
 }
 
+/// **RISK 🟡 MED** — the central IPC request dispatcher (a big `match` over [`Request`]). Mutates
+/// all mesh state under the lock and returns a [`Response`] + an optional [`PostAction`] (the
+/// async/side-effecting work — data-plane bringup, kill-switch arm, shutdown — done by the caller
+/// AFTER releasing the lock). Mis-wiring a new request arm (or doing async work here) is the
+/// common bug. Connector-gated requests are pre-screened by [`scope_gate`].
 fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
     match req {
         Request::CreateMesh {
@@ -2834,6 +2883,8 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
     }
 }
 
+/// **RISK 🟡 MED** — install a mesh from an invite blob (keys, roster, endpoints) and persist it;
+/// returns a `Bringup` PostAction so the caller starts its data plane. Mesh-lifecycle correctness.
 fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction>) {
     if st.meshes.contains_key(&invite.mesh_id) {
         return (err(&format!("already in mesh {}", invite.mesh_id)), None);
@@ -2963,6 +3014,8 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     )
 }
 
+/// **RISK 🟡 MED** — genesis a brand-new mesh (master keypair, charter, self as first member) and
+/// persist it; returns a `Bringup` PostAction. Mesh-lifecycle correctness.
 fn create_mesh(
     st: &mut State,
     name: String,
@@ -3221,6 +3274,7 @@ fn expel_member(st: &mut State, mesh: MeshId, member: MemberId) -> (Response, Op
     (Response::Info { message }, None)
 }
 
+/// 🟡 Project a `MeshState` into the IPC `MeshDetail` (members, health, exit, policy) for `MeshInfo`.
 fn detail(ms: &MeshState) -> MeshDetail {
     let me = ms.my_key.pubkey();
     let now = now_ms();
@@ -3385,6 +3439,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
     }
 }
 
+/// 🟢 Human name for an IP protocol number (tcp/udp/icmp/…) for the traffic monitor.
 fn proto_name(p: u8) -> String {
     match p {
         1 => "icmp".into(),
@@ -3470,12 +3525,14 @@ fn traffic_view(st: &State, mesh: Option<MeshId>) -> TrafficView {
     v
 }
 
+/// 🟢 Standard "no such mesh" error response.
 fn no_mesh(id: MeshId) -> Response {
     Response::Error {
         message: format!("no mesh {id}"),
     }
 }
 
+/// 🟢 Build a `Response::Error` from a message.
 fn err(message: &str) -> Response {
     Response::Error {
         message: message.to_string(),
@@ -3643,6 +3700,7 @@ fn list_services(st: &State, mesh: MeshId, proto: Option<String>) -> Response {
     Response::Services(out)
 }
 
+/// 🟢 Short hex fingerprint of a public key (for display).
 fn fp(pk: &PubKey) -> String {
     pk[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -3735,10 +3793,12 @@ fn expel_name(p: ExpelPolicy) -> String {
     }
 }
 
+/// 🟢 Lowercase hex of bytes.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 🟢 Parse 64 hex chars into a 32-byte array; `None` if malformed.
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
     if s.len() != 64 {
