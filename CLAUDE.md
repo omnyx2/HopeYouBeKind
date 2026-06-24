@@ -32,6 +32,19 @@ socket + `MESHD_STATE_DIR`, no `DATA_PLANE`) or on a test mesh. Swap the live da
 explicitly agreed, via `lattice off` → `lattice shutdown` → quit app → relaunch once → re-auth.
 Diagnose reachability with `curl`/TCP, not `ping` (ICMP is blocked on campus). See BUILD.md §5.
 
+## Before editing — check the regression map
+
+`docs/ERRORS.md` opens with a **blast-radius map** ("if you edit X, re-test Y, because…") plus a
+running log of real incidents and their root causes. **Before changing the data plane, exit
+routing/pf, IPC enums, or the build/packaging, skim that map** — most of those areas have broken
+once already and the trap is written down. After fixing a real regression, add an entry (newest
+first) so the next person inherits the lesson.
+
+Highest-traffic traps: `exit.rs` route/pf changes are per-OS and independent (test all 3, watch
+for route loops + the `100.64/10`-matches-own-IP pitfall); IPC enum changes must be additive
+(`"unknown variant"` = version skew); and always confirm you're testing the CURRENT build via the
+`meshd: version … build <sha>` log line (a stale binary masks regressions).
+
 ## Commits
 
 - This repo is **public**: never commit real infra IPs/hostnames (use placeholders).
