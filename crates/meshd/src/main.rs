@@ -1484,7 +1484,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     // traffic we forward for others to our real WAN. Default Isolate if the mesh is gone.
     let isolate = {
         let mut st = state.lock().unwrap();
-        let isolate = st
+        let policy_isolate = st
             .meshes
             .get(&b.mesh_id)
             .map(|ms| matches!(ms.mesh.charter.exit_policy, ExitPolicy::Isolate))
@@ -1494,7 +1494,15 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
             ms.dp_port = port; // local data-plane port — advertised in the LAN beacon
             ms.dp_error = None; // bound cleanly — clear any prior "port busy" error
         }
-        isolate
+        // The isolate `route-to` rule pins traffic we forward FOR OTHERS to our real WAN, but
+        // its pf selector `from 100.64.0.0/10` ALSO matches THIS node's own overlay source IP
+        // (100.80.x.y ∈ 100.64/10). On a plain full-tunnel client that diverts our OWN egress
+        // back out the physical WAN, so the overlay TUN sees zero packets and the kill-switch
+        // reverts the tunnel. Only a node that actually serves as an exit for others should
+        // install it — i.e. a publicly-reachable, pinned node (MESHD_ADVERTISE set). A client
+        // never forwards for anyone, so it must never get the rule.
+        let is_exit_node = std::env::var("MESHD_ADVERTISE").is_ok();
+        policy_isolate && is_exit_node
     };
     // enable_nat shells out (pfctl/sysctl on unix, several PowerShell cmdlets on
     // Windows) — synchronous + slow, so run it off the async runtime to avoid stalling
