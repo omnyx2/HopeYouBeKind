@@ -13,10 +13,7 @@ regressions are easy to localize, and set up the working-memory workflow.
 
 ### Requirements (open)
 
-1. **Open verification (separate thread)** — clean-boot the Mac, launch a ≥0.7.4 bundle once,
-   re-verify full-tunnel egress=Oracle + Ipkts>0 against the version-matched Oracle. Confirms
-   the macOS fixes on a non-churned system. (meshd is currently NOT running on the Mac.)
-2. **Windows re-join incomplete** — found the box on the home LAN (`192.168.0.6`, host
+1. **Windows re-join incomplete** — found the box on the home LAN (`192.168.0.6`, host
    `hyunseok`), SSH works as `sshuser`/1234 (expect script in scratchpad; NOT omnyx). meshd.exe
    + Lattice.exe were RUNNING but mesh 1 still showed win #5 idle (stale campus endpoint
    10.32.86.243). Left off at: reading the Windows meshd log failed on PowerShell quoting over
@@ -30,9 +27,9 @@ exit.rs ✅ · meshrun/lib.rs ✅ · meshd/main.rs ✅ — the data-plane/exit/I
 treatment; do on demand.
 
 ### Notes / context to not lose (refreshed 2026-07-22)
-- **Mac: meshd NOT running** (socket refused); internet direct via campus (10.32.x / egress
-  203.247.167.58). The disk bundle is stale (19465bb-era) vs source 0.7.4 — next launch should
-  use a fresh `scripts/build-app.sh` bundle, or install the released `Lattice_0.7.4_aarch64.dmg`.
+- **Mac: CLEAN 0.7.4 install running** — official release dmg installed to /Applications
+  (meshd `v0.7.4 build c00836b`), all older installs/bundles/dmgs deleted. Full-tunnel via
+  Oracle verified working + stable; state dir preserved (auto-rejoined both meshes).
 - Oracle: last known `e069aa7`, systemd, healthy exit. SSH:
   `ssh -i ssh-key-2026-06-13.key -o IdentitiesOnly=yes ubuntu@<oracle>` (key in repo root, gitignored).
 - **v0.7.4 released**: tag + GitHub Release with all installers (run 28096210159 SUCCESS —

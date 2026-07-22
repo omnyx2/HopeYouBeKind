@@ -5,6 +5,16 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## Mac clean-slate reinstall + macOS-fix verification (2026-07-22)
+
+- **Wiped every stale install** (/Applications 0.7.3 app, 0.7.3 dev bundle, ancient Downloads
+  dmgs) and **installed the official `Lattice_0.7.4_aarch64.dmg`** to /Applications. State dir
+  kept → both meshes auto-rejoined on launch.
+- **VERIFIED the two macOS full-tunnel fixes on a fresh, non-churned daemon**: meshd logs
+  `v0.7.4 build c00836b`; pf conf is nat-only (no route-to on a client — fix 5cfa960); exit /32
+  pin → en0 (no loop — fix 19465bb); **full-tunnel egress = Oracle on try 1** and stays up past
+  the kill-switch window. Closes the "clean verification" TEMP item. — config/deploy, no commit
+
 ## Release v0.7.4 pushed + tagged (2026-06-24)
 
 - **Pushed `feat/extensions-meshd` (e069aa7..c00836b) + annotated tag `v0.7.4` at c00836b** → Release workflow triggered (run 28096210159, in_progress). NOTE: v0.7.3 release build had failed.
