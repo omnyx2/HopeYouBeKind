@@ -30,7 +30,8 @@ treatment; do on demand.
 - **Mac: CLEAN 0.7.4 install running** — official release dmg installed to /Applications
   (meshd `v0.7.4 build c00836b`), all older installs/bundles/dmgs deleted. Full-tunnel via
   Oracle verified working + stable; state dir preserved (auto-rejoined both meshes).
-- Oracle: last known `e069aa7`, systemd, healthy exit. SSH:
+- Oracle: **updated to `v0.7.4 build 51deceb`** (2026-07-22), systemd active, healthy pinned
+  exit; full-tunnel from the Mac re-verified against it (egress OK, no kill-switch). SSH:
   `ssh -i ssh-key-2026-06-13.key -o IdentitiesOnly=yes ubuntu@<oracle>` (key in repo root, gitignored).
 - **v0.7.4 released**: tag + GitHub Release with all installers (run 28096210159 SUCCESS —
   v0.7.3's release run had failed; nothing to fix in release.yml after all).
