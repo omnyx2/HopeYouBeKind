@@ -8,6 +8,9 @@ commit. The durable record; `TEMP.md` only holds open items.
 ## Release v0.7.4 pushed + tagged (2026-06-24)
 
 - **Pushed `feat/extensions-meshd` (e069aa7..c00836b) + annotated tag `v0.7.4` at c00836b** → Release workflow triggered (run 28096210159, in_progress). NOTE: v0.7.3 release build had failed.
+- **Release build SUCCEEDED** (7m20s) — GitHub Release v0.7.4 published with the full asset set
+  (macOS .dmg, Windows .msi/-setup.exe, Linux .AppImage/.deb ×2 arch, standalone meshd Linux
+  binaries). The v0.7.3 failure did not recur; release.yml needed no fix. (verified 2026-07-22)
 
 ## Code documentation pass + process hardening (2026-06-24)
 
