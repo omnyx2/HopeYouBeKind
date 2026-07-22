@@ -33,5 +33,12 @@ treatment; do on demand.
 - Oracle: **updated to `v0.7.4 build 51deceb`** (2026-07-22), systemd active, healthy pinned
   exit; full-tunnel from the Mac re-verified against it (egress OK, no kill-switch). SSH:
   `ssh -i ssh-key-2026-06-13.key -o IdentitiesOnly=yes ubuntu@<oracle>` (key in repo root, gitignored).
+- **lablinux (#4) RE-JOINED 2026-07-22**: `v0.7.4 build c00836b` (release meshd-Linux-X64 binary
+  scp'd over the old 6/21 install at /usr/lib/lattice/resources/meshd; .bak-0.7.0 kept). LIVE,
+  overlay ping 3/3 (~4.9ms), direct path to Mac after starting via Oracle relay. SSH:
+  `ssh hyunseok@172.28.7.32` (key auth); sudo pw 1234; launched via `/tmp/lab-start.sh`
+  (setsid+disown — plain nohup died on session close). Its public addr (Oracle-reflected) =
+  210.107.188.8; LAN addr 172.28.7.32. NOTE: launched manually, NOT persistent across reboot
+  (no systemd unit) — GUI app relaunch or a unit would make it durable.
 - **v0.7.4 released**: tag + GitHub Release with all installers (run 28096210159 SUCCESS —
   v0.7.3's release run had failed; nothing to fix in release.yml after all).
