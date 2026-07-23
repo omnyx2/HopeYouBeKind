@@ -227,6 +227,19 @@ pub enum Request {
         #[serde(default)]
         proto: Option<String>,
     },
+
+    // --- domain split-tunnel (docs/SPLIT_TUNNEL.md) — LOCAL to this node ------------------
+    /// Add a local split rule: traffic to `domain` (and subdomains) egresses via `mesh`'s exit.
+    SplitAdd { domain: String, mesh: MeshId },
+    /// Remove a split rule by exact `domain`.
+    SplitDel { domain: String },
+    /// List split rules + whether the proxy is currently active. Returns [`Response::Split`].
+    SplitList,
+    /// Turn split mode ON for `mesh`: start the local DNS proxy + point the host resolver at it,
+    /// so this mesh's rules take effect. Default internet is untouched.
+    SplitOn { mesh: MeshId },
+    /// Turn split mode OFF: stop the proxy, remove injected `/32` routes, restore DNS.
+    SplitOff,
 }
 
 /// A P-C6 wrapped invite: the serialized [`InviteBlob`] sealed under (algo, salt, n).
@@ -284,6 +297,8 @@ pub enum Response {
     Extensions(Vec<ExtensionView>),
     /// Discovered services (from `ListServices`).
     Services(Vec<ServiceView>),
+    /// Split-tunnel state (from `SplitList`).
+    Split(SplitView),
     /// A pushed event on a `Subscribe`'d connection — NOT a reply to a request. `seq` is
     /// monotonic per connection; a gap means events were dropped (the connector lagged)
     /// and it should re-query current state. A `topic` of `"_lagged"` is the explicit
@@ -327,6 +342,23 @@ pub struct ServiceView {
     pub meta: serde_json::Value,
     /// Whether the owner is currently live (recent data-plane contact); self = always true.
     pub online: bool,
+}
+
+/// Split-tunnel state (from `SplitList`, docs/SPLIT_TUNNEL.md). Local to this node.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SplitView {
+    /// The configured domain→mesh rules.
+    pub rules: Vec<SplitRuleView>,
+    /// The mesh whose split proxy is currently running, or `None` if split mode is off.
+    #[serde(default)]
+    pub active_mesh: Option<MeshId>,
+}
+
+/// One split-tunnel rule projected for the UI/CLI.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SplitRuleView {
+    pub domain: String,
+    pub mesh: MeshId,
 }
 
 /// A self-contained invite: everything a joiner needs to install the mesh and key

@@ -295,6 +295,22 @@ struct State {
     /// by `EnableExtension`, persisted to `extensions.json` (0600). A connector's `Hello`
     /// token is checked against these; a grant gates which scopes the connection holds.
     extensions: HashMap<String, ExtensionGrant>,
+    /// Domain split-tunnel rules (docs/SPLIT_TUNNEL.md) — LOCAL to this node, persisted to
+    /// `split.json` (0600), never gossiped. Each maps a domain to the mesh whose exit its
+    /// traffic egresses through.
+    split_rules: Vec<dns_split::SplitRule>,
+    /// The running split-tunnel proxy, if split mode is on (`None` = off).
+    split: Option<SplitActive>,
+}
+
+/// A running domain split-tunnel session (docs/SPLIT_TUNNEL.md).
+struct SplitActive {
+    /// The mesh whose tun/exit matched traffic is routed into.
+    mesh: MeshId,
+    /// The DNS-proxy task; aborted on `SplitOff`.
+    task: tokio::task::JoinHandle<()>,
+    /// Every `/32` IP we injected a host route for — removed on `SplitOff`.
+    injected: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Ipv4Addr>>>,
 }
 
 /// One enabled extension's grant — the local record a connector authenticates against.
@@ -376,6 +392,11 @@ enum PostAction {
     Bringup(Bringup),
     /// Full tunnel just went up for this mesh — start the kill-switch.
     ArmKillSwitch(MeshId),
+    /// Start domain split-tunnel for this mesh (bind the DNS proxy + point the host resolver at
+    /// it). Async work done after the lock is released (docs/SPLIT_TUNNEL.md).
+    SplitOn(MeshId),
+    /// Stop domain split-tunnel (abort proxy, remove injected `/32` routes, restore DNS).
+    SplitOff,
     /// Cleanly stop the whole daemon (after the response is sent to the client).
     Shutdown,
 }
@@ -531,6 +552,7 @@ fn load_backup(path: &std::path::Path) -> Vec<PersistedMesh> {
 fn persist(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
     persist_extensions(st);
+    persist_split(st);
     for ms in st.meshes.values() {
         let p = to_persisted(ms);
         if let Ok(json) = serde_json::to_vec_pretty(&p) {
@@ -582,6 +604,29 @@ fn persist_extensions(st: &State) {
             }
         }
     }
+}
+
+/// Persist the local split-tunnel rules to `split.json` (0600). Called from [`persist`].
+fn persist_split(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    if let Ok(json) = serde_json::to_vec_pretty(&st.split_rules) {
+        let f = dir.join("split.json");
+        if std::fs::write(&f, &json).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// Load the split-tunnel rules at startup. Missing/corrupt file ⇒ empty.
+fn load_split(dir: &std::path::Path) -> Vec<dns_split::SplitRule> {
+    std::fs::read(dir.join("split.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 /// Load the extension grants at startup (id → grant). Missing/corrupt file ⇒ empty.
@@ -707,7 +752,51 @@ fn request_mutates(req: &Request) -> bool {
             | Request::ExpelMember { .. }
             | Request::EnableExtension { .. }
             | Request::DisableExtension { .. }
+            | Request::SplitAdd { .. }
+            | Request::SplitDel { .. }
     )
+}
+
+/// Add a local split-tunnel rule (idempotent on `domain`). Persisted; takes effect the next time
+/// split mode is turned on for that mesh.
+fn split_add(st: &mut State, domain: String, mesh: MeshId) -> Response {
+    let domain = domain.trim().trim_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return err("empty domain");
+    }
+    if !st.meshes.contains_key(&mesh) {
+        return no_mesh(mesh);
+    }
+    st.split_rules.retain(|r| r.domain != domain);
+    st.split_rules.push(dns_split::SplitRule { domain, mesh });
+    Response::Ok
+}
+
+/// Remove a local split-tunnel rule by exact domain.
+fn split_del(st: &mut State, domain: String) -> Response {
+    let domain = domain.trim().trim_matches('.').to_ascii_lowercase();
+    let before = st.split_rules.len();
+    st.split_rules.retain(|r| r.domain != domain);
+    if st.split_rules.len() == before {
+        err("no such split rule")
+    } else {
+        Response::Ok
+    }
+}
+
+/// Project the split-tunnel state for the CLI/GUI.
+fn split_list(st: &State) -> Response {
+    Response::Split(lattice_mesh::ipc::SplitView {
+        rules: st
+            .split_rules
+            .iter()
+            .map(|r| lattice_mesh::ipc::SplitRuleView {
+                domain: r.domain.clone(),
+                mesh: r.mesh,
+            })
+            .collect(),
+        active_mesh: st.split.as_ref().map(|s| s.mesh),
+    })
 }
 
 #[tokio::main]
@@ -753,6 +842,13 @@ async fn main() -> anyhow::Result<()> {
         let (bus, _) = tokio::sync::broadcast::channel::<MeshEvent>(EVENT_BUS_CAP);
         st.bus = Some(bus);
         if let Some(dir) = &pdir {
+            st.split_rules = load_split(dir);
+            if !st.split_rules.is_empty() {
+                elog!(
+                    "meshd: loaded {} split-tunnel rule(s)",
+                    st.split_rules.len()
+                );
+            }
             st.extensions = load_extensions(dir);
             if !st.extensions.is_empty() {
                 elog!("meshd: loaded {} extension grant(s)", st.extensions.len());
@@ -1353,6 +1449,10 @@ where
                         Some(PostAction::ArmKillSwitch(mesh)) => {
                             arm_kill_switch(mesh, Arc::clone(&state))
                         }
+                        Some(PostAction::SplitOn(mesh)) => {
+                            split_enable(mesh, Arc::clone(&state)).await
+                        }
+                        Some(PostAction::SplitOff) => split_disable(Arc::clone(&state)).await,
                         Some(PostAction::Shutdown) => shutdown = true,
                         None => {}
                     }
@@ -2185,6 +2285,79 @@ fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
 /// Every ~20s probe the internet THROUGH the tunnel (TCP connect to 1.1.1.1:443 —
 /// it travels TUN→exit, so success proves the exit forwards). The moment a probe
 /// fails, auto-revert to direct internet so the user is never cut off.
+/// **RISK 🔴 HIGH** — turn ON domain split-tunnel (docs/SPLIT_TUNNEL.md): point the host resolver
+/// at our local DNS proxy and spawn it, so this mesh's rules pull matched domains' IPs into the
+/// mesh via `/32` routes. Does NOT change the default route — normal internet is untouched.
+/// Idempotent-ish: a prior session is stopped first.
+async fn split_enable(mesh: MeshId, state: Arc<Mutex<State>>) {
+    // Stop any prior session cleanly first.
+    split_disable(Arc::clone(&state)).await;
+
+    // Snapshot what the proxy needs: the mesh's tun name + the rules for THIS mesh.
+    let (tun, rules) = {
+        let st = state.lock().unwrap();
+        let tun = st.meshes.get(&mesh).and_then(|m| m.tun_name.clone());
+        let rules: Vec<dns_split::SplitRule> = st
+            .split_rules
+            .iter()
+            .filter(|r| r.mesh == mesh)
+            .cloned()
+            .collect();
+        (tun, rules)
+    };
+    let Some(tun) = tun else {
+        elog!("meshd: split-tunnel: mesh {mesh} has no data-plane tun (is the data plane up?)");
+        return;
+    };
+
+    // Detect the real upstream resolver BEFORE we hijack DNS, so normal names still resolve.
+    let upstream = tokio::task::spawn_blocking(dns_split::detect_upstream)
+        .await
+        .unwrap_or_else(|_| "1.1.1.1:53".parse().unwrap());
+
+    // Point the host resolver at our proxy (backs up the prior DNS for restore).
+    let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+    if let Err(e) = tokio::task::spawn_blocking(move || exit::set_dns(&[loopback]))
+        .await
+        .unwrap_or(Ok(()))
+    {
+        elog!("meshd: split-tunnel: could not set host DNS to the proxy: {e}");
+        return;
+    }
+
+    let injected = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let task = tokio::spawn(dns_split::run_proxy(
+        tun.clone(),
+        rules,
+        upstream,
+        std::sync::Arc::clone(&injected),
+    ));
+    state.lock().unwrap().split = Some(SplitActive {
+        mesh,
+        task,
+        injected,
+    });
+    elog!("meshd: split-tunnel ON for mesh {mesh} (upstream {upstream}, tun {tun})");
+}
+
+/// **RISK 🔴 HIGH** — turn OFF domain split-tunnel: abort the proxy, remove every injected `/32`
+/// host route, and restore the host DNS. Safe no-op if split mode was already off.
+async fn split_disable(state: Arc<Mutex<State>>) {
+    let active = state.lock().unwrap().split.take();
+    let Some(active) = active else { return };
+    active.task.abort();
+    let ips: Vec<Ipv4Addr> = active.injected.lock().unwrap().iter().copied().collect();
+    tokio::task::spawn_blocking(move || {
+        for ip in ips {
+            exit::unroute_host(ip);
+        }
+        exit::restore_dns();
+    })
+    .await
+    .ok();
+    elog!("meshd: split-tunnel OFF (routes + DNS restored)");
+}
+
 fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
     tokio::spawn(async move {
         loop {
@@ -2707,6 +2880,19 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
         } => (advertise(st, mesh, proto, port, name, meta), None),
         Request::Unadvertise { mesh, proto } => (unadvertise(st, mesh, proto), None),
         Request::ListServices { mesh, proto } => (list_services(st, mesh, proto), None),
+
+        // --- domain split-tunnel (docs/SPLIT_TUNNEL.md), local to this node ------------------
+        Request::SplitAdd { domain, mesh } => (split_add(st, domain, mesh), None),
+        Request::SplitDel { domain } => (split_del(st, domain), None),
+        Request::SplitList => (split_list(st), None),
+        Request::SplitOn { mesh } => {
+            if !st.meshes.contains_key(&mesh) {
+                (no_mesh(mesh), None)
+            } else {
+                (Response::Ok, Some(PostAction::SplitOn(mesh)))
+            }
+        }
+        Request::SplitOff => (Response::Ok, Some(PostAction::SplitOff)),
 
         Request::CreateInvite {
             mesh,
