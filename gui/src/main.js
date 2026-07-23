@@ -776,6 +776,11 @@ async function renderConfigs(id) {
   ).join("");
   const peerOpts = d.members.filter((mb) => !mb.is_me)
     .map((mb) => `<option value="${mb.id}">#${mb.id} ${esc(mb.name)}</option>`).join("");
+  // Split-tunnel exit choices: other members only (routing to yourself makes no sense).
+  const splitExitOpts = [`<option value="">exit via…</option>`].concat(
+    d.members.filter((mb) => !mb.is_me)
+      .map((mb) => `<option value="${mb.id}">#${mb.id} ${esc(mb.name)}</option>`)
+  ).join("");
   el("mesh-config-body").innerHTML = `
     <div class="card">
       <div class="card-head"><h2 class="card-title">Egress &amp; routing</h2></div>
@@ -819,10 +824,11 @@ async function renderConfigs(id) {
     </div>
     <div class="card" id="split-card">
       <div class="card-head"><h2 class="card-title">Domain split-tunnel <span class="muted small">(this computer only)</span></h2></div>
-      <p class="muted small">Keep normal internet direct, but send specific domains (and their subdomains) out through this mesh's exit. Learned via DNS — works for HTTPS, adapts to IP changes.</p>
+      <p class="muted small">Keep normal internet direct (your own network); send specific domains (and their subdomains) out through a chosen exit member. Learned via DNS — works for HTTPS, adapts to IP changes. The rule carries its own exit; the mesh's own exit isn't touched.</p>
       <div id="split-list" class="muted small">loading…</div>
       <div class="add-row">
         <input id="split-domain" placeholder="domain — e.g. pornhub.com (covers *.pornhub.com)" />
+        <select id="split-exit" class="select">${splitExitOpts}</select>
         <button class="small-btn" id="split-add">add domain</button>
         <button class="small-btn" id="split-toggle">on/off</button>
       </div>
@@ -853,7 +859,9 @@ async function renderConfigs(id) {
   el("split-add").onclick = async () => {
     const dom = el("split-domain").value.trim().replace(/^\.+|\.+$/g, "").toLowerCase();
     if (!dom || !dom.includes(".")) return toast("enter a domain like pornhub.com");
-    try { await meshd({ SplitAdd: { domain: dom, mesh: id } }); toast(`added *.${dom}`); } catch (e) { toast(String(e)); }
+    const ev = el("split-exit").value;
+    if (!ev) return toast("pick which member is the exit for this domain");
+    try { await meshd({ SplitAdd: { domain: dom, mesh: id, exit: parseInt(ev, 10) } }); toast(`added *.${dom}`); } catch (e) { toast(String(e)); }
     el("split-domain").value = "";
     renderSplit(id);
   };
@@ -884,7 +892,7 @@ async function renderSplit(id) {
     `<div class="kv"><span>status</span>${state}</div>` +
     (mine.length
       ? mine.map((r) =>
-          `<div class="kv"><span>*.${esc(r.domain)}</span>` +
+          `<div class="kv"><span>*.${esc(r.domain)} <span class="muted small">→ ${r.exit ? "#" + r.exit : "mesh exit"}</span></span>` +
           `<button class="small-btn" data-split-rm="${esc(r.domain)}">remove</button></div>`).join("")
       : `<div class="muted small">No domains yet — add one below.</div>`);
   box.querySelectorAll("[data-split-rm]").forEach((b) => b.onclick = async () => {

@@ -61,11 +61,19 @@ restart (or when you add a rule while it's already on — the proxy snapshots ru
 Requires root (bind :53, edit routes/DNS) — meshd already runs elevated. If the mesh's data
 plane isn't up (no tun), `split on` safely bails **before** binding :53 or touching DNS.
 
+## Per-domain exit (the rule carries its own exit)
+
+Each rule specifies WHICH member it exits through, independent of the mesh-wide exit: `lattice
+split add pornhub.com <mesh> <exit-member>`. So you never set (or misconfigure) the mesh exit —
+normal traffic keeps using your own network, and only the matched domain goes to the rule's exit.
+Mechanism: the DNS proxy records `matched-IP → rule.exit` in a shared `SharedSplitRoutes` map; the
+data-plane run loop checks it BEFORE the flow table and sends that IP to `rule.exit` (bypassing
+the mesh exit). Local, never gossiped. The exit is guarded: it can't be this node itself or an
+unknown member (the "set exit to self → can't connect" trap). `exit = 0` falls back to the mesh's
+configured exit (back-compat for pre-per-domain `split.json`).
+
 ## Limits / not-yet
 
-- **One exit per mesh.** All split rules for a mesh use that mesh's single configured exit
-  (`lattice exit`). Per-domain *different* exits need `FlowAction::ToExit(Some(NodeId))` finished
-  (roster pubkey→member-id resolution; `dataplane.rs` "phase 2"). See docs/FLOW_TABLE.md.
 - **A-records / IPv4 only.** AAAA (IPv6) isn't injected yet.
 - **DNS is resolved locally** (via the captured upstream), not through the exit. Fine when the
   block is at the connection level (the campus case); a site behind DNS poisoning would need the

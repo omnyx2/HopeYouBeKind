@@ -15,6 +15,21 @@ commit. The durable record; `TEMP.md` only holds open items.
   pin → en0 (no loop — fix 19465bb); **full-tunnel egress = Oracle on try 1** and stays up past
   the kill-switch window. Closes the "clean verification" TEMP item. — config/deploy, no commit
 
+## Per-domain split-tunnel exit — BUILT + LIVE-verified (2026-07-23)
+
+The user's model: split-tunnel keeps normal traffic on your OWN network by default; only registered
+domains use a designated exit — and the RULE should carry the exit, not a mesh-wide setting (the
+recurring "set exit to self #7 → can't connect" bug came from the mesh-exit coupling).
+- SplitRule gains `exit: MemberId`; a shared `SharedSplitRoutes` map (matched IP → rule exit) is
+  passed meshd↔run loop; the run loop checks it BEFORE the flow table → routes that IP to the
+  rule's exit, bypassing the mesh exit. Local, no wire change, exit=0 falls back to mesh exit.
+- Guard: exit can't be self or an unknown member (kills the trap at the source).
+- CLI `split add <domain> <mesh> <exit>`; GUI exit-member picker.
+- **LIVE (build 02a37dc): mesh exit = NONE, rule pornhub→member#1(Oracle); pornhub egressed via
+  Oracle (utun6, HTTP 200, Oracle RX+21712) while ifconfig.me stayed campus; off restored clean.**
+- Commit 02a37dc (+ docs/GUI/CHANGELOG follow-up). Root-cause note: the exit-drift to #2/#7 was
+  the USER setting a bad mesh exit in the GUI; per-domain exit + the self-guard remove the whole class.
+
 ## Fleet clean-slate reinstall to v0.7.5 (2026-07-23)
 
 Tagged v0.7.5 @ 975d26c (F1 split-tunnel + F2 conns); CI built all-platform installers.

@@ -11,6 +11,16 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [Unreleased]
+
+### Added
+- **Per-domain split-tunnel exit** — each split rule now carries its OWN exit member
+  (`lattice split add <domain> <mesh> <exit>`), independent of the mesh-wide exit. So normal
+  traffic keeps using your own network and you never touch the mesh exit. Guarded: the exit can't
+  be this node itself or an unknown member (fixes the "set exit to self → can't connect" trap).
+  Live-verified: with the mesh exit set to *none*, `pornhub.com` still egressed via the chosen
+  member (Oracle) while everything else stayed direct. GUI: an exit-member picker on the split card.
+
 ## [0.7.5] — 2026-07-23
 
 ### Added
