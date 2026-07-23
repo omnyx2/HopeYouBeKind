@@ -171,6 +171,22 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     }
 }
 
+/// **RISK 🔴 HIGH** — add a `/32` host route so ONLY `ip`'s traffic enters the mesh `iface` (tun),
+/// WITHOUT touching the default route (domain split-tunnel, docs/SPLIT_TUNNEL.md). Idempotent
+/// (delete-first). Everything else keeps using the real default. Inverse: [`unroute_host`].
+#[cfg(target_os = "macos")]
+pub fn route_host_via_iface(ip: std::net::Ipv4Addr, iface: &str) -> Result<(), String> {
+    let s = ip.to_string();
+    run("route", &["-q", "delete", "-host", &s]);
+    run_checked("route", &["-q", "add", "-host", &s, "-interface", iface])
+}
+
+/// **RISK 🟡 MED** — remove a `/32` host route added by [`route_host_via_iface`] (best-effort).
+#[cfg(target_os = "macos")]
+pub fn unroute_host(ip: std::net::Ipv4Addr) {
+    run("route", &["-q", "delete", "-host", &ip.to_string()]);
+}
+
 /// **RISK 🔴 HIGH** (restores the live default; if it fails the host is stranded on a dead tunnel).
 /// macOS full-tunnel OFF (inverse of [`route_through`]): restore the saved default gateway and
 /// delete the `/32` exit pin. Best-effort.
@@ -427,6 +443,22 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     } else {
         Err(errs.join("; "))
     }
+}
+
+/// **RISK 🔴 HIGH** — add a `/32` host route so ONLY `ip`'s traffic enters the mesh `iface` (tun),
+/// WITHOUT touching the default route (domain split-tunnel). `ip route replace` is idempotent.
+#[cfg(target_os = "linux")]
+pub fn route_host_via_iface(ip: std::net::Ipv4Addr, iface: &str) -> Result<(), String> {
+    run_checked(
+        "ip",
+        &["route", "replace", &format!("{ip}/32"), "dev", iface],
+    )
+}
+
+/// **RISK 🟡 MED** — remove a `/32` host route added by [`route_host_via_iface`] (best-effort).
+#[cfg(target_os = "linux")]
+pub fn unroute_host(ip: std::net::Ipv4Addr) {
+    run("ip", &["route", "del", &format!("{ip}/32")]);
 }
 
 /// **RISK 🔴 HIGH** (restores the live default; failure strands the host on a dead tunnel).
@@ -732,6 +764,33 @@ try {{
     Ok(())
 }
 
+/// **RISK 🔴 HIGH** — add a `/32` host route so ONLY `ip`'s traffic enters the mesh `iface` (the
+/// Wintun adapter), WITHOUT touching the default (domain split-tunnel). Delete-first idempotent.
+#[cfg(target_os = "windows")]
+pub fn route_host_via_iface(ip: std::net::Ipv4Addr, iface: &str) -> Result<(), String> {
+    let script = format!(
+        r#"
+$ErrorActionPreference='Stop'
+try {{
+  $idx = (Get-NetAdapter -Name '{iface}' -ErrorAction SilentlyContinue).ifIndex
+  if (-not $idx) {{ throw 'tun adapter "{iface}" not found' }}
+  Remove-NetRoute -DestinationPrefix '{ip}/32' -Confirm:$false -ErrorAction SilentlyContinue
+  New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex $idx -NextHop 0.0.0.0 -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+  exit 0
+}} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}
+"#
+    );
+    ps_checked(&script)
+}
+
+/// **RISK 🟡 MED** — remove a `/32` host route added by [`route_host_via_iface`] (best-effort).
+#[cfg(target_os = "windows")]
+pub fn unroute_host(ip: std::net::Ipv4Addr) {
+    ps(&format!(
+        "Remove-NetRoute -DestinationPrefix '{ip}/32' -Confirm:$false -ErrorAction SilentlyContinue"
+    ));
+}
+
 /// **RISK 🔴 HIGH** (removes the /1 overrides; if it silently fails ALL traffic stays on the dead tunnel).
 /// Windows full-tunnel OFF (inverse of [`route_through`]): remove the two `/1` overrides (this is
 /// what hands the default back to the real gateway) + the `/32` pin. Each removal is independent
@@ -862,6 +921,12 @@ pub fn route_through(_tun: &str, _exit_ip: IpAddr) -> Result<(), String> {
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn restore_routes() {}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn route_host_via_iface(_ip: std::net::Ipv4Addr, _iface: &str) -> Result<(), String> {
+    Err("split-tunnel routing not implemented on this platform".into())
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn unroute_host(_ip: std::net::Ipv4Addr) {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn enable_nat(_isolate: bool) {
     tracing::warn!("exit-node NAT not implemented on this platform");
