@@ -22,7 +22,9 @@
 
 use lattice_proto::wire_v2::MeshId;
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
 /// One local split-tunnel rule: traffic to `domain` (and its subdomains) egresses via `mesh`'s
 /// exit. Local to this node — never gossiped (docs/SPLIT_TUNNEL.md). The mesh's current exit
@@ -148,6 +150,129 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
             return None;
         }
     }
+}
+
+/// The address the split-tunnel DNS proxy binds (loopback:53). Apps are pointed here (via
+/// `exit::set_dns([127.0.0.1])`) while split mode is on.
+pub const PROXY_BIND: &str = "127.0.0.1:53";
+
+/// Best-effort: the host's REAL upstream resolver to forward proxied queries to, so normal
+/// (non-split) names still resolve exactly as before. Reads the OS resolver config; falls back to
+/// Cloudflare `1.1.1.1:53` if none is found. MUST be called BEFORE pointing the host at our proxy
+/// (otherwise it would read `127.0.0.1`).
+pub fn detect_upstream() -> SocketAddr {
+    let fallback: SocketAddr = "1.1.1.1:53".parse().unwrap();
+    // macOS: `scutil --dns` lists the active resolvers; take the first non-loopback nameserver.
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("scutil").arg("--dns").output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let l = line.trim();
+            if let Some(rest) = l.strip_prefix("nameserver[") {
+                if let Some((_, ip)) = rest.split_once("] : ") {
+                    if let Ok(a) = ip.trim().parse::<std::net::IpAddr>() {
+                        if !a.is_loopback() {
+                            return SocketAddr::new(a, 53);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Linux (and macOS fallback): /etc/resolv.conf first non-loopback `nameserver`.
+    if let Ok(txt) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in txt.lines() {
+            if let Some(ip) = line.trim().strip_prefix("nameserver ") {
+                if let Ok(a) = ip.trim().parse::<std::net::IpAddr>() {
+                    if !a.is_loopback() {
+                        return SocketAddr::new(a, 53);
+                    }
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// Run the split-tunnel DNS proxy until the task is aborted. Binds [`PROXY_BIND`], and for each
+/// query: forwards it to `upstream`, parses the response for A records, and — if the queried name
+/// matches any rule in `rules` — injects a `/32` host route for each answered IP into `tun` (via
+/// `exit::route_host_via_iface`, recording it in `injected` for cleanup), then relays the answer
+/// back to the app unchanged. Non-matching names just pass through. Rules are a static snapshot
+/// taken at enable time (re-toggle split mode to pick up a newly-added rule).
+pub async fn run_proxy(
+    tun: String,
+    rules: Vec<SplitRule>,
+    upstream: SocketAddr,
+    injected: Arc<Mutex<HashSet<Ipv4Addr>>>,
+) {
+    let sock = match tokio::net::UdpSocket::bind(PROXY_BIND).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::warn!("split-tunnel: cannot bind {PROXY_BIND} ({e}); DNS proxy not started");
+            return;
+        }
+    };
+    tracing::warn!(%upstream, tun, rules = rules.len(), "split-tunnel DNS proxy listening");
+    let rules = Arc::new(rules);
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let (n, client) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let query = buf[..n].to_vec();
+        let (sock, rules, injected, tun) = (
+            Arc::clone(&sock),
+            Arc::clone(&rules),
+            Arc::clone(&injected),
+            tun.clone(),
+        );
+        tokio::spawn(async move {
+            let _ = handle_query(&sock, client, &query, upstream, &rules, &injected, &tun).await;
+        });
+    }
+}
+
+/// Forward one query upstream, inject routes for a matched name, relay the answer to `client`.
+async fn handle_query(
+    sock: &tokio::net::UdpSocket,
+    client: SocketAddr,
+    query: &[u8],
+    upstream: SocketAddr,
+    rules: &[SplitRule],
+    injected: &Arc<Mutex<HashSet<Ipv4Addr>>>,
+    tun: &str,
+) -> std::io::Result<()> {
+    // Ephemeral socket to the upstream resolver (its own path uses the real default route, so a
+    // split /32 can't loop the resolver traffic into the mesh).
+    let up = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    up.send_to(query, upstream).await?;
+    let mut rbuf = vec![0u8; 4096];
+    let n = match tokio::time::timeout(std::time::Duration::from_secs(4), up.recv(&mut rbuf)).await
+    {
+        Ok(Ok(n)) => n,
+        _ => return Ok(()), // upstream timeout/err: drop; the app will retry
+    };
+    let resp = &rbuf[..n];
+    if let Some((qname, ips)) = parse_a_records(resp) {
+        if rules.iter().any(|r| domain_matches(&r.domain, &qname)) {
+            for ip in ips {
+                let fresh = injected.lock().unwrap().insert(ip);
+                if fresh {
+                    let tun_s = tun.to_string();
+                    // Route injection shells out — do it off the async loop.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::exit::route_host_via_iface(ip, &tun_s)
+                    })
+                    .await;
+                    tracing::warn!(%ip, name = %qname, tun, "split-tunnel: routed via mesh exit");
+                }
+            }
+        }
+    }
+    sock.send_to(resp, client).await?;
+    Ok(())
 }
 
 #[cfg(test)]
