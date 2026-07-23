@@ -298,8 +298,9 @@ def cmd_split(sock, a):
     action = a.action
     if action == "add":
         mid = resolve_mesh(sock, a.mesh)
-        call(sock, {"SplitAdd": {"domain": a.domain, "mesh": mid}})
-        print(f"split rule added: *.{a.domain} → mesh {mid}'s exit. `lattice split on {mid}` to activate.")
+        exit_id = resolve_member(sock, mid, a.exit)
+        call(sock, {"SplitAdd": {"domain": a.domain, "mesh": mid, "exit": exit_id}})
+        print(f"split rule added: *.{a.domain} → member #{exit_id} in mesh {mid}. `lattice split on {mid}` to activate.")
     elif action == "rm":
         call(sock, {"SplitDel": {"domain": a.domain}})
         print(f"split rule removed: {a.domain}")
@@ -317,9 +318,11 @@ def cmd_split(sock, a):
         print(f"split-tunnel: {'ON (mesh %s)' % act if act is not None else 'OFF'}")
         rules = v.get("rules", [])
         if not rules:
-            print("  (no rules — `lattice split add <domain> <mesh>`)")
+            print("  (no rules — `lattice split add <domain> <mesh> <exit>`)")
         for rule in rules:
-            print(f"  *.{rule['domain']:<24} → mesh {rule['mesh']}")
+            ex = rule.get("exit", 0)
+            tgt = f"member #{ex}" if ex else f"mesh {rule['mesh']} exit"
+            print(f"  *.{rule['domain']:<24} → {tgt}  (mesh {rule['mesh']})")
 
 
 def cmd_recipher(sock, a):
@@ -937,9 +940,10 @@ def build_parser():
 
     s = sub.add_parser("split", help="domain split-tunnel: send only specific domains via a mesh exit")
     ssub = s.add_subparsers(dest="action")
-    sp = ssub.add_parser("add", help="add a domain→mesh rule (matches subdomains too)")
+    sp = ssub.add_parser("add", help="add a domain→exit rule (matches subdomains too)")
     sp.add_argument("domain", help="e.g. pornhub.com (covers *.pornhub.com)")
-    sp.add_argument("mesh", help="mesh id or name whose exit carries it")
+    sp.add_argument("mesh", help="mesh id or name the exit member is in")
+    sp.add_argument("exit", help="the exit member (id or name) this domain routes through — e.g. oracle")
     sp = ssub.add_parser("rm", help="remove a domain rule")
     sp.add_argument("domain")
     ssub.add_parser("list", help="list rules + on/off state")

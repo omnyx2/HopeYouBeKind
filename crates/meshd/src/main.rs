@@ -53,8 +53,8 @@ use lattice_mesh::registry::{self, ServiceEntry, ServiceRecord};
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
-    SharedEndpoint, SharedExit, SharedTraffic, Traffic, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_FLOWS,
-    CTRL_REGISTRY, CTRL_REVOKE, CTRL_ROSTER,
+    SharedEndpoint, SharedExit, SharedSplitRoutes, SharedTraffic, Traffic, CTRL_ALLCLEAR,
+    CTRL_ATTACK, CTRL_FLOWS, CTRL_REGISTRY, CTRL_REVOKE, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::flow::FlowRule;
@@ -187,6 +187,10 @@ struct MeshState {
     links: PeerLinks,
     /// The egress member, shared with the loop so SetExit steers it live.
     exit_sel: SharedExit,
+    /// Domain split-tunnel routes (matched IP → its rule's exit member), shared with the loop so
+    /// split traffic goes to the rule's exit without touching the mesh-wide exit. Empty when
+    /// split mode is off (docs/SPLIT_TUNNEL.md).
+    split_routes: SharedSplitRoutes,
     /// The OS interface name of this mesh's TUN (set at bringup) — needed to divert
     /// the default route for full-tunnel egress.
     tun_name: Option<String>,
@@ -412,6 +416,7 @@ struct Bringup {
     epoch: u64,
     links: PeerLinks,
     exit_sel: SharedExit,
+    split_routes: SharedSplitRoutes,
     my_endpoint: SharedEndpoint,
     decrypt_fails: DecryptFails,
     traffic: SharedTraffic,
@@ -682,6 +687,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
     }
     let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(p.exit));
+    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
@@ -700,6 +706,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         epoch: p.epoch,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
+        split_routes: Arc::clone(&split_routes),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
@@ -717,6 +724,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         secret: p.secret,
         links,
         exit_sel,
+        split_routes,
         tun_name: None,
         my_endpoint,
         dp_port: 0,
@@ -759,16 +767,29 @@ fn request_mutates(req: &Request) -> bool {
 
 /// Add a local split-tunnel rule (idempotent on `domain`). Persisted; takes effect the next time
 /// split mode is turned on for that mesh.
-fn split_add(st: &mut State, domain: String, mesh: MeshId) -> Response {
+fn split_add(st: &mut State, domain: String, mesh: MeshId, exit: MemberId) -> Response {
     let domain = domain.trim().trim_matches('.').to_ascii_lowercase();
     if domain.is_empty() {
         return err("empty domain");
     }
-    if !st.meshes.contains_key(&mesh) {
+    let Some(ms) = st.meshes.get(&mesh) else {
         return no_mesh(mesh);
+    };
+    // Guard the recurring "can't connect" trap: an exit must be a REAL other member, not yourself
+    // and not an unknown id. `0` = fall back to the mesh's configured exit.
+    if exit != 0 {
+        if exit == ms.my_id() {
+            return err(
+                "exit can't be this node itself — pick another member (e.g. the exit node)",
+            );
+        }
+        if !ms.roster().iter().any(|c| c.id == exit) {
+            return err("no such member in this mesh for the exit");
+        }
     }
     st.split_rules.retain(|r| r.domain != domain);
-    st.split_rules.push(dns_split::SplitRule { domain, mesh });
+    st.split_rules
+        .push(dns_split::SplitRule { domain, mesh, exit });
     Response::Ok
 }
 
@@ -793,6 +814,7 @@ fn split_list(st: &State) -> Response {
             .map(|r| lattice_mesh::ipc::SplitRuleView {
                 domain: r.domain.clone(),
                 mesh: r.mesh,
+                exit: r.exit,
             })
             .collect(),
         active_mesh: st.split.as_ref().map(|s| s.mesh),
@@ -1681,6 +1703,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         applied_tx,
         b.decrypt_fails,
         b.traffic,
+        b.split_routes,
     ));
     // Record the loop's abort handle (RemoveMesh stops it) + the command sender.
     if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
@@ -2293,17 +2316,24 @@ async fn split_enable(mesh: MeshId, state: Arc<Mutex<State>>) {
     // Stop any prior session cleanly first.
     split_disable(Arc::clone(&state)).await;
 
-    // Snapshot what the proxy needs: the mesh's tun name + the rules for THIS mesh.
-    let (tun, rules) = {
+    // Snapshot what the proxy needs: the mesh's tun name, its split-routes handle (shared with
+    // the data-plane loop), and the rules for THIS mesh.
+    let (tun, split_routes, rules) = {
         let st = state.lock().unwrap();
-        let tun = st.meshes.get(&mesh).and_then(|m| m.tun_name.clone());
+        let m = st.meshes.get(&mesh);
+        let tun = m.and_then(|m| m.tun_name.clone());
+        let split_routes = m.map(|m| Arc::clone(&m.split_routes));
         let rules: Vec<dns_split::SplitRule> = st
             .split_rules
             .iter()
             .filter(|r| r.mesh == mesh)
             .cloned()
             .collect();
-        (tun, rules)
+        (tun, split_routes, rules)
+    };
+    let Some(split_routes) = split_routes else {
+        elog!("meshd: split-tunnel: mesh {mesh} not found");
+        return;
     };
     let Some(tun) = tun else {
         elog!("meshd: split-tunnel: mesh {mesh} has no data-plane tun (is the data plane up?)");
@@ -2331,6 +2361,7 @@ async fn split_enable(mesh: MeshId, state: Arc<Mutex<State>>) {
         rules,
         upstream,
         std::sync::Arc::clone(&injected),
+        Arc::clone(&split_routes),
     ));
     state.lock().unwrap().split = Some(SplitActive {
         mesh,
@@ -2343,7 +2374,17 @@ async fn split_enable(mesh: MeshId, state: Arc<Mutex<State>>) {
 /// **RISK 🔴 HIGH** — turn OFF domain split-tunnel: abort the proxy, remove every injected `/32`
 /// host route, and restore the host DNS. Safe no-op if split mode was already off.
 async fn split_disable(state: Arc<Mutex<State>>) {
-    let active = state.lock().unwrap().split.take();
+    let active = {
+        let mut st = state.lock().unwrap();
+        let active = st.split.take();
+        // Clear the data-plane split-route table for that mesh so its traffic reverts to normal.
+        if let Some(a) = &active {
+            if let Some(m) = st.meshes.get(&a.mesh) {
+                m.split_routes.lock().unwrap().clear();
+            }
+        }
+        active
+    };
     let Some(active) = active else { return };
     active.task.abort();
     let ips: Vec<Ipv4Addr> = active.injected.lock().unwrap().iter().copied().collect();
@@ -2882,7 +2923,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
         Request::ListServices { mesh, proto } => (list_services(st, mesh, proto), None),
 
         // --- domain split-tunnel (docs/SPLIT_TUNNEL.md), local to this node ------------------
-        Request::SplitAdd { domain, mesh } => (split_add(st, domain, mesh), None),
+        Request::SplitAdd { domain, mesh, exit } => (split_add(st, domain, mesh, exit), None),
         Request::SplitDel { domain } => (split_del(st, domain), None),
         Request::SplitList => (split_list(st), None),
         Request::SplitOn { mesh } => {
@@ -3132,6 +3173,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     }
     let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
@@ -3151,6 +3193,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         epoch,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
+        split_routes: Arc::clone(&split_routes),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
@@ -3170,6 +3213,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             secret,
             links,
             exit_sel,
+            split_routes,
             tun_name: None,
             my_endpoint,
             dp_port: 0,
@@ -3300,6 +3344,7 @@ fn create_mesh(
     let secret: [u8; 32] = rand::random();
     let links = seed_links(HashMap::new());
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
@@ -3315,6 +3360,7 @@ fn create_mesh(
         epoch: 0,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
+        split_routes: Arc::clone(&split_routes),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
@@ -3334,6 +3380,7 @@ fn create_mesh(
             secret,
             links,
             exit_sel,
+            split_routes,
             tun_name: None,
             my_endpoint,
             dp_port: 0,

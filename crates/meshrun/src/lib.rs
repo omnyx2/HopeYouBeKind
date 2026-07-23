@@ -172,6 +172,12 @@ fn parse_flow(p: &[u8]) -> Option<FlowEvent> {
 /// supervisor can change egress live (the GUI's egress toggle) without a respawn.
 pub type SharedExit = Arc<Mutex<Option<MemberId>>>;
 
+/// Domain split-tunnel routes (docs/SPLIT_TUNNEL.md), shared with the supervisor: a matched
+/// domain's IP → the exit MEMBER its rule designates. The run loop checks this BEFORE the flow
+/// table, so a split IP goes to its rule's exit regardless of the mesh-wide exit. Local, never
+/// gossiped; empty when split mode is off. `Ipv4Addr` keyed (A-records).
+pub type SharedSplitRoutes = Arc<Mutex<HashMap<Ipv4Addr, MemberId>>>;
+
 /// This node's own advertised endpoint (`ip:port`), shared so a supervisor (meshd)
 /// reads the current value for invites/gossip while the run loop updates it — it
 /// changes when a public peer reflects our public (reflexive) address to us (P-D3).
@@ -513,6 +519,7 @@ pub async fn run<X: Transport + 'static>(
     loop_event: LoopEventTx,
     fails: DecryptFails,
     traffic: SharedTraffic,
+    split_routes: SharedSplitRoutes,
 ) {
     let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
     // Per-peer last-logged time for relay-fallback decisions, so a stuck peer can't spam.
@@ -523,10 +530,21 @@ pub async fn run<X: Transport + 'static>(
             // to the exit member, which NATs it out (P4; NAT is OS-side, exit.rs).
             outbound = tun.read_packet() => {
                 let Ok(p) = outbound else { break };
-                // Route via the SDN flow table (docs/FLOW_TABLE.md): the default table is
-                // overlay → owner, internet → exit, but an admin can program any policy.
                 let exit_now = *exit.lock().unwrap();
-                if let RouteDecision::Send { to, via_exit } = dp.decide(&p, exit_now) {
+                // Domain split-tunnel (docs/SPLIT_TUNNEL.md): if this packet's dst is a matched
+                // domain's IP, route it to its RULE's exit member — regardless of the mesh-wide
+                // exit. Everything else follows the flow table (default: overlay → owner,
+                // internet → exit). Local, never gossiped.
+                let split_to = ipv4_dst(&p)
+                    .and_then(|d| split_routes.lock().unwrap().get(&d).copied());
+                let decision = match split_to {
+                    Some(m) => Some((m, true)),
+                    None => match dp.decide(&p, exit_now) {
+                        RouteDecision::Send { to, via_exit } => Some((to, via_exit)),
+                        RouteDecision::Drop => None,
+                    },
+                };
+                if let Some((to, via_exit)) = decision {
                     // Pick a path: direct if the peer is directly reachable, else relay the
                     // frame through a public node, which forwards it on (docs/RELAY.md).
                     let now = now_ms();
@@ -838,6 +856,9 @@ mod tests {
     fn no_traffic() -> SharedTraffic {
         Arc::new(Mutex::new(Traffic::default()))
     }
+    fn no_split() -> SharedSplitRoutes {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     fn ipv4_to(dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0u8; 28]; // 20B IPv4 header + 8B payload
@@ -871,6 +892,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         )); // Alice (member 1)
         tokio::spawn(run(
             dp(2),
@@ -885,6 +907,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         )); // Bob   (member 2)
 
         // Inject an IP packet at Alice's TUN, destined for Bob's overlay IP.
@@ -924,6 +947,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         )); // exit = member 2
         tokio::spawn(run(
             dp(2),
@@ -938,6 +962,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
 
         // A real internet destination (not in the mesh /24) → goes to the exit.
@@ -1035,6 +1060,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -1049,6 +1075,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         )); // relay hop
         tokio::spawn(run(
             dp(3),
@@ -1063,6 +1090,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
 
         let packet = ipv4_to("100.80.3.3".parse().unwrap()); // member 3 = C
@@ -1123,6 +1151,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -1137,6 +1166,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
         tokio::spawn(run(
             dp(3),
@@ -1151,6 +1181,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
 
         // Poll A's link table until C (member 3) appears, learned via B's gossip.
@@ -1301,6 +1332,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -1315,6 +1347,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
 
         // B should adopt the public address A reflected (the `self` line in A's gossip).
@@ -1374,6 +1407,7 @@ mod tests {
             dummy_applied(),
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
         tokio::spawn(run(
             dp(2),
@@ -1388,6 +1422,7 @@ mod tests {
             b_applied_tx,
             no_fails(),
             no_traffic(),
+            no_split(),
         ));
 
         // Baseline: a packet flows on the original cipher.

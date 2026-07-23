@@ -229,8 +229,15 @@ pub enum Request {
     },
 
     // --- domain split-tunnel (docs/SPLIT_TUNNEL.md) — LOCAL to this node ------------------
-    /// Add a local split rule: traffic to `domain` (and subdomains) egresses via `mesh`'s exit.
-    SplitAdd { domain: String, mesh: MeshId },
+    /// Add a local split rule: traffic to `domain` (and subdomains) egresses via member `exit`
+    /// in `mesh` — the rule carries its own exit, so the mesh-wide exit is untouched and normal
+    /// traffic keeps using your own network. `exit = 0` falls back to the mesh's configured exit.
+    SplitAdd {
+        domain: String,
+        mesh: MeshId,
+        #[serde(default)]
+        exit: MemberId,
+    },
     /// Remove a split rule by exact `domain`.
     SplitDel { domain: String },
     /// List split rules + whether the proxy is currently active. Returns [`Response::Split`].
@@ -359,6 +366,9 @@ pub struct SplitView {
 pub struct SplitRuleView {
     pub domain: String,
     pub mesh: MeshId,
+    /// The exit member this domain routes through (`0` = the mesh's configured exit).
+    #[serde(default)]
+    pub exit: MemberId,
 }
 
 /// A self-contained invite: everything a joiner needs to install the mesh and key

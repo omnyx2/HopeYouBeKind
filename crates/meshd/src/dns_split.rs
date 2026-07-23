@@ -20,7 +20,7 @@
 //!   panic on malformed/attacker input — all bounds-checked, returns None/partial).
 //! - 🟢 [`SplitRule`] / [`domain_matches`] — pure config + string suffix match.
 
-use lattice_proto::wire_v2::MeshId;
+use lattice_proto::wire_v2::{MemberId, MeshId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -34,8 +34,14 @@ pub struct SplitRule {
     /// The registrable domain, e.g. `"pornhub.com"`. Matches the domain itself and ALL
     /// subdomains (`www.pornhub.com`, `ads.pornhub.com`, …) — see [`domain_matches`].
     pub domain: String,
-    /// Which mesh's tun (and thus exit) the matched traffic is routed into.
+    /// Which mesh's tun the matched traffic is routed into.
     pub mesh: MeshId,
+    /// The exit MEMBER this domain's traffic egresses through — the rule carries its own exit, so
+    /// the mesh-wide exit is never touched and normal traffic keeps using your own network. `0`
+    /// (older rules / unset) falls back to the mesh's configured exit. `#[serde(default)]` so a
+    /// pre-exit `split.json` loads.
+    #[serde(default)]
+    pub exit: MemberId,
 }
 
 /// Does DNS query name `qname` fall under `rule.domain`? True when `qname` equals the domain or
@@ -205,6 +211,7 @@ pub async fn run_proxy(
     rules: Vec<SplitRule>,
     upstream: SocketAddr,
     injected: Arc<Mutex<HashSet<Ipv4Addr>>>,
+    split_routes: Arc<Mutex<std::collections::HashMap<Ipv4Addr, MemberId>>>,
 ) {
     let sock = match tokio::net::UdpSocket::bind(PROXY_BIND).await {
         Ok(s) => Arc::new(s),
@@ -222,19 +229,31 @@ pub async fn run_proxy(
             Err(_) => continue,
         };
         let query = buf[..n].to_vec();
-        let (sock, rules, injected, tun) = (
+        let (sock, rules, injected, tun, split_routes) = (
             Arc::clone(&sock),
             Arc::clone(&rules),
             Arc::clone(&injected),
             tun.clone(),
+            Arc::clone(&split_routes),
         );
         tokio::spawn(async move {
-            let _ = handle_query(&sock, client, &query, upstream, &rules, &injected, &tun).await;
+            let _ = handle_query(
+                &sock,
+                client,
+                &query,
+                upstream,
+                &rules,
+                &injected,
+                &tun,
+                &split_routes,
+            )
+            .await;
         });
     }
 }
 
 /// Forward one query upstream, inject routes for a matched name, relay the answer to `client`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_query(
     sock: &tokio::net::UdpSocket,
     client: SocketAddr,
@@ -243,6 +262,7 @@ async fn handle_query(
     rules: &[SplitRule],
     injected: &Arc<Mutex<HashSet<Ipv4Addr>>>,
     tun: &str,
+    split_routes: &Arc<Mutex<std::collections::HashMap<Ipv4Addr, MemberId>>>,
 ) -> std::io::Result<()> {
     // Ephemeral socket to the upstream resolver (its own path uses the real default route, so a
     // split /32 can't loop the resolver traffic into the mesh).
@@ -256,8 +276,14 @@ async fn handle_query(
     };
     let resp = &rbuf[..n];
     if let Some((qname, ips)) = parse_a_records(resp) {
-        if rules.iter().any(|r| domain_matches(&r.domain, &qname)) {
+        // First rule whose domain matches wins; it carries the exit member this domain uses.
+        if let Some(rule) = rules.iter().find(|r| domain_matches(&r.domain, &qname)) {
             for ip in ips {
+                // Record ip → this rule's exit member so the data plane sends it there (not the
+                // mesh-wide exit). `0` = fall back to the mesh exit (older rules).
+                if rule.exit != 0 {
+                    split_routes.lock().unwrap().insert(ip, rule.exit);
+                }
                 let fresh = injected.lock().unwrap().insert(ip);
                 if fresh {
                     let tun_s = tun.to_string();
@@ -266,7 +292,7 @@ async fn handle_query(
                         crate::exit::route_host_via_iface(ip, &tun_s)
                     })
                     .await;
-                    tracing::warn!(%ip, name = %qname, tun, "split-tunnel: routed via mesh exit");
+                    tracing::warn!(%ip, name = %qname, exit = rule.exit, "split-tunnel: routed to rule's exit");
                 }
             }
         }
