@@ -436,6 +436,16 @@ pub struct MemberView {
     /// the UI shows a reason exactly when there's a problem to explain.
     #[serde(default)]
     pub reason: Option<String>,
+    /// How we currently reach this member — the auto-discovered path (docs/SPLIT_TUNNEL.md is
+    /// separate; this is discovery, docs/DISCOVERY.md): `direct` (a fresh direct frame),
+    /// `relay` (reachable only via a public hop), `offline` (not heard), or `me`. For the
+    /// `lattice conns` connection book. `#[serde(default)]` so older meshd fills "".
+    #[serde(default)]
+    pub path: String,
+    /// Seconds since we last heard ANY frame from this member (direct or relayed); `None` if
+    /// never. Shown as the last-contact age in the connection book.
+    #[serde(default)]
+    pub last_seen_secs: Option<u64>,
 }
 
 /// The per-mesh detail view (§7).

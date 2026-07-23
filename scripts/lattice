@@ -266,6 +266,32 @@ def cmd_off(sock, a):
     print("full tunnel OFF — back to direct internet.")
 
 
+def cmd_conns(sock, a):
+    # Connection book: per-member key→value of the auto-discovered/connected path.
+    mid = resolve_mesh(sock, a.mesh)
+    d = call(sock, {"MeshInfo": {"mesh": mid}})["Mesh"]
+    members = d.get("members", [])
+    icon = {"direct": "●", "relay": "◇", "offline": "·", "me": "★"}
+    print(f"mesh #{mid} {d.get('name','')} — connection book (auto-discovered paths)")
+    print(f"  {'member':<16} {'overlay':<14} {'path':<8} {'endpoint':<22} last-seen")
+    for m in members:
+        p = m.get("path", "")
+        age = m.get("last_seen_secs")
+        if m.get("is_me"):
+            seen = "(this node)"
+        elif age is None:
+            seen = "never"
+        elif age < 90:
+            seen = f"{age}s ago"
+        elif age < 5400:
+            seen = f"{age//60}m ago"
+        else:
+            seen = f"{age//3600}h ago"
+        ep = m.get("endpoint") or "—"
+        print(f"  {icon.get(p,' ')} #{m['id']} {m.get('name',''):<12} {m.get('overlay_ip',''):<14} {p:<8} {ep:<22} {seen}")
+    print("  ● direct  ◇ via relay  · offline  ★ me")
+
+
 def cmd_split(sock, a):
     # Domain split-tunnel: default internet stays direct; only matched domains egress via a mesh
     # exit. `add`/`rm`/`list`/`on <mesh>`/`off`.
@@ -904,6 +930,10 @@ def build_parser():
     s.add_argument("--exit", metavar="CIDR", help="route a destination via the mesh exit")
     s.add_argument("--reset", action="store_true", help="reset to the default table")
     s.set_defaults(fn=cmd_flows)
+
+    s = sub.add_parser("conns", help="connection book: how each member is reached (direct/relay/offline)")
+    s.add_argument("mesh", help="mesh id or name")
+    s.set_defaults(fn=cmd_conns)
 
     s = sub.add_parser("split", help="domain split-tunnel: send only specific domains via a mesh exit")
     ssub = s.add_subparsers(dest="action")

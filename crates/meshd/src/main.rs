@@ -3542,6 +3542,29 @@ fn detail(ms: &MeshState) -> MeshDetail {
             // reach this member at over the tunnel (e.g. ssh user@100.80.1.1).
             let p = ms.mesh.charter.overlay_prefix;
             let overlay_ip = format!("{}.{}.{}.{}", p[0], p[1], ms.mesh.id, c.id);
+            // The auto-discovered path (for `lattice conns`): `direct` if a fresh direct frame,
+            // `relay` if reachable only via a public hop, `offline` if not heard, `me` for self.
+            let (path, last_seen_secs) = if is_me {
+                ("me".to_string(), Some(0))
+            } else {
+                match link {
+                    Some(l) if l.last_seen_ms != 0 => {
+                        let age = now.saturating_sub(l.last_seen_ms) / 1000;
+                        let live = now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS;
+                        let direct = l.last_direct_ms != 0
+                            && now.saturating_sub(l.last_direct_ms) < LIVE_WINDOW_MS;
+                        let p = if !live {
+                            "offline"
+                        } else if direct {
+                            "direct"
+                        } else {
+                            "relay"
+                        };
+                        (p.to_string(), Some(age))
+                    }
+                    _ => ("offline".to_string(), None),
+                }
+            };
             MemberView {
                 id: c.id,
                 name: c.name.clone(),
@@ -3551,6 +3574,8 @@ fn detail(ms: &MeshState) -> MeshDetail {
                 endpoint,
                 state,
                 reason,
+                path,
+                last_seen_secs,
             }
         })
         .collect();
