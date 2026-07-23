@@ -11,7 +11,7 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
-## [Unreleased]
+## [0.7.6] — 2026-07-23
 
 ### Added
 - **Per-domain split-tunnel exit** — each split rule now carries its OWN exit member
