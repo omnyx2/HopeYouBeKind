@@ -15,6 +15,18 @@ commit. The durable record; `TEMP.md` only holds open items.
   pin → en0 (no loop — fix 19465bb); **full-tunnel egress = Oracle on try 1** and stays up past
   the kill-switch window. Closes the "clean verification" TEMP item. — config/deploy, no commit
 
+## Fleet clean-slate reinstall to v0.7.5 (2026-07-23)
+
+Tagged v0.7.5 @ 975d26c (F1 split-tunnel + F2 conns); CI built all-platform installers.
+Fresh-installed on every reachable node, GUI + daemon, all verified `v0.7.5 build 975d26c`:
+- **Mac**: removed old /Applications app, installed official 0.7.5 dmg fresh, relaunched — LIVE.
+- **Oracle** (ubuntu systemd): swapped meshd-Linux-X64 into ~/myVpn/target/release/meshd, restart — LIVE direct exit.
+- **lablinux** (hyunseok): `dpkg -i` the 0.7.5 deb (GUI /usr/bin/lattice + meshd both updated),
+  relaunched via /tmp/lab-start.sh — LIVE, now DIRECT to Mac (path re-converged on fresh install).
+- **Windows**: offline (192.168.0.6 + 10.32.86.243 down) — skipped.
+Connection book confirms oracle+lablinux both `direct`. Gotcha: the poisoned `grep` shell wrapper
+masked dpkg success output — use `command grep` when reading remote command output.
+
 ## F2 connection book — BUILT + LIVE-verified (2026-07-23)
 
 "Auto-discover reachable live members, auto-connect, persist for fast reconnect + surface as

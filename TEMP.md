@@ -49,13 +49,12 @@ Non-matching domains: passthrough, no injection → app uses normal internet. Wo
   `split off` restored DNS (127.0.0.1→10.64.0.3) + removed the /32 cleanly. F1 domain
   split-tunnel WORKS end to end.
 
-### Fleet clean-slate reinstall to v0.7.5 (in progress, 2026-07-23)
-Standing order: wipe+fresh-install meshd & GUI on every reachable node, verify `build <sha>`==HEAD.
-- v0.7.5 tagged at 975d26c (F1 split-tunnel + F2 conns). CI run 29986056966 building installers.
-- Reachable: Mac(local, on bc0aee3→update), Oracle(138.2.14.219 ubuntu systemd, on 51deceb→update),
-  lablinux(172.28.7.32 hyunseok, deb 0.7.4→update). Windows OFFLINE (192.168.0.6 + 10.32.86.243 down) — skip.
-- When CI done: Mac 0.7.5 dmg→/Applications; Oracle meshd-Linux-X64→systemd restart; lablinux
-  0.7.5 deb (dpkg -i --force-downgrade)→relaunch. Verify each logs `v0.7.5 build 975d26c`.
+### Fleet: ALL on v0.7.5 build 975d26c (done 2026-07-23)
+Mac + Oracle + lablinux fresh-installed (GUI+daemon), verified, LIVE, oracle+lablinux direct.
+Windows offline (skipped) — reinstall when it's back on a reachable network. SSH: Oracle
+`ssh -i ssh-key-2026-06-13.key ubuntu@138.2.14.219`; lablinux `ssh hyunseok@172.28.7.32` (sudo pw
+1234, piped `echo 1234|sudo -S`, meshd relaunch `/tmp/lab-start.sh`). Use `command grep` for
+remote output (shell has a poisoned grep wrapper).
 
 ### Open / deferred (both features shipped; these are polish)
 - F1: per-domain DIFFERENT exits (finish ToExit(Some(NodeId))); AAAA/IPv6; SNI.
