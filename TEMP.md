@@ -43,10 +43,18 @@ Non-matching domains: passthrough, no injection → app uses normal internet. Wo
 - Key correctness confirmed: mesh exit_sel is seeded from the persisted exit at bringup
   (main.rs:684) + SetExit (2625) — so split works WITHOUT full-tunnel: a /32-routed pornhub
   packet → decide() exit=Oracle → sealed → Japan NAT. Same path as full-tunnel, one IP.
-- ⏳ **P5 LIVE test (next)** — swap the running meshd for the split build, `split add pornhub.com 1`
-  + `split on 1`, verify a *.pornhub.com connection egresses via Oracle while ifconfig.me stays
-  campus. Requires a meshd restart (full-tunnel is OFF now, so just a mesh reconnect).
-- Deferred: P0 per-domain exit override (ToExit(Some)); F2 auto-connect persistence; GUI card.
+- ✅ **P5 LIVE VERIFIED (2026-07-23)** — swapped running meshd → build 40eb106; `split add
+  pornhub.com 1` + `split on 1`: www.pornhub.com→66.254.114.41 routed to utun6, HTTP 200, Oracle
+  tun0 RX +8601 (traffic transited Oracle); google/ifconfig stayed en0/campus with Oracle RX +0;
+  `split off` restored DNS (127.0.0.1→10.64.0.3) + removed the /32 cleanly. F1 domain
+  split-tunnel WORKS end to end.
+
+### F1 remaining / F2 (open, next)
+- P0 per-domain exit override (ToExit(Some(NodeId))→MemberId) — needed if two domains want two
+  DIFFERENT exits in one mesh; today all split rules for a mesh use that mesh's single exit.
+- GUI card for split rules (mirror the routing-rules card).
+- docs/SPLIT_TUNNEL.md (referenced by code, not yet written).
+- **F2 auto-connect + persist** — not started (infra map done in TEMP header).
 
 ### Deferred / not doing now
 SNI extraction (HTTPS same-IP disambiguation), auto-censorship-detection (AUTO_EXIT.md),
