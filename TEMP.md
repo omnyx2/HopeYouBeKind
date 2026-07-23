@@ -49,12 +49,11 @@ Non-matching domains: passthrough, no injection → app uses normal internet. Wo
   `split off` restored DNS (127.0.0.1→10.64.0.3) + removed the /32 cleanly. F1 domain
   split-tunnel WORKS end to end.
 
-### F1 remaining / F2 (open, next)
-- P0 per-domain exit override (ToExit(Some(NodeId))→MemberId) — needed if two domains want two
-  DIFFERENT exits in one mesh; today all split rules for a mesh use that mesh's single exit.
-- GUI card for split rules (mirror the routing-rules card).
-- docs/SPLIT_TUNNEL.md (referenced by code, not yet written).
-- **F2 auto-connect + persist** — not started (infra map done in TEMP header).
+### Open / deferred (both features shipped; these are polish)
+- F1: per-domain DIFFERENT exits (finish ToExit(Some(NodeId))); AAAA/IPv6; SNI.
+- F2: persist path-history (so `conns` shows last-good path after a restart, before re-verify);
+  GUI `conns` card; live relay-path screenshot.
+- Both features' running build = bc0aee3 (swapped into /Applications app). Live VPN fine.
 
 ### Deferred / not doing now
 SNI extraction (HTTPS same-IP disambiguation), auto-censorship-detection (AUTO_EXIT.md),

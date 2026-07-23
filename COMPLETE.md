@@ -15,6 +15,30 @@ commit. The durable record; `TEMP.md` only holds open items.
   pin → en0 (no loop — fix 19465bb); **full-tunnel egress = Oracle on try 1** and stays up past
   the kill-switch window. Closes the "clean verification" TEMP item. — config/deploy, no commit
 
+## F2 connection book — BUILT + LIVE-verified (2026-07-23)
+
+"Auto-discover reachable live members, auto-connect, persist for fast reconnect + surface as
+key→value." Auto-discovery/connect/endpoint-persistence ALREADY existed (DHT + gossip +
+relay→direct + to_persisted.peers reloaded on start). New: surface the RESULT as a connection
+book. MemberView gained `path` (direct/relay/offline/me) + `last_seen_secs`, derived in detail()
+from the Link's last_seen_ms/last_direct_ms. `lattice conns <mesh>` renders per-member key→value.
+LIVE (build bc0aee3): oracle shown `direct` 11s-ago at 138.2.14.219, correctly classified. — bc0aee3
+Deferred: persist path-history for post-restart view; GUI conns card; F2 relay-case live shot
+(same last_direct_ms logic, shown in logs earlier).
+
+## F1 domain split-tunnel — BUILT + LIVE-verified (2026-07-23)
+
+Default internet stays direct; specific domains egress via a chosen mesh exit. Local to this node.
+- DNS parser + rule types (dns_split.rs, 4 tests) — e12da6f
+- exit.rs route_host_via_iface/unroute_host (3 OS, /32, no default touch) — d425584
+- DNS proxy + upstream detect (run_proxy/detect_upstream) — d1a96cc
+- meshd wiring (IPC SplitAdd/Del/List/On/Off, split.json persist, split_enable/disable 🔴) — 4d5663f
+- lattice split CLI (offline-verified) — 105789f
+- **LIVE (build 40eb106): pornhub→Oracle (utun6, HTTP 200, Oracle RX+8601); normal traffic
+  en0/campus, Oracle RX+0; on/off restores DNS+/32 cleanly** — 91004d5
+- docs/SPLIT_TUNNEL.md + GUI Configs split-tunnel card — 42900ad
+Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
+
 ## Release v0.7.4 pushed + tagged (2026-06-24)
 
 - **Pushed `feat/extensions-meshd` (e069aa7..c00836b) + annotated tag `v0.7.4` at c00836b** → Release workflow triggered (run 28096210159, in_progress). NOTE: v0.7.3 release build had failed.
