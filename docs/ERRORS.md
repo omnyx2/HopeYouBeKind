@@ -13,6 +13,14 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-07-23** · deploying a new meshd to lablinux over ssh → `setsid`/`nohup` background
+  launches DIDN'T persist (died with the ssh session) AND the poisoned shell `grep` wrapper +
+  interleaved `sudo` password prompts mangled the output so the swap looked like it "kept failing"
+  (stale 975d26c in the log) when the `cp` had actually worked. Fix: (1) install a **systemd unit**
+  for headless meshd (like Oracle) — reliable + survives reboot; (2) run remote commands from a
+  **self-contained script that writes results to a file**, then `cat` the file, instead of piping
+  live output through the mangling shell; (3) use `command grep` on remote output.
+
 Granular implementation errors from active work (the design-lesson write-ups are further down).
 
 - **2026-06-24** · ran `cargo build -p meshd` in the bundle script → **no-op** (`error: package

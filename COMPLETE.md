@@ -15,6 +15,17 @@ commit. The durable record; `TEMP.md` only holds open items.
   pin → en0 (no loop — fix 19465bb); **full-tunnel egress = Oracle on try 1** and stays up past
   the kill-switch window. Closes the "clean verification" TEMP item. — config/deploy, no commit
 
+## Current-computer-as-exit — cross-node LIVE-verified on lablinux (2026-07-23)
+
+Verified per-domain split-tunnel where the exit is ANOTHER member (incl. this computer acting as
+an exit for someone else): updated lablinux to a07da4d (built on Oracle, scp'd; **gave lablinux a
+systemd unit** since setsid launches over ssh didn't persist). On lablinux, rule `ifconfig.me →
+member #7 (Mac)`, split on → `curl ifconfig.me` returned **203.247.167.58 (the Mac's egress)**,
+not lablinux's own 210.107.188.8 — so lablinux's traffic exited through the Mac (path: lablinux →
+Oracle relay → Mac NAT → internet), even though Mac↔lablinux can't reach directly (campus
+isolation, relayed). off reverted to 210.107.188.8. Mac forwards+NATs as a client (forwarding=1,
+pf nat 100.64/10) so it works as an exit without being a pinned exit node.
+
 ## Per-domain split-tunnel exit — BUILT + LIVE-verified (2026-07-23)
 
 The user's model: split-tunnel keeps normal traffic on your OWN network by default; only registered
