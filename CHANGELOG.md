@@ -11,6 +11,20 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.5] — 2026-07-23
+
+### Added
+- **Domain split-tunnel** (docs/SPLIT_TUNNEL.md) — keep normal internet direct, but send specific
+  domains (and their subdomains, e.g. `*.pornhub.com`) out through a chosen mesh exit. meshd runs
+  a local DNS proxy that learns the domain→IP mapping and injects a `/32` route into the mesh tun
+  for matched IPs only; the default route is never touched. `lattice split add/rm/list/on/off` +
+  a Configs GUI card. Local to each node, never gossiped. Live-verified (a `*.pornhub.com`
+  connection egressed via the exit while everything else stayed direct).
+- **Connection book** — `lattice conns <mesh>` shows a per-member key→value view of the
+  auto-discovered path: `direct` / `relay` / `offline`, endpoint, and last-seen age. `MemberView`
+  gains `path` + `last_seen_secs`. The learned endpoint was already persisted for fast reconnect;
+  this surfaces which path each member was auto-connected over.
+
 ## [0.7.4] — 2026-06-24
 
 ### Fixed
