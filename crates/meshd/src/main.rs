@@ -65,6 +65,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::mpsc::UnboundedSender;
 
 mod dht;
+mod dns_split; // domain-based split-tunnel: DNS-driven per-domain exit routing (docs/SPLIT_TUNNEL.md)
 #[allow(dead_code)] // ported from v1: some restore/disable paths aren't wired yet.
 mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1. // node-wide DHT rendezvous (re-find a moved peer by pubkey) — docs/DHT_RENDEZVOUS.md.
 
