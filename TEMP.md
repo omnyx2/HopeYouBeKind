@@ -6,7 +6,55 @@ live here; move done items to `COMPLETE.md`; log errors to `docs/ERRORS.md`. Rea
 
 ---
 
-## Current task: code documentation pass + process hardening
+## Current task: domain-based split-tunnel + auto-connect persistence
+
+Two features (user, 2026-07-23):
+- **F1 domain split-tunnel** — default = normal internet; specific domains (e.g.
+  `www.pornhub.com`) egress via a CHOSEN exit member. Domain-primary + IP/CIDR secondary.
+- **F2 auto-connect + persist** — auto-discover which LIVE members are reachable, connect
+  automatically, and persist the resulting connection path (key→value) to disk for fast reconnect.
+
+### What exists (explore agent, reuse these)
+- Flow table BUILT: `crates/proto/src/flow.rs` FlowRule{priority, match_{scope,dst_cidr,proto,
+  dport}, action{ToOverlayOwner|ToExit(Option<NodeId>)|ToPeer|Local|Drop}}; `decide()` in
+  dataplane.rs; gossiped via CTRL_FLOWS; CLI `lattice flows`; GUI routing-rules card. **IP-only
+  match, no domain field.**
+- `ToExit(Some(NodeId))` / `ToPeer` exist in the enum but `decide()` DROPS them ("phase 2":
+  NodeId(pubkey)→MemberId via roster not wired). Must finish for per-domain exit override.
+- `set_dns` in exit.rs (points host resolver at IPs; used by full-tunnel). No DNS snoop/resolver.
+- F2 infra mostly EXISTS: DHT re-discover + endpoint gossip + relay→direct promotion + `Link`
+  {endpoint,last_seen}; persisted mesh endpoints re-seeded on load. F2 ≈ surface + persist the
+  chosen path, not build discovery from scratch.
+
+### Chosen architecture (F1) — local DNS resolver + dynamic route/flow injection
+meshd runs a small DNS proxy on 127.0.0.1:53; host resolver pointed at it (reuse set_dns, in a
+NEW "domain-split" mode that does NOT need full-tunnel). Per query: forward upstream, get A/AAAA.
+If qname matches a split rule `{domain-pattern → exit member}`: inject `<ip>/32 → mesh tun` host
+route + a flow rule `dst=<ip>/32 → ToExit(member)`, refresh on TTL; return answer unchanged.
+Non-matching domains: passthrough, no injection → app uses normal internet. Works for HTTPS/any
+(IP-level after DNS), adapts to IP rotation. Manual IP/CIDR = static flow+route (the "IP 보조").
+
+### Requirements — status
+- ✅ **DNS parser + rule types** (dns_split.rs, 4 unit tests) — commit e12da6f
+- ✅ **exit.rs route_host_via_iface/unroute_host** (3 OS, /32 no-default-touch) — d425584
+- ✅ **DNS proxy loop + upstream detect** (run_proxy/detect_upstream) — d1a96cc
+- ✅ **meshd wiring** (IPC SplitAdd/Del/List/On/Off, split.json persist, split_enable/disable 🔴) — 4d5663f
+- ✅ **lattice split CLI** + OFFLINE verified (add/list/rm/persist; on-without-tun safely bails) — 105789f
+- Key correctness confirmed: mesh exit_sel is seeded from the persisted exit at bringup
+  (main.rs:684) + SetExit (2625) — so split works WITHOUT full-tunnel: a /32-routed pornhub
+  packet → decide() exit=Oracle → sealed → Japan NAT. Same path as full-tunnel, one IP.
+- ⏳ **P5 LIVE test (next)** — swap the running meshd for the split build, `split add pornhub.com 1`
+  + `split on 1`, verify a *.pornhub.com connection egresses via Oracle while ifconfig.me stays
+  campus. Requires a meshd restart (full-tunnel is OFF now, so just a mesh reconnect).
+- Deferred: P0 per-domain exit override (ToExit(Some)); F2 auto-connect persistence; GUI card.
+
+### Deferred / not doing now
+SNI extraction (HTTPS same-IP disambiguation), auto-censorship-detection (AUTO_EXIT.md),
+app-uid matching. Note them if they block.
+
+---
+
+## Prior task: code documentation pass + process hardening
 
 Goal: make every data-plane/exit function self-explanatory (contract + `///` + edit-risk) so
 regressions are easy to localize, and set up the working-memory workflow.
