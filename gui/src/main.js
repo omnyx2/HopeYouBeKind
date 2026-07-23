@@ -817,8 +817,19 @@ async function renderConfigs(id) {
         <button class="small-btn" id="flow-reset">reset to default</button>
       </div>
     </div>
+    <div class="card" id="split-card">
+      <div class="card-head"><h2 class="card-title">Domain split-tunnel <span class="muted small">(this computer only)</span></h2></div>
+      <p class="muted small">Keep normal internet direct, but send specific domains (and their subdomains) out through this mesh's exit. Learned via DNS — works for HTTPS, adapts to IP changes.</p>
+      <div id="split-list" class="muted small">loading…</div>
+      <div class="add-row">
+        <input id="split-domain" placeholder="domain — e.g. pornhub.com (covers *.pornhub.com)" />
+        <button class="small-btn" id="split-add">add domain</button>
+        <button class="small-btn" id="split-toggle">on/off</button>
+      </div>
+    </div>
     <p class="muted small" style="margin-top:6px">Invite a member is on the <b>Peers</b> tab; Report attack / Wipe are on the <b>Warnings</b> tab.</p>`;
   renderFlows(id);
+  renderSplit(id);
   el("ov-egress").onclick = async () => { try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); } refreshMode(); };
   el("ov-exit-set").onclick = async () => {
     const v = el("ov-exit").value;
@@ -839,6 +850,47 @@ async function renderConfigs(id) {
     try { await meshd({ Recipher: { mesh: id, cipher: changed ? cipher : null } }); toast("re-ciphered"); } catch (e) { toast(String(e)); }
     renderConfigs(id);
   };
+  el("split-add").onclick = async () => {
+    const dom = el("split-domain").value.trim().replace(/^\.+|\.+$/g, "").toLowerCase();
+    if (!dom || !dom.includes(".")) return toast("enter a domain like pornhub.com");
+    try { await meshd({ SplitAdd: { domain: dom, mesh: id } }); toast(`added *.${dom}`); } catch (e) { toast(String(e)); }
+    el("split-domain").value = "";
+    renderSplit(id);
+  };
+  el("split-toggle").onclick = async () => {
+    let on = false;
+    try { on = (await meshd("SplitList")).Split?.active_mesh != null; } catch {}
+    try {
+      if (on) { await meshd("SplitOff"); toast("split-tunnel off"); }
+      else { await meshd({ SplitOn: { mesh: id } }); toast("split-tunnel on — matched domains via exit"); }
+    } catch (e) { toast(String(e)); }
+    renderSplit(id);
+  };
+}
+
+// ---- Domain split-tunnel rules (local to this node) ----
+async function renderSplit(id) {
+  const box = el("split-list");
+  if (!box) return;
+  let v;
+  try { v = (await meshd("SplitList")).Split || { rules: [], active_mesh: null }; }
+  catch (e) { box.innerHTML = `<span class="muted small">unavailable — ${esc(String(e))}</span>`; return; }
+  const on = v.active_mesh != null;
+  const tog = el("split-toggle");
+  if (tog) tog.textContent = on ? (v.active_mesh === id ? "turn OFF" : `on (mesh ${v.active_mesh})`) : "turn ON";
+  const mine = (v.rules || []).filter((r) => r.mesh === id);
+  const state = on ? (v.active_mesh === id ? `<b style="color:var(--live)">ON</b>` : `on for mesh ${v.active_mesh}`) : "off";
+  box.innerHTML =
+    `<div class="kv"><span>status</span>${state}</div>` +
+    (mine.length
+      ? mine.map((r) =>
+          `<div class="kv"><span>*.${esc(r.domain)}</span>` +
+          `<button class="small-btn" data-split-rm="${esc(r.domain)}">remove</button></div>`).join("")
+      : `<div class="muted small">No domains yet — add one below.</div>`);
+  box.querySelectorAll("[data-split-rm]").forEach((b) => b.onclick = async () => {
+    try { await meshd({ SplitDel: { domain: b.dataset.splitRm } }); toast("removed"); } catch (e) { toast(String(e)); }
+    renderSplit(id);
+  });
 }
 
 // ---- SDN flow table editor (Phase 2: unsigned, gossiped) ----
