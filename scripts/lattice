@@ -266,6 +266,36 @@ def cmd_off(sock, a):
     print("full tunnel OFF — back to direct internet.")
 
 
+def cmd_split(sock, a):
+    # Domain split-tunnel: default internet stays direct; only matched domains egress via a mesh
+    # exit. `add`/`rm`/`list`/`on <mesh>`/`off`.
+    action = a.action
+    if action == "add":
+        mid = resolve_mesh(sock, a.mesh)
+        call(sock, {"SplitAdd": {"domain": a.domain, "mesh": mid}})
+        print(f"split rule added: *.{a.domain} → mesh {mid}'s exit. `lattice split on {mid}` to activate.")
+    elif action == "rm":
+        call(sock, {"SplitDel": {"domain": a.domain}})
+        print(f"split rule removed: {a.domain}")
+    elif action == "on":
+        mid = resolve_mesh(sock, a.mesh)
+        call(sock, {"SplitOn": {"mesh": mid}})
+        print(f"split-tunnel ON for mesh {mid} — matched domains now exit via it; the rest stays direct.")
+    elif action == "off":
+        call(sock, "SplitOff")
+        print("split-tunnel OFF — DNS + routes restored.")
+    else:  # list
+        r = call(sock, "SplitList")
+        v = r.get("Split", {})
+        act = v.get("active_mesh")
+        print(f"split-tunnel: {'ON (mesh %s)' % act if act is not None else 'OFF'}")
+        rules = v.get("rules", [])
+        if not rules:
+            print("  (no rules — `lattice split add <domain> <mesh>`)")
+        for rule in rules:
+            print(f"  *.{rule['domain']:<24} → mesh {rule['mesh']}")
+
+
 def cmd_recipher(sock, a):
     mid = resolve_mesh(sock, a.mesh)
     req = {"Recipher": {"mesh": mid, "cipher": a.cipher}}
@@ -874,6 +904,19 @@ def build_parser():
     s.add_argument("--exit", metavar="CIDR", help="route a destination via the mesh exit")
     s.add_argument("--reset", action="store_true", help="reset to the default table")
     s.set_defaults(fn=cmd_flows)
+
+    s = sub.add_parser("split", help="domain split-tunnel: send only specific domains via a mesh exit")
+    ssub = s.add_subparsers(dest="action")
+    sp = ssub.add_parser("add", help="add a domain→mesh rule (matches subdomains too)")
+    sp.add_argument("domain", help="e.g. pornhub.com (covers *.pornhub.com)")
+    sp.add_argument("mesh", help="mesh id or name whose exit carries it")
+    sp = ssub.add_parser("rm", help="remove a domain rule")
+    sp.add_argument("domain")
+    ssub.add_parser("list", help="list rules + on/off state")
+    sp = ssub.add_parser("on", help="turn split-tunnel ON for a mesh")
+    sp.add_argument("mesh", help="mesh id or name")
+    ssub.add_parser("off", help="turn split-tunnel OFF")
+    s.set_defaults(fn=cmd_split, action=None)
 
     s = sub.add_parser("rm", help="wipe a mesh from this computer")
     s.add_argument("mesh", help="mesh id or name")
