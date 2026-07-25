@@ -11,6 +11,20 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.9] — 2026-07-25
+
+### Fixed
+- **Pinned exit's overlay silently broke (isolate + per-subnet NAT regression).** After v0.7.8 made
+  the exit NAT/`isolate` rules per-subnet (`100.80.<id>.0/24`), the Linux `ip rule from <subnet>
+  lookup <iso-table>` (and the macOS pf `route-to ... to any`) also matched the exit node's OWN
+  overlay IP — which sits inside that subnet — so the node's member↔member replies were diverted
+  out the real WAN instead of the tun. A pinned exit (`MESHD_ADVERTISE`) could still be reached
+  via gossip but its data path to other members died (overlay ssh/ping timed out) until a
+  reconcile. Fix: overlay-destined traffic now bypasses the isolate rule — Linux adds a
+  higher-priority `to 100.64.0.0/10 lookup main` rule; macOS uses `to ! 100.64.0.0/10`. Only
+  forwarded INTERNET traffic isolates to the real WAN. Diagnosed by diffing against the last
+  working baseline (per CLAUDE.md), live-verified Mac↔Oracle.
+
 ## [0.7.8] — 2026-07-25
 
 ### Fixed

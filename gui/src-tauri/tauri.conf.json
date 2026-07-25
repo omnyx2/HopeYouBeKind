@@ -9,7 +9,7 @@
   },
   "package": {
     "productName": "Lattice",
-    "version": "0.7.8"
+    "version": "0.7.9"
   },
   "tauri": {
     "bundle": {

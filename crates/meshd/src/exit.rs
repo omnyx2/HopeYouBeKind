@@ -296,8 +296,11 @@ pub fn enable_nat(subnet: &str, isolate: bool) {
     // The gateway is captured now, while the default route is still the real one.
     if isolate {
         if let Some(gw) = macos_default_gateway() {
+            // `to ! 100.64.0.0/10` excludes overlay-internal destinations: our own overlay IP is
+            // inside <subnet>, so a plain `to any` would divert member↔member replies out the real
+            // WAN and break the overlay for this node. Only forwarded INTERNET traffic isolates.
             conf.push_str(&format!(
-                "pass out route-to ({wan} {gw}) inet from {subnet} to any\n"
+                "pass out route-to ({wan} {gw}) inet from {subnet} to ! 100.64.0.0/10\n"
             ));
             tracing::warn!(
                 wan,
@@ -579,6 +582,11 @@ fn linux_default_route() -> Option<(String, String)> {
 const ISO_TABLE: &str = "100";
 #[cfg(target_os = "linux")]
 const ISO_PRIO: &str = "1000";
+/// Higher priority (lower number) than `ISO_PRIO`: overlay-destined traffic bypasses the isolate
+/// rule and uses `main` (which has the tun route), so a pinned exit's own overlay IP — which sits
+/// INSIDE the served subnet — never gets its member↔member replies diverted out the real WAN.
+#[cfg(target_os = "linux")]
+const ISO_BYPASS_PRIO: &str = "999";
 
 /// **RISK 🔴 HIGH** (iptables MASQUERADE/FORWARD + isolate source-routing).
 /// Linux exit NAT for ONE overlay `subnet` (per-mesh `exitable`): IP forwarding + iptables
@@ -647,6 +655,37 @@ pub fn enable_nat(subnet: &str, isolate: bool) {
                 "ip",
                 &[
                     "route", "replace", "default", "via", &gw, "dev", &wan, "table", ISO_TABLE,
+                ],
+            );
+            // Overlay-internal traffic (member↔member, and our OWN replies — sourced from our
+            // overlay IP, which is INSIDE <subnet>) must stay on the tun, never get diverted to the
+            // real WAN. Insert a higher-priority rule that sends every overlay-destined packet to
+            // `main` (which holds the tun route) BEFORE the source-keyed isolate rule can grab it.
+            // Without this, a pinned exit's replies to other members leak out the WAN and the
+            // overlay silently breaks for that node (a real regression the per-subnet NAT exposed).
+            let _ = Command::new("ip")
+                .args([
+                    "rule",
+                    "del",
+                    "to",
+                    "100.64.0.0/10",
+                    "lookup",
+                    "main",
+                    "priority",
+                    ISO_BYPASS_PRIO,
+                ])
+                .status();
+            run(
+                "ip",
+                &[
+                    "rule",
+                    "add",
+                    "to",
+                    "100.64.0.0/10",
+                    "lookup",
+                    "main",
+                    "priority",
+                    ISO_BYPASS_PRIO,
                 ],
             );
             let _ = Command::new("ip")
