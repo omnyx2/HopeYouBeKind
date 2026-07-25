@@ -9,6 +9,23 @@
 //! loop (`lattice_meshrun::run`): a per-mesh TUN + UDP socket carrying sealed
 //! packets. The loop shares a peer table + exit selection with this control plane,
 //! so the IPC reports live endpoints/liveness (P6.3d) and steers egress live.
+//!
+//! ## Edit-risk (key fns carry a `RISK:` tag — same scheme as `exit.rs`/`meshrun`)
+//! Most of this file is control-plane bookkeeping (🟢/🟡). The dangerous parts:
+//! - 🔴 [`bringup_dataplane`] — opens the per-mesh TUN/UDP, applies routes/NAT, arms the
+//!   kill-switch. Where full-tunnel is wired; touches the live host network.
+//! - 🔴 [`arm_kill_switch`] — the probe that reverts full-tunnel if the exit "isn't passing
+//!   traffic"; a false revert (or a missing one) is a connectivity bug. (`Opkts=0` has many
+//!   causes — see docs/ERRORS.md before touching.)
+//! - 🔴 [`shutdown_daemon`] — restores routes/DNS before aborting the data plane; if it skips a
+//!   restore the host is left on a dead tunnel.
+//! - 🟡 [`handle`] — the central IPC request dispatcher; mutates ALL mesh state and emits the
+//!   `PostAction`s (bringup / kill-switch / shutdown). Big match; easy to mis-wire a new request.
+//! - 🟡 [`serve_conn`]/[`scope_gate`]/[`ext_subscribe`] — the IPC connection: bounded outbound
+//!   channel (backpressure), shutdown-ack flush, and connector scope checks re-read from the LIVE
+//!   grant (not a snapshot). See the extensions-framework notes.
+//! - 🟡 [`peer_allowed`] — the socket-peer uid gate (who may talk to the daemon).
+//! The data-plane loop itself lives in `lattice_meshrun` (its own edit-risk legend).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -25,18 +42,19 @@ use lattice_mesh::charter::{
 use lattice_mesh::crypto::suite;
 use lattice_mesh::dataplane::MeshDataPlane;
 use lattice_mesh::ipc::{
-    FlowView, InviteBlob, MemberView, MeshDetail, MeshSummary, PeerTrafficView, PolicyView,
-    Request, Response, TrafficView,
+    ExtensionView, FlowView, InviteBlob, MemberView, MeshDetail, MeshSummary, PeerTrafficView,
+    PolicyView, Request, Response, ServiceView, TrafficView,
 };
 use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{
     effective_members, valid_members, Cert, MasterKey, MemberKey, PubKey, Revocation,
 };
+use lattice_mesh::registry::{self, ServiceEntry, ServiceRecord};
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
-    SharedEndpoint, SharedExit, SharedTraffic, Traffic, CTRL_ALLCLEAR, CTRL_ATTACK, CTRL_FLOWS,
-    CTRL_REVOKE, CTRL_ROSTER,
+    SharedEndpoint, SharedExit, SharedSplitRoutes, SharedTraffic, Traffic, CTRL_ALLCLEAR,
+    CTRL_ATTACK, CTRL_FLOWS, CTRL_REGISTRY, CTRL_REVOKE, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::flow::FlowRule;
@@ -47,6 +65,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::mpsc::UnboundedSender;
 
 mod dht;
+mod dns_split; // domain-based split-tunnel: DNS-driven per-domain exit routing (docs/SPLIT_TUNNEL.md)
 #[allow(dead_code)] // ported from v1: some restore/disable paths aren't wired yet.
 mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1. // node-wide DHT rendezvous (re-find a moved peer by pubkey) — docs/DHT_RENDEZVOUS.md.
 
@@ -168,6 +187,15 @@ struct MeshState {
     links: PeerLinks,
     /// The egress member, shared with the loop so SetExit steers it live.
     exit_sel: SharedExit,
+    /// Domain split-tunnel routes (matched IP → its rule's exit member), shared with the loop so
+    /// split traffic goes to the rule's exit without touching the mesh-wide exit. Empty when
+    /// split mode is off (docs/SPLIT_TUNNEL.md).
+    split_routes: SharedSplitRoutes,
+    /// Whether THIS node lets this mesh's members use it as their internet exit (per-mesh
+    /// opt-in, docs/EXIT_SHARING.md). LOCAL, persisted, never gossiped; default false. When on
+    /// (or on a pinned exit), this mesh's subnet gets forwarding+NAT so members can egress
+    /// through us. Default-off keeps a mesh intruder from turning us into a proxy.
+    exitable: bool,
     /// The OS interface name of this mesh's TUN (set at bringup) — needed to divert
     /// the default route for full-tunnel egress.
     tun_name: Option<String>,
@@ -210,6 +238,13 @@ struct MeshState {
     /// live data plane and persisted. `flow::default_table()` = the classic behavior.
     flows: Vec<FlowRule>,
     flow_version: u64,
+    /// Connector service registry (docs/EXTENSIONS.md §6): services THIS node advertises
+    /// plus those learned from peers. Soft state — not persisted; peer entries expire if
+    /// not re-gossiped. Gossiped via `CTRL_REGISTRY`.
+    services: Vec<ServiceEntry>,
+    /// Monotonic counter for OUR advertised services' `seq`, so a re-advertise supersedes
+    /// the previous record at every peer.
+    service_seq: u64,
 }
 
 impl MeshState {
@@ -260,6 +295,104 @@ struct State {
     /// Node-wide DHT rendezvous (`MESHD_DHT=1`); `None` = off. Re-finds a peer whose
     /// address changed with no overlapping live window — docs/DHT_RENDEZVOUS.md.
     dht: Option<Arc<dht::DhtService>>,
+    /// Extension event bus (docs/EXTENSIONS.md §1). Subsystems publish [`MeshEvent`]s;
+    /// each subscribed connector connection drains a `broadcast::Receiver` and forwards
+    /// scope-matching events. Bounded — a slow connector lags and drops events, it never
+    /// back-pressures the data plane. Set once at startup (`None` only before that).
+    bus: Option<tokio::sync::broadcast::Sender<MeshEvent>>,
+    /// Installed extension grants (docs/EXTENSIONS.md §3), keyed by extension id. Created
+    /// by `EnableExtension`, persisted to `extensions.json` (0600). A connector's `Hello`
+    /// token is checked against these; a grant gates which scopes the connection holds.
+    extensions: HashMap<String, ExtensionGrant>,
+    /// Domain split-tunnel rules (docs/SPLIT_TUNNEL.md) — LOCAL to this node, persisted to
+    /// `split.json` (0600), never gossiped. Each maps a domain to the mesh whose exit its
+    /// traffic egresses through.
+    split_rules: Vec<dns_split::SplitRule>,
+    /// The running split-tunnel proxy, if split mode is on (`None` = off).
+    split: Option<SplitActive>,
+}
+
+/// A running domain split-tunnel session (docs/SPLIT_TUNNEL.md).
+struct SplitActive {
+    /// The mesh whose tun/exit matched traffic is routed into.
+    mesh: MeshId,
+    /// The DNS-proxy task; aborted on `SplitOff`.
+    task: tokio::task::JoinHandle<()>,
+    /// Every `/32` IP we injected a host route for — removed on `SplitOff`.
+    injected: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Ipv4Addr>>>,
+}
+
+/// One enabled extension's grant — the local record a connector authenticates against.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ExtensionGrant {
+    id: String,
+    /// Local secret the connector presents in `Hello`. Not a network credential — it
+    /// only identifies which extension a local connection claims to be.
+    token: String,
+    /// The scopes the user granted (subset of what the extension requested).
+    scopes: Vec<String>,
+    enabled: bool,
+    /// Allowed on every mesh, including ones joined later. `#[serde(default)]` so grants
+    /// written before per-mesh scoping load as "no meshes" (safe — must be re-granted).
+    #[serde(default)]
+    all_meshes: bool,
+    /// The specific meshes this grant may touch (when `all_meshes` is false). A connector
+    /// can advertise/list/receive events ONLY for these — so enabling one connector never
+    /// silently exposes a mesh the user didn't pick (docs/EXTENSIONS.md §3).
+    #[serde(default)]
+    meshes: Vec<MeshId>,
+}
+
+impl ExtensionGrant {
+    fn view(&self) -> ExtensionView {
+        ExtensionView {
+            id: self.id.clone(),
+            scopes: self.scopes.clone(),
+            enabled: self.enabled,
+            token: self.token.clone(),
+            all_meshes: self.all_meshes,
+            meshes: self.meshes.clone(),
+        }
+    }
+    /// Whether this grant is allowed to touch `mesh`.
+    fn allows_mesh(&self, mesh: MeshId) -> bool {
+        self.all_meshes || self.meshes.contains(&mesh)
+    }
+}
+
+/// An event published on the extension bus (docs/EXTENSIONS.md §5). `topic` is the bus
+/// channel (`peer` | `service` | `exit` | `health`); `data` is a topic-specific JSON
+/// payload. `mesh` is the mesh the event concerns (so a subscriber only gets events for
+/// meshes its grant allows); `None` = node-level, delivered to any subscriber. Events are
+/// coarse — a connector that sees one re-queries authoritative state (e.g. `ListServices`).
+#[derive(Clone, Debug)]
+struct MeshEvent {
+    topic: &'static str,
+    mesh: Option<MeshId>,
+    ts_ms: u64,
+    data: serde_json::Value,
+}
+
+/// Bus capacity. A connector that falls this far behind gets a `Lagged` (we surface it as
+/// a `_lagged` marker so it re-queries) rather than stalling the publisher.
+const EVENT_BUS_CAP: usize = 1024;
+/// Per-connection outbound queue depth. Bounds memory if a connector stops reading its
+/// socket: responses backpressure the request loop, pushed events are dropped past this.
+const OUT_CHAN_CAP: usize = 256;
+/// Cap on registry entries per mesh (own + learned), mirroring the roster/flow caps.
+const MAX_SERVICES: usize = 256;
+
+/// Publish an event to the extension bus, if it is up and has subscribers. Best-effort:
+/// `send` errors only when there are zero receivers, which we ignore.
+fn emit(st: &State, topic: &'static str, mesh: Option<MeshId>, data: serde_json::Value) {
+    if let Some(bus) = &st.bus {
+        let _ = bus.send(MeshEvent {
+            topic,
+            mesh,
+            ts_ms: now_ms(),
+            data,
+        });
+    }
 }
 
 /// Work the IPC handler defers to the async caller (it can't `.await` or spawn
@@ -268,6 +401,14 @@ enum PostAction {
     Bringup(Bringup),
     /// Full tunnel just went up for this mesh — start the kill-switch.
     ArmKillSwitch(MeshId),
+    /// Start domain split-tunnel for this mesh (bind the DNS proxy + point the host resolver at
+    /// it). Async work done after the lock is released (docs/SPLIT_TUNNEL.md).
+    SplitOn(MeshId),
+    /// Stop domain split-tunnel (abort proxy, remove injected `/32` routes, restore DNS).
+    SplitOff,
+    /// Apply the (just-changed) `exitable` flag for this mesh: enable/disable forwarding+NAT for
+    /// its subnet so its members can/can't use us as their exit (docs/EXIT_SHARING.md).
+    ApplyExitable(MeshId),
     /// Cleanly stop the whole daemon (after the response is sent to the client).
     Shutdown,
 }
@@ -283,6 +424,7 @@ struct Bringup {
     epoch: u64,
     links: PeerLinks,
     exit_sel: SharedExit,
+    split_routes: SharedSplitRoutes,
     my_endpoint: SharedEndpoint,
     decrypt_fails: DecryptFails,
     traffic: SharedTraffic,
@@ -290,6 +432,7 @@ struct Bringup {
     flows: Vec<FlowRule>,
 }
 
+/// 🟢 Unix epoch milliseconds (control-plane timestamps).
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -341,6 +484,10 @@ struct PersistedMesh {
     /// Last-known peer endpoints — re-seeded on load so reconnect is fast (discovery
     /// then re-learns the rest, e.g. after a network change).
     peers: Vec<(MemberId, String)>,
+    /// Whether this node serves as an exit for this mesh (docs/EXIT_SHARING.md). `#[serde(default)]`
+    /// so older state files load as `false` (safe-off).
+    #[serde(default)]
+    exitable: bool,
 }
 
 /// Where to persist (env `MESHD_STATE_DIR`, else `$HOME/.lattice/meshd`), or `None`
@@ -366,6 +513,7 @@ fn persist_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// 🟢 On-disk JSON path for mesh `id` under the state dir.
 fn mesh_file(dir: &std::path::Path, id: MeshId) -> PathBuf {
     dir.join(format!("mesh-{id}.json"))
 }
@@ -395,6 +543,7 @@ fn to_persisted(ms: &MeshState) -> PersistedMesh {
             .iter()
             .map(|(m, l)| (*m, l.endpoint.to_string()))
             .collect(),
+        exitable: ms.exitable,
     }
 }
 
@@ -420,6 +569,8 @@ fn load_backup(path: &std::path::Path) -> Vec<PersistedMesh> {
 /// self-destruct / RemoveMesh erases the on-disk copy too).
 fn persist(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
+    persist_extensions(st);
+    persist_split(st);
     for ms in st.meshes.values() {
         let p = to_persisted(ms);
         if let Ok(json) = serde_json::to_vec_pretty(&p) {
@@ -450,6 +601,61 @@ fn persist(st: &State) {
             }
         }
     }
+}
+
+/// Path of the extension-grant store (docs/EXTENSIONS.md §3) within the persist dir.
+fn extensions_file(dir: &std::path::Path) -> PathBuf {
+    dir.join("extensions.json")
+}
+
+/// Persist the extension grants to `extensions.json` (0600). Called from [`persist`].
+fn persist_extensions(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    let grants: Vec<&ExtensionGrant> = st.extensions.values().collect();
+    if let Ok(json) = serde_json::to_vec_pretty(&grants) {
+        let f = extensions_file(dir);
+        if std::fs::write(&f, &json).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// Persist the local split-tunnel rules to `split.json` (0600). Called from [`persist`].
+fn persist_split(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    if let Ok(json) = serde_json::to_vec_pretty(&st.split_rules) {
+        let f = dir.join("split.json");
+        if std::fs::write(&f, &json).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// Load the split-tunnel rules at startup. Missing/corrupt file ⇒ empty.
+fn load_split(dir: &std::path::Path) -> Vec<dns_split::SplitRule> {
+    std::fs::read(dir.join("split.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Load the extension grants at startup (id → grant). Missing/corrupt file ⇒ empty.
+fn load_extensions(dir: &std::path::Path) -> HashMap<String, ExtensionGrant> {
+    let f = extensions_file(dir);
+    let Ok(bytes) = std::fs::read(&f) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<Vec<ExtensionGrant>>(&bytes)
+        .map(|v| v.into_iter().map(|g| (g.id.clone(), g)).collect())
+        .unwrap_or_default()
 }
 
 /// Load persisted meshes from disk (startup).
@@ -494,6 +700,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
     }
     let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(p.exit));
+    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
@@ -512,6 +719,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         epoch: p.epoch,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
+        split_routes: Arc::clone(&split_routes),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
@@ -529,6 +737,8 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         secret: p.secret,
         links,
         exit_sel,
+        split_routes,
+        exitable: p.exitable,
         tun_name: None,
         my_endpoint,
         dp_port: 0,
@@ -542,6 +752,8 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         traffic,
         flows: restored_flows,
         flow_version: p.flow_version,
+        services: Vec::new(),
+        service_seq: 0,
     };
     (ms, bringup)
 }
@@ -560,10 +772,108 @@ fn request_mutates(req: &Request) -> bool {
             | Request::Recipher { .. }
             | Request::AllClear { .. }
             | Request::ExpelMember { .. }
+            | Request::EnableExtension { .. }
+            | Request::DisableExtension { .. }
+            | Request::SplitAdd { .. }
+            | Request::SplitDel { .. }
+            | Request::SetExitable { .. }
     )
 }
 
+/// **RISK 🔴 HIGH** — apply the per-mesh `exitable` flag: enable or disable forwarding+NAT for
+/// this mesh's overlay subnet so its members can (or can't) use us as their internet exit
+/// (docs/EXIT_SHARING.md). Only this mesh's subnet is touched — other meshes are unaffected.
+async fn apply_exitable(mesh: MeshId, state: Arc<Mutex<State>>) {
+    // Snapshot: is it now exitable (or a pinned exit), and this mesh's subnet + isolate policy.
+    let info = {
+        let st = state.lock().unwrap();
+        st.meshes.get(&mesh).map(|ms| {
+            let p = ms.mesh.charter.overlay_prefix;
+            let subnet = format!("{}.{}.{}.0/24", p[0], p[1], mesh);
+            let isolate = matches!(ms.mesh.charter.exit_policy, ExitPolicy::Isolate);
+            (ms.exitable, subnet, isolate)
+        })
+    };
+    let Some((exitable, subnet, policy_isolate)) = info else {
+        return;
+    };
+    let pinned = std::env::var("MESHD_ADVERTISE").is_ok();
+    let serve = exitable || pinned;
+    let isolate = policy_isolate && pinned;
+    let _ = tokio::task::spawn_blocking(move || {
+        if serve {
+            exit::enable_nat(&subnet, isolate);
+        } else {
+            exit::disable_nat(&subnet);
+        }
+    })
+    .await;
+    elog!(
+        "meshd: mesh {mesh} exitable={exitable} — {} as an exit for its members",
+        if serve { "serving" } else { "NOT serving" }
+    );
+}
+
+/// Add a local split-tunnel rule (idempotent on `domain`). Persisted; takes effect the next time
+/// split mode is turned on for that mesh.
+fn split_add(st: &mut State, domain: String, mesh: MeshId, exit: MemberId) -> Response {
+    let domain = domain.trim().trim_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return err("empty domain");
+    }
+    let Some(ms) = st.meshes.get(&mesh) else {
+        return no_mesh(mesh);
+    };
+    // Guard the recurring "can't connect" trap: an exit must be a REAL other member, not yourself
+    // and not an unknown id. `0` = fall back to the mesh's configured exit.
+    if exit != 0 {
+        if exit == ms.my_id() {
+            return err(
+                "exit can't be this node itself — pick another member (e.g. the exit node)",
+            );
+        }
+        if !ms.roster().iter().any(|c| c.id == exit) {
+            return err("no such member in this mesh for the exit");
+        }
+    }
+    st.split_rules.retain(|r| r.domain != domain);
+    st.split_rules
+        .push(dns_split::SplitRule { domain, mesh, exit });
+    Response::Ok
+}
+
+/// Remove a local split-tunnel rule by exact domain.
+fn split_del(st: &mut State, domain: String) -> Response {
+    let domain = domain.trim().trim_matches('.').to_ascii_lowercase();
+    let before = st.split_rules.len();
+    st.split_rules.retain(|r| r.domain != domain);
+    if st.split_rules.len() == before {
+        err("no such split rule")
+    } else {
+        Response::Ok
+    }
+}
+
+/// Project the split-tunnel state for the CLI/GUI.
+fn split_list(st: &State) -> Response {
+    Response::Split(lattice_mesh::ipc::SplitView {
+        rules: st
+            .split_rules
+            .iter()
+            .map(|r| lattice_mesh::ipc::SplitRuleView {
+                domain: r.domain.clone(),
+                mesh: r.mesh,
+                exit: r.exit,
+            })
+            .collect(),
+        active_mesh: st.split.as_ref().map(|s| s.mesh),
+    })
+}
+
 #[tokio::main]
+/// **RISK 🟡 MED** — daemon startup: log the build id, set up the event bus + extension grants,
+/// load persisted meshes (and bring up their data planes if `DATA_PLANE`), then serve the IPC
+/// socket/pipe. The single-instance behaviour + restore-from-disk live here.
 async fn main() -> anyhow::Result<()> {
     // First line in the log: proves meshd actually launched (vs the GUI's launcher
     // failing before this point), and records the args we got.
@@ -572,6 +882,13 @@ async fn main() -> anyhow::Result<()> {
         "meshd: started pid={} args={:?}",
         std::process::id(),
         &argv[1..]
+    );
+    // Identify exactly which build this is, so "old vs new binary got mixed up" is answerable
+    // straight from the log (CARGO_PKG_VERSION + git SHA stamped by build.rs).
+    elog!(
+        "meshd: version v{} build {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("LATTICE_BUILD")
     );
     // The socket is the first non-flag argument; flags (`--data-plane`) may come in any
     // order. Falling back to the platform default lets a bare `meshd` still work.
@@ -591,6 +908,23 @@ async fn main() -> anyhow::Result<()> {
         let mut st = state.lock().unwrap();
         st.data_plane = data_plane;
         st.persist_dir.clone_from(&pdir);
+        // Extension event bus + persisted grants (docs/EXTENSIONS.md). The bus lives for
+        // the daemon's lifetime; connector connections subscribe on demand.
+        let (bus, _) = tokio::sync::broadcast::channel::<MeshEvent>(EVENT_BUS_CAP);
+        st.bus = Some(bus);
+        if let Some(dir) = &pdir {
+            st.split_rules = load_split(dir);
+            if !st.split_rules.is_empty() {
+                elog!(
+                    "meshd: loaded {} split-tunnel rule(s)",
+                    st.split_rules.len()
+                );
+            }
+            st.extensions = load_extensions(dir);
+            if !st.extensions.is_empty() {
+                elog!("meshd: loaded {} extension grant(s)", st.extensions.len());
+            }
+        }
     }
     elog!(
         "meshd: data-plane mode {}",
@@ -738,6 +1072,8 @@ async fn main() -> anyhow::Result<()> {
 /// Accept IPC connections forever. The transport is platform-specific (unix socket
 /// vs named pipe) but the per-connection protocol ([`serve_conn`]) is shared.
 #[cfg(unix)]
+/// 🟡 IPC accept loop (unix socket): bind, then for each connection check [`peer_allowed`] and
+/// spawn [`serve_conn`]. Includes the single-instance / stale-socket handling.
 async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     // Single-instance guard. Blindly `remove_file` + re-`bind` would steal the socket
     // from a meshd that is ALREADY running — but that old instance keeps its TUNs and
@@ -769,6 +1105,7 @@ async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<(
 
 /// The connecting process's uid, read from the socket (Linux `SO_PEERCRED`,
 /// macOS/BSD `getpeereid`). `None` if it can't be determined (we then fail open).
+/// 🟢 The connected peer's uid (Linux `SO_PEERCRED`) — for [`peer_allowed`].
 #[cfg(target_os = "linux")]
 fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -785,6 +1122,7 @@ fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
     (rc == 0).then_some(cred.uid)
 }
 
+/// 🟢 The connected peer's uid (BSD/macOS `LOCAL_PEERCRED`) — for [`peer_allowed`].
 #[cfg(all(unix, not(target_os = "linux")))]
 fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
     let mut uid: libc::uid_t = 0;
@@ -800,6 +1138,8 @@ fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
 /// `$SUDO_UID`, and the listed uids may connect — others are refused and logged.
 /// Use it on shared/multi-user hosts to stop another local user driving the daemon.
 #[cfg(unix)]
+/// **RISK 🟡 MED** — the socket-peer authorization gate: decides who may talk to the daemon
+/// (the opt-in `LATTICE_ALLOW_UID` policy over `SO_PEERCRED`). Loosening this exposes the IPC.
 fn peer_allowed(stream: &tokio::net::UnixStream) -> bool {
     use std::os::unix::io::AsRawFd;
     let allow = match std::env::var("LATTICE_ALLOW_UID") {
@@ -830,6 +1170,8 @@ fn peer_allowed(stream: &tokio::net::UnixStream) -> bool {
 }
 
 #[cfg(windows)]
+/// 🟡 IPC accept loop (Windows named pipe): a pool of pipe instances, each handed to a
+/// [`pipe_worker`]. (`max_instances` must be ≤254 — see the Windows meshd saga.)
 async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
     // A POOL of concurrent pipe instances so several simultaneous GUI requests don't get
@@ -874,6 +1216,7 @@ async fn accept_loop(pipe: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()>
 /// One pipe-pool worker: wait for a client, immediately re-arm a fresh listening
 /// instance (so the pool's listener count never dips), then serve the connection.
 #[cfg(windows)]
+/// 🟡 Serve one Windows named-pipe connection (the per-instance worker), then loop to accept.
 async fn pipe_worker(
     mut server: tokio::net::windows::named_pipe::NamedPipeServer,
     pipe: String,
@@ -899,58 +1242,336 @@ async fn pipe_worker(
     }
 }
 
+/// Per-connection extension session (docs/EXTENSIONS.md §3). Plain GUI/CLI clients leave
+/// this empty; a connector's `Hello` fills it and `Subscribe` attaches a forwarder.
+#[derive(Default)]
+struct ConnSession {
+    /// Set once a valid `Hello` authenticated this connection as an extension. All
+    /// authorization (scopes, per-mesh allow-list, `enabled`) is re-read from the LIVE grant
+    /// (`State::extensions`) on every gated request/event — never snapshotted here — so
+    /// `DisableExtension` / scope- or mesh-narrowing takes effect on an already-connected
+    /// connector (docs/EXTENSIONS.md §3).
+    ext_id: Option<String>,
+    /// Abort handle for the event-forwarder task spawned by `Subscribe` (one per
+    /// connection; a re-subscribe replaces it; connection close aborts it).
+    sub_abort: Option<tokio::task::AbortHandle>,
+}
+
+/// Random 16-byte hex grant token (docs/EXTENSIONS.md §3). Local secret, not a network
+/// credential — it only identifies which extension a local connection claims to be.
+fn gen_token() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The scope a bus `topic` requires (docs/EXTENSIONS.md §4/§5). `None` = unknown topic.
+fn scope_for_topic(topic: &str) -> Option<&'static str> {
+    match topic {
+        "peer" => Some("events:peer"),
+        "exit" => Some("events:exit"),
+        "health" => Some("events:health"),
+        "service" => Some("registry:read"),
+        _ => None,
+    }
+}
+
+/// Authenticate a connector connection from its `Hello` (docs/EXTENSIONS.md §3): match the
+/// token against the enabled grant for `id`, and on success bind the session to that grant
+/// id. Scopes/meshes are NOT snapshotted — they're re-read from the live grant on every
+/// gated request/event so a later disable/narrow takes effect. `version` is informational.
+fn ext_hello(
+    state: &Arc<Mutex<State>>,
+    sess: &mut ConnSession,
+    id: String,
+    _version: String,
+    token: String,
+) -> Response {
+    let st = state.lock().unwrap();
+    match st.extensions.get(&id) {
+        Some(g) if !g.enabled => err("extension is disabled"),
+        Some(g) if g.token == token => {
+            let scopes = g.scopes.clone();
+            sess.ext_id = Some(id);
+            Response::HelloOk { scopes }
+        }
+        Some(_) => err("invalid extension token"),
+        None => err("unknown extension — enable it first"),
+    }
+}
+
+/// Attach an event-forwarder to a `Subscribe`'d connection (docs/EXTENSIONS.md §5). Each
+/// requested topic must map to a granted scope; on success a task drains the bus and pushes
+/// scope-matching events (with a per-connection `seq`) onto the connection's outbound
+/// channel. A lag drops events and emits a `_lagged` marker so the connector re-queries.
+fn ext_subscribe(
+    state: &Arc<Mutex<State>>,
+    sess: &mut ConnSession,
+    out_tx: &tokio::sync::mpsc::Sender<String>,
+    topics: Vec<String>,
+) -> Response {
+    let Some(ext_id) = sess.ext_id.clone() else {
+        return err("not authenticated — send Hello first");
+    };
+    // Validate the requested topics against the LIVE grant (so a just-narrowed grant is
+    // honored at subscribe time too); the forwarder re-checks every event against it.
+    let mut wanted: HashSet<String> = HashSet::new();
+    {
+        let st = state.lock().unwrap();
+        let Some(g) = st.extensions.get(&ext_id).filter(|g| g.enabled) else {
+            return err("extension is disabled");
+        };
+        for t in &topics {
+            match scope_for_topic(t) {
+                Some(scope) if g.scopes.iter().any(|s| s == scope) => {
+                    wanted.insert(t.clone());
+                }
+                Some(scope) => return err(&format!("scope {scope} not granted for topic {t}")),
+                None => return err(&format!("unknown topic {t}")),
+            }
+        }
+    }
+    let rx = match state.lock().unwrap().bus.as_ref() {
+        Some(b) => b.subscribe(),
+        None => return err("event bus unavailable"),
+    };
+    // One subscription per connection — a re-subscribe replaces the prior forwarder.
+    if let Some(h) = sess.sub_abort.take() {
+        h.abort();
+    }
+    let tx = out_tx.clone();
+    let state = Arc::clone(state);
+    let fwd = tokio::spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
+        use tokio::sync::mpsc::error::TrySendError;
+        let mut rx = rx;
+        let mut seq: u64 = 0;
+        loop {
+            let env = match rx.recv().await {
+                Ok(ev) => {
+                    if !wanted.contains(ev.topic) {
+                        continue;
+                    }
+                    // Re-validate against the LIVE grant so DisableExtension / scope- or
+                    // mesh-narrowing takes effect on this already-attached stream: a removed
+                    // or disabled grant tears the stream down; a now-ungranted topic or an
+                    // out-of-scope mesh just drops the event.
+                    let decision = {
+                        let st = state.lock().unwrap();
+                        match st.extensions.get(&ext_id).filter(|g| g.enabled) {
+                            None => None, // disabled / removed → stop forwarding
+                            Some(g) => {
+                                let scope_ok = scope_for_topic(ev.topic)
+                                    .is_some_and(|sc| g.scopes.iter().any(|s| s == sc));
+                                let mesh_ok = ev.mesh.map_or(true, |m| g.allows_mesh(m));
+                                Some(scope_ok && mesh_ok)
+                            }
+                        }
+                    };
+                    match decision {
+                        None => break,
+                        Some(false) => continue,
+                        Some(true) => {}
+                    }
+                    seq += 1;
+                    Response::Event {
+                        topic: ev.topic.to_string(),
+                        seq,
+                        ts_ms: ev.ts_ms,
+                        data: ev.data,
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    seq += 1;
+                    Response::Event {
+                        topic: "_lagged".to_string(),
+                        seq,
+                        ts_ms: now_ms(),
+                        data: serde_json::json!({ "dropped": true }),
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            };
+            let line = match serde_json::to_string(&env) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            // Bounded outbound queue: a connector that stops draining its socket must not
+            // grow the daemon's memory without limit. Drop the event when the queue is full
+            // — the jump in `seq` is the documented signal to the connector to re-query.
+            match tx.try_send(line) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => break,
+            }
+        }
+    });
+    sess.sub_abort = Some(fwd.abort_handle());
+    Response::Ok
+}
+
+/// **RISK 🟡 MED** — connector authorization; re-reads the LIVE grant (not a Hello-time snapshot)
+/// so a disable/narrow takes effect on an open connection. A gap here = a privilege leak.
+/// Deny connector-only requests that lack the required scope/auth/mesh (docs/EXTENSIONS.md
+/// §3/§4). `None` = allowed. Management calls (Enable/Disable/List) stay open to trusted
+/// local clients. `ListServices` is open to the management GUI (no `Hello`) but, for a
+/// connector, is gated by `registry:read` + the per-mesh allow-list — so a connector can't
+/// read services from a mesh it wasn't enabled for.
+fn scope_gate(req: &Request, sess: &ConnSession, st: &State) -> Option<Response> {
+    // Re-validate connector requests against the LIVE grant (not a Hello-time snapshot) so
+    // DisableExtension / scope- or mesh-narrowing takes effect on an already-connected
+    // connector (docs/EXTENSIONS.md §3). `None` once a connector is authenticated means its
+    // grant was disabled or removed out from under it.
+    let live = sess
+        .ext_id
+        .as_ref()
+        .and_then(|id| st.extensions.get(id))
+        .filter(|g| g.enabled);
+    match req {
+        Request::Advertise { mesh, .. } | Request::Unadvertise { mesh, .. } => {
+            if sess.ext_id.is_none() {
+                Some(err("not authenticated — send Hello first"))
+            } else {
+                match live {
+                    None => Some(err("extension is disabled")),
+                    Some(g) if !g.scopes.iter().any(|s| s == "registry:advertise") => {
+                        Some(err("scope registry:advertise not granted"))
+                    }
+                    Some(g) if !g.allows_mesh(*mesh) => {
+                        Some(err("extension not enabled for this mesh"))
+                    }
+                    Some(_) => None,
+                }
+            }
+        }
+        // A connector (authenticated) is mesh-gated; the management GUI (no Hello) is not.
+        Request::ListServices { mesh, .. } if sess.ext_id.is_some() => match live {
+            None => Some(err("extension is disabled")),
+            Some(g) if !g.scopes.iter().any(|s| s == "registry:read") => {
+                Some(err("scope registry:read not granted"))
+            }
+            Some(g) if !g.allows_mesh(*mesh) => Some(err("extension not enabled for this mesh")),
+            Some(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// **RISK 🟡 MED** — bounded outbound channel (backpressure vs leak), the Shutdown-ack must FLUSH
+/// before teardown, and an event-forwarder interleaves with request/response. Subtle ordering.
 /// One IPC connection: newline-JSON [`Request`] in, [`Response`] out, until close.
+///
+/// A plain client (GUI/CLI) gets strict request→response. A connector that sends
+/// [`Request::Subscribe`] turns the connection into a stream: the daemon keeps answering
+/// its commands AND pushes [`Response::Event`] lines as mesh events occur. To let those
+/// interleave safely, every outbound line goes through one writer task fed by an mpsc, so
+/// the request loop and the event forwarder never half-write over each other.
 async fn serve_conn<S>(stream: S, state: Arc<Mutex<State>>)
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = BufReader::new(rd).lines();
+    // Bounded so a connector that stops draining its socket backpressures (responses) or is
+    // dropped (events) instead of growing the daemon's memory without limit.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(OUT_CHAN_CAP);
+    let writer = tokio::spawn(async move {
+        while let Some(mut line) = out_rx.recv().await {
+            line.push('\n');
+            if wr.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut sess = ConnSession::default();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
         let mut shutdown = false;
         let resp = match serde_json::from_str::<Request>(&line) {
+            // Session/streaming requests need the per-connection session + outbound channel,
+            // so they're handled here rather than in the stateless `handle`.
+            Ok(Request::Hello { id, version, token }) => {
+                ext_hello(&state, &mut sess, id, version, token)
+            }
+            Ok(Request::Subscribe { topics }) => ext_subscribe(&state, &mut sess, &out_tx, topics),
             Ok(req) => {
-                // Handle under the lock; do any async data-plane bringup AFTER
-                // releasing it (TUN/UDP open is async and must not block IPC).
-                let mutates = request_mutates(&req);
-                let (resp, action) = {
-                    let mut st = state.lock().unwrap();
-                    handle(req, &mut st)
+                let denied = {
+                    let st = state.lock().unwrap();
+                    scope_gate(&req, &sess, &st)
                 };
-                match action {
-                    Some(PostAction::Bringup(b)) => bringup_dataplane(b, Arc::clone(&state)).await,
-                    Some(PostAction::ArmKillSwitch(mesh)) => {
-                        arm_kill_switch(mesh, Arc::clone(&state))
+                if let Some(denied) = denied {
+                    denied
+                } else {
+                    // Handle under the lock; do any async data-plane bringup AFTER
+                    // releasing it (TUN/UDP open is async and must not block IPC).
+                    let mutates = request_mutates(&req);
+                    let (resp, action) = {
+                        let mut st = state.lock().unwrap();
+                        handle(req, &mut st)
+                    };
+                    match action {
+                        Some(PostAction::Bringup(b)) => {
+                            bringup_dataplane(b, Arc::clone(&state)).await
+                        }
+                        Some(PostAction::ArmKillSwitch(mesh)) => {
+                            arm_kill_switch(mesh, Arc::clone(&state))
+                        }
+                        Some(PostAction::SplitOn(mesh)) => {
+                            split_enable(mesh, Arc::clone(&state)).await
+                        }
+                        Some(PostAction::SplitOff) => split_disable(Arc::clone(&state)).await,
+                        Some(PostAction::ApplyExitable(mesh)) => {
+                            apply_exitable(mesh, Arc::clone(&state)).await
+                        }
+                        Some(PostAction::Shutdown) => shutdown = true,
+                        None => {}
                     }
-                    Some(PostAction::Shutdown) => shutdown = true,
-                    None => {}
+                    if mutates {
+                        persist(&state.lock().unwrap()); // P-S1: save after a state change
+                    }
+                    resp
                 }
-                if mutates {
-                    persist(&state.lock().unwrap()); // P-S1: save after a state change
-                }
-                resp
             }
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
         };
-        let mut out = serde_json::to_string(&resp)
+        let out = serde_json::to_string(&resp)
             .unwrap_or_else(|_| "{\"Error\":{\"message\":\"encode failed\"}}".to_string());
-        out.push('\n');
-        let wrote = wr.write_all(out.as_bytes()).await.is_ok();
-        // Acknowledge the request first, THEN tear the daemon down cleanly.
+        // Responses use the blocking (await) send: if the client stops reading, this
+        // backpressures the request loop rather than queueing unboundedly.
+        let sent = out_tx.send(out).await.is_ok();
+        // Acknowledge the request first, THEN tear the daemon down cleanly. The ack is
+        // queued to the writer task, so on shutdown we FLUSH it (drop our sender + await
+        // the writer) before stopping the daemon — preserving the original write-then-
+        // shutdown ordering so the client always receives its Shutdown ack.
         if shutdown {
+            if let Some(h) = sess.sub_abort.take() {
+                h.abort();
+            }
+            drop(out_tx);
+            let _ = writer.await;
             shutdown_daemon(&state).await;
+            return;
         }
-        if !wrote {
+        if !sent {
             break;
         }
     }
+    // Connection closed: stop the event forwarder + the writer so neither task leaks.
+    if let Some(h) = sess.sub_abort.take() {
+        h.abort();
+    }
+    drop(out_tx);
+    let _ = writer.await;
 }
 
+/// **RISK 🔴 HIGH** — restores routes/DNS BEFORE aborting the data plane; skipping a restore
+/// leaves the host on a dead tunnel (no internet). Keep the restore-then-teardown order.
 /// Cleanly stop the daemon (the `Shutdown` request): if a full tunnel is up, restore the
 /// host's routes/DNS first so closing the TUN doesn't strand the default route on a dead
 /// interface; otherwise just clear any stale exit pin. Then abort every mesh's data-plane
@@ -980,6 +1601,8 @@ async fn shutdown_daemon(state: &Arc<Mutex<State>>) {
     std::process::exit(0);
 }
 
+/// **RISK 🔴 HIGH** — opens the live TUN/UDP, applies routes/NAT, arms the kill-switch; where
+/// full-tunnel is wired (the macOS regressions surfaced through here). Touches the host network.
 /// Open the per-mesh TUN + UDP and spawn the data-plane loop. Failures (e.g. no
 /// root for the TUN) are logged and non-fatal: meshd keeps serving the control
 /// plane. The `links`/`exit_sel` handles are shared with [`MeshState`].
@@ -1073,24 +1696,48 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     let tun_name = tun.name().map(|s| s.to_string());
     // Exit-egress policy (docs/EXIT_POLICY.md): under Isolate, enable_nat also pins
     // traffic we forward for others to our real WAN. Default Isolate if the mesh is gone.
-    let isolate = {
+    let (isolate, serve) = {
         let mut st = state.lock().unwrap();
-        let isolate = st
+        let policy_isolate = st
             .meshes
             .get(&b.mesh_id)
             .map(|ms| matches!(ms.mesh.charter.exit_policy, ExitPolicy::Isolate))
             .unwrap_or(true);
+        let exitable = st
+            .meshes
+            .get(&b.mesh_id)
+            .map(|ms| ms.exitable)
+            .unwrap_or(false);
         if let Some(ms) = st.meshes.get_mut(&b.mesh_id) {
             ms.tun_name = tun_name.clone();
             ms.dp_port = port; // local data-plane port — advertised in the LAN beacon
             ms.dp_error = None; // bound cleanly — clear any prior "port busy" error
         }
-        isolate
+        // SERVE AS AN EXIT for this mesh ONLY if the user made it `exitable` — or this is a
+        // dedicated pinned exit (MESHD_ADVERTISE). Default OFF: a mesh member (incl. an intruder)
+        // can't route their internet through this node unless it explicitly opted in for that
+        // mesh. Blast radius stays on nodes that chose to serve (docs/EXIT_SHARING.md).
+        let is_exit_node = std::env::var("MESHD_ADVERTISE").is_ok();
+        // The isolate `route-to`/side-route pins forwarded traffic to our real WAN; its selector
+        // also matches THIS node's own overlay IP, so only a real pinned exit gets it (a client
+        // would divert its own full-tunnel egress off the tun and wedge). Regression: 5cfa960.
+        (policy_isolate && is_exit_node, exitable || is_exit_node)
     };
-    // enable_nat shells out (pfctl/sysctl on unix, several PowerShell cmdlets on
-    // Windows) — synchronous + slow, so run it off the async runtime to avoid stalling
-    // IPC while a mesh is brought up.
-    let _ = tokio::task::spawn_blocking(move || exit::enable_nat(isolate)).await;
+    // Reconcile NAT to the exitable decision at every bringup. Serving → NAT this mesh's OWN
+    // subnet only (never all 100.64/10). NOT serving → disable_nat, which also PURGES any legacy
+    // all-overlay MASQUERADE left by older always-on builds — else a previously-always-on node
+    // would keep forwarding for everyone despite `exitable=off` (caught by a cross-node test).
+    {
+        let subnet = format!("{}.{}.{}.0/24", b.prefix[0], b.prefix[1], b.mesh_id);
+        let _ = tokio::task::spawn_blocking(move || {
+            if serve {
+                exit::enable_nat(&subnet, isolate);
+            } else {
+                exit::disable_nat(&subnet);
+            }
+        })
+        .await;
+    }
     // This node's own reachable address, advertised in the endpoint gossip so peers
     // can reach us without a manual SetPeer (docs/DISCOVERY.md §2). A public node
     // (the Oracle exit) PINS it via MESHD_ADVERTISE=ip:port — never overridden;
@@ -1124,6 +1771,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         applied_tx,
         b.decrypt_fails,
         b.traffic,
+        b.split_routes,
     ));
     // Record the loop's abort handle (RemoveMesh stops it) + the command sender.
     if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
@@ -1141,6 +1789,11 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                 continue;
             };
             let mut persist_after = false;
+            // Deferred event emits: `ms` (a &mut into `state`) is alive across the match,
+            // so we can't borrow `state` for `emit` until after it. NLL frees `ms` once the
+            // match ends, so we flag here and emit below.
+            let mut emit_peer = false;
+            let mut emit_service = false;
             match ev {
                 LoopEvent::Recipher(r) => {
                     ms.secret = r.secret;
@@ -1190,6 +1843,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                                     "meshd: mesh {mid} roster grew {before} -> {after} via gossip"
                                 );
                                 persist_after = true;
+                                emit_peer = true;
                             }
                         }
                     }
@@ -1222,6 +1876,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                             let after = ms.roster().len();
                             if changed {
                                 persist_after = true;
+                                emit_peer = true;
                                 if after < before {
                                     elog!("meshd: mesh {mid} roster shrank {before} -> {after} via revocation gossip");
                                 }
@@ -1257,9 +1912,41 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                         }
                     }
                 }
+                // A peer gossiped its advertised services — merge them (soft state,
+                // newest-per-(member, proto) wins) so the registry converges mesh-wide. Not
+                // persisted; a `service` event tells subscribed connectors to re-query.
+                LoopEvent::Registry(bytes) => {
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = serde_json::from_slice::<Vec<ServiceRecord>>(&bytes) {
+                            let me = ms.my_id();
+                            // Don't let a peer's batch overwrite our OWN records.
+                            let incoming = incoming.into_iter().filter(|r| r.member != me);
+                            if registry::merge(&mut ms.services, incoming, now_ms(), MAX_SERVICES) {
+                                emit_service = true;
+                            }
+                        }
+                    }
+                }
             }
             if persist_after {
                 persist(&state);
+            }
+            // `ms` is dead after the match (NLL), so `state` can be shared-borrowed now.
+            if emit_peer {
+                emit(
+                    &state,
+                    "peer",
+                    Some(mid),
+                    serde_json::json!({ "kind": "roster_changed", "mesh": mid }),
+                );
+            }
+            if emit_service {
+                emit(
+                    &state,
+                    "service",
+                    Some(mid),
+                    serde_json::json!({ "kind": "changed", "mesh": mid }),
+                );
             }
         }
     });
@@ -1277,7 +1964,14 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(ROSTER_GOSSIP_TICK_SECS)).await;
             let sends: Vec<(u8, Vec<u8>, Vec<MemberId>, UnboundedSender<LoopCmd>)> = {
-                let st = state.lock().unwrap();
+                let mut st = state.lock().unwrap();
+                // Drop peer service records that stopped refreshing (crash / unadvertise)
+                // before building this round's gossip (docs/EXTENSIONS.md §6).
+                let now = now_ms();
+                for ms in st.meshes.values_mut() {
+                    let me = ms.my_id();
+                    registry::expire(&mut ms.services, me, now);
+                }
                 st.meshes
                     .values()
                     .flat_map(|ms| {
@@ -1309,7 +2003,22 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
                             if let Ok(enc) = bincode::serialize(&ms.flows) {
                                 let mut body = ms.flow_version.to_be_bytes().to_vec();
                                 body.extend_from_slice(&enc);
-                                out.push((CTRL_FLOWS, body, peers, tx));
+                                out.push((CTRL_FLOWS, body, peers.clone(), tx.clone()));
+                            }
+                        }
+                        // Service registry — gossip only OUR OWN advertised services (never
+                        // re-broadcast peers', or a crashed node's record would never die).
+                        // Each node advertises its own; peers expire what stops arriving.
+                        let me = ms.my_id();
+                        let own: Vec<ServiceRecord> = ms
+                            .services
+                            .iter()
+                            .filter(|e| e.rec.member == me)
+                            .map(|e| e.rec.clone())
+                            .collect();
+                        if !own.is_empty() {
+                            if let Ok(body) = serde_json::to_vec(&own) {
+                                out.push((CTRL_REGISTRY, body, peers, tx));
                             }
                         }
                         out
@@ -1608,6 +2317,7 @@ fn local_ip() -> Option<std::net::IpAddr> {
 /// distorted when full-tunnel diverts the default route through the overlay — so it's a
 /// stable "which network am I physically on" signal for topology grouping. Picks the first
 /// up, non-loopback, RFC1918 IPv4, skipping the mesh overlay (`100.64.0.0/10`) and tunnels.
+/// 🟢 This host's primary private LAN IPv4 (for the LAN beacon / advertise address). Unix.
 #[cfg(unix)]
 fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     use std::net::Ipv4Addr;
@@ -1649,6 +2359,7 @@ fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
+/// 🟢 This host's primary private LAN IPv4 (for the LAN beacon / advertise address). Non-unix.
 #[cfg(not(unix))]
 fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     match local_ip() {
@@ -1657,11 +2368,105 @@ fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
+/// **RISK 🔴 HIGH** — auto-reverts full-tunnel if the exit "isn't passing traffic". A false
+/// revert cuts a working VPN; a missing one strands the host. `Opkts=0`/"not passing" has MANY
+/// causes (pf rule, route loop, wrong exit, wedge) — read docs/ERRORS.md before changing the probe.
 /// Kill-switch watchdog (from v1). Full tunnel diverts the host default route
 /// through the exit; if that path can't carry traffic the host is stranded OFFLINE.
 /// Every ~20s probe the internet THROUGH the tunnel (TCP connect to 1.1.1.1:443 —
 /// it travels TUN→exit, so success proves the exit forwards). The moment a probe
 /// fails, auto-revert to direct internet so the user is never cut off.
+/// **RISK 🔴 HIGH** — turn ON domain split-tunnel (docs/SPLIT_TUNNEL.md): point the host resolver
+/// at our local DNS proxy and spawn it, so this mesh's rules pull matched domains' IPs into the
+/// mesh via `/32` routes. Does NOT change the default route — normal internet is untouched.
+/// Idempotent-ish: a prior session is stopped first.
+async fn split_enable(mesh: MeshId, state: Arc<Mutex<State>>) {
+    // Stop any prior session cleanly first.
+    split_disable(Arc::clone(&state)).await;
+
+    // Snapshot what the proxy needs: the mesh's tun name, its split-routes handle (shared with
+    // the data-plane loop), and the rules for THIS mesh.
+    let (tun, split_routes, rules) = {
+        let st = state.lock().unwrap();
+        let m = st.meshes.get(&mesh);
+        let tun = m.and_then(|m| m.tun_name.clone());
+        let split_routes = m.map(|m| Arc::clone(&m.split_routes));
+        let rules: Vec<dns_split::SplitRule> = st
+            .split_rules
+            .iter()
+            .filter(|r| r.mesh == mesh)
+            .cloned()
+            .collect();
+        (tun, split_routes, rules)
+    };
+    let Some(split_routes) = split_routes else {
+        elog!("meshd: split-tunnel: mesh {mesh} not found");
+        return;
+    };
+    let Some(tun) = tun else {
+        elog!("meshd: split-tunnel: mesh {mesh} has no data-plane tun (is the data plane up?)");
+        return;
+    };
+
+    // Detect the real upstream resolver BEFORE we hijack DNS, so normal names still resolve.
+    let upstream = tokio::task::spawn_blocking(dns_split::detect_upstream)
+        .await
+        .unwrap_or_else(|_| "1.1.1.1:53".parse().unwrap());
+
+    // Point the host resolver at our proxy (backs up the prior DNS for restore).
+    let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+    if let Err(e) = tokio::task::spawn_blocking(move || exit::set_dns(&[loopback]))
+        .await
+        .unwrap_or(Ok(()))
+    {
+        elog!("meshd: split-tunnel: could not set host DNS to the proxy: {e}");
+        return;
+    }
+
+    let injected = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let task = tokio::spawn(dns_split::run_proxy(
+        tun.clone(),
+        rules,
+        upstream,
+        std::sync::Arc::clone(&injected),
+        Arc::clone(&split_routes),
+    ));
+    state.lock().unwrap().split = Some(SplitActive {
+        mesh,
+        task,
+        injected,
+    });
+    elog!("meshd: split-tunnel ON for mesh {mesh} (upstream {upstream}, tun {tun})");
+}
+
+/// **RISK 🔴 HIGH** — turn OFF domain split-tunnel: abort the proxy, remove every injected `/32`
+/// host route, and restore the host DNS. Safe no-op if split mode was already off.
+async fn split_disable(state: Arc<Mutex<State>>) {
+    let active = {
+        let mut st = state.lock().unwrap();
+        let active = st.split.take();
+        // Clear the data-plane split-route table for that mesh so its traffic reverts to normal.
+        if let Some(a) = &active {
+            if let Some(m) = st.meshes.get(&a.mesh) {
+                m.split_routes.lock().unwrap().clear();
+            }
+        }
+        active
+    };
+    let Some(active) = active else { return };
+    active.task.abort();
+    let ips: Vec<Ipv4Addr> = active.injected.lock().unwrap().iter().copied().collect();
+    tokio::task::spawn_blocking(move || {
+        for ip in ips {
+            exit::unroute_host(ip);
+        }
+        exit::restore_dns();
+    })
+    .await
+    .ok();
+    elog!("meshd: split-tunnel OFF (routes + DNS restored)");
+}
+
 fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
     tokio::spawn(async move {
         loop {
@@ -1693,6 +2498,11 @@ fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
     });
 }
 
+/// **RISK 🟡 MED** — the central IPC request dispatcher (a big `match` over [`Request`]). Mutates
+/// all mesh state under the lock and returns a [`Response`] + an optional [`PostAction`] (the
+/// async/side-effecting work — data-plane bringup, kill-switch arm, shutdown — done by the caller
+/// AFTER releasing the lock). Mis-wiring a new request arm (or doing async work here) is the
+/// common bug. Connector-gated requests are pre-screened by [`scope_gate`].
 fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
     match req {
         Request::CreateMesh {
@@ -1852,6 +2662,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     epoch: ms.epoch,
                     exit: ms.mesh.exit,
                     is_current: cur == Some(ms.mesh.id),
+                    exitable: ms.exitable,
                     attack_armed_secs_left: ms.attack_armed_at.map(|armed| {
                         ATTACK_GRACE_SECS.saturating_sub(now.saturating_sub(armed) / 1000)
                     }),
@@ -2055,6 +2866,12 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     exit::restore_routes();
                     exit::restore_dns();
                 }
+                emit(
+                    st,
+                    "peer",
+                    Some(mesh),
+                    serde_json::json!({ "kind": "mesh_removed", "mesh": mesh }),
+                );
                 (Response::Ok, None)
             } else {
                 (no_mesh(mesh), None)
@@ -2145,6 +2962,56 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             ),
             None,
         ),
+
+        // --- extensions / connectors (docs/EXTENSIONS.md) --------------------------
+        Request::EnableExtension {
+            id,
+            scopes,
+            all_meshes,
+            meshes,
+        } => (enable_extension(st, id, scopes, all_meshes, meshes), None),
+        Request::DisableExtension { id } => match st.extensions.get_mut(&id) {
+            Some(g) => {
+                g.enabled = false;
+                (Response::Ok, None)
+            }
+            None => (err("unknown extension"), None),
+        },
+        Request::ListExtensions => (
+            Response::Extensions(st.extensions.values().map(|g| g.view()).collect()),
+            None,
+        ),
+        Request::Advertise {
+            mesh,
+            proto,
+            port,
+            name,
+            meta,
+        } => (advertise(st, mesh, proto, port, name, meta), None),
+        Request::Unadvertise { mesh, proto } => (unadvertise(st, mesh, proto), None),
+        Request::ListServices { mesh, proto } => (list_services(st, mesh, proto), None),
+
+        // --- domain split-tunnel (docs/SPLIT_TUNNEL.md), local to this node ------------------
+        Request::SplitAdd { domain, mesh, exit } => (split_add(st, domain, mesh, exit), None),
+        Request::SplitDel { domain } => (split_del(st, domain), None),
+        Request::SplitList => (split_list(st), None),
+        Request::SplitOn { mesh } => {
+            if !st.meshes.contains_key(&mesh) {
+                (no_mesh(mesh), None)
+            } else {
+                (Response::Ok, Some(PostAction::SplitOn(mesh)))
+            }
+        }
+        Request::SplitOff => (Response::Ok, Some(PostAction::SplitOff)),
+
+        Request::SetExitable { mesh, enabled } => {
+            if let Some(ms) = st.meshes.get_mut(&mesh) {
+                ms.exitable = enabled;
+                (Response::Ok, Some(PostAction::ApplyExitable(mesh)))
+            } else {
+                (no_mesh(mesh), None)
+            }
+        }
 
         Request::CreateInvite {
             mesh,
@@ -2312,9 +3179,18 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 Err(e) => (err(&format!("bad invite contents: {e}")), None),
             }
         }
+
+        // Per-connection session requests are intercepted in `serve_conn` (they need the
+        // connection's session + outbound channel); they never reach the stateless handler.
+        Request::Hello { .. } | Request::Subscribe { .. } => (
+            err("session request must be sent on a connector connection"),
+            None,
+        ),
     }
 }
 
+/// **RISK 🟡 MED** — install a mesh from an invite blob (keys, roster, endpoints) and persist it;
+/// returns a `Bringup` PostAction so the caller starts its data plane. Mesh-lifecycle correctness.
 fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction>) {
     if st.meshes.contains_key(&invite.mesh_id) {
         return (err(&format!("already in mesh {}", invite.mesh_id)), None);
@@ -2375,6 +3251,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     }
     let links = seed_links(seed);
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
@@ -2394,6 +3271,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         epoch,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
+        split_routes: Arc::clone(&split_routes),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
@@ -2413,6 +3291,8 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             secret,
             links,
             exit_sel,
+            split_routes,
+            exitable: false,
             tun_name: None,
             my_endpoint,
             dp_port: 0,
@@ -2426,7 +3306,15 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             traffic,
             flows: lattice_proto::flow::default_table(),
             flow_version: 0,
+            services: Vec::new(),
+            service_seq: 0,
         },
+    );
+    emit(
+        st,
+        "peer",
+        Some(invite.mesh_id),
+        serde_json::json!({ "kind": "mesh_added", "mesh": invite.mesh_id }),
     );
     (
         Response::MeshCreated {
@@ -2436,6 +3324,8 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     )
 }
 
+/// **RISK 🟡 MED** — genesis a brand-new mesh (master keypair, charter, self as first member) and
+/// persist it; returns a `Bringup` PostAction. Mesh-lifecycle correctness.
 fn create_mesh(
     st: &mut State,
     name: String,
@@ -2533,6 +3423,7 @@ fn create_mesh(
     let secret: [u8; 32] = rand::random();
     let links = seed_links(HashMap::new());
     let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
     let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
     let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
     let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
@@ -2548,6 +3439,7 @@ fn create_mesh(
         epoch: 0,
         links: Arc::clone(&links),
         exit_sel: Arc::clone(&exit_sel),
+        split_routes: Arc::clone(&split_routes),
         my_endpoint: Arc::clone(&my_endpoint),
         decrypt_fails: Arc::clone(&decrypt_fails),
         traffic: Arc::clone(&traffic),
@@ -2567,6 +3459,8 @@ fn create_mesh(
             secret,
             links,
             exit_sel,
+            split_routes,
+            exitable: false,
             tun_name: None,
             my_endpoint,
             dp_port: 0,
@@ -2580,7 +3474,15 @@ fn create_mesh(
             traffic,
             flows: lattice_proto::flow::default_table(),
             flow_version: 0,
+            services: Vec::new(),
+            service_seq: 0,
         },
+    );
+    emit(
+        st,
+        "peer",
+        Some(id),
+        serde_json::json!({ "kind": "mesh_added", "mesh": id }),
     );
     (
         Response::MeshCreated { mesh: id },
@@ -2686,6 +3588,7 @@ fn expel_member(st: &mut State, mesh: MeshId, member: MemberId) -> (Response, Op
     (Response::Info { message }, None)
 }
 
+/// 🟡 Project a `MeshState` into the IPC `MeshDetail` (members, health, exit, policy) for `MeshInfo`.
 fn detail(ms: &MeshState) -> MeshDetail {
     let me = ms.my_key.pubkey();
     let now = now_ms();
@@ -2766,6 +3669,29 @@ fn detail(ms: &MeshState) -> MeshDetail {
             // reach this member at over the tunnel (e.g. ssh user@100.80.1.1).
             let p = ms.mesh.charter.overlay_prefix;
             let overlay_ip = format!("{}.{}.{}.{}", p[0], p[1], ms.mesh.id, c.id);
+            // The auto-discovered path (for `lattice conns`): `direct` if a fresh direct frame,
+            // `relay` if reachable only via a public hop, `offline` if not heard, `me` for self.
+            let (path, last_seen_secs) = if is_me {
+                ("me".to_string(), Some(0))
+            } else {
+                match link {
+                    Some(l) if l.last_seen_ms != 0 => {
+                        let age = now.saturating_sub(l.last_seen_ms) / 1000;
+                        let live = now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS;
+                        let direct = l.last_direct_ms != 0
+                            && now.saturating_sub(l.last_direct_ms) < LIVE_WINDOW_MS;
+                        let p = if !live {
+                            "offline"
+                        } else if direct {
+                            "direct"
+                        } else {
+                            "relay"
+                        };
+                        (p.to_string(), Some(age))
+                    }
+                    _ => ("offline".to_string(), None),
+                }
+            };
             MemberView {
                 id: c.id,
                 name: c.name.clone(),
@@ -2775,6 +3701,8 @@ fn detail(ms: &MeshState) -> MeshDetail {
                 endpoint,
                 state,
                 reason,
+                path,
+                last_seen_secs,
             }
         })
         .collect();
@@ -2831,6 +3759,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
         epoch: ms.epoch,
         me: ms.my_id(),
         exit: ms.mesh.exit,
+        exitable: ms.exitable,
         invite: format!("{:?}", ch.invite),
         trigger: format!("{:?}", ch.trigger),
         max_members: ch.max_members,
@@ -2850,6 +3779,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
     }
 }
 
+/// 🟢 Human name for an IP protocol number (tcp/udp/icmp/…) for the traffic monitor.
 fn proto_name(p: u8) -> String {
     match p {
         1 => "icmp".into(),
@@ -2935,18 +3865,182 @@ fn traffic_view(st: &State, mesh: Option<MeshId>) -> TrafficView {
     v
 }
 
+/// 🟢 Standard "no such mesh" error response.
 fn no_mesh(id: MeshId) -> Response {
     Response::Error {
         message: format!("no mesh {id}"),
     }
 }
 
+/// 🟢 Build a `Response::Error` from a message.
 fn err(message: &str) -> Response {
     Response::Error {
         message: message.to_string(),
     }
 }
 
+// ---- extensions / connectors (docs/EXTENSIONS.md) ----------------------------------
+
+/// Enable an extension and (re)grant it `scopes` + the meshes it may touch (`all_meshes`
+/// or the `meshes` allow-list). A first enable mints a token; re-enabling keeps the existing
+/// token so a running connector's `Hello` keeps working, and just updates the scope/mesh set
+/// + flips `enabled` on. Returns the grant view (carries the token).
+fn enable_extension(
+    st: &mut State,
+    id: String,
+    scopes: Vec<String>,
+    all_meshes: bool,
+    mut meshes: Vec<MeshId>,
+) -> Response {
+    // Keep only meshes that actually exist on this node (drop stale/typo ids).
+    meshes.retain(|m| st.meshes.contains_key(m));
+    meshes.sort_unstable();
+    meshes.dedup();
+    let grant = st
+        .extensions
+        .entry(id.clone())
+        .or_insert_with(|| ExtensionGrant {
+            id,
+            token: gen_token(),
+            scopes: Vec::new(),
+            enabled: false,
+            all_meshes: false,
+            meshes: Vec::new(),
+        });
+    grant.scopes = scopes;
+    grant.all_meshes = all_meshes;
+    grant.meshes = meshes;
+    grant.enabled = true;
+    Response::Extension(grant.view())
+}
+
+/// Advertise that THIS node offers `proto` on its overlay IP at `port` (docs/EXTENSIONS.md
+/// §6). Supersedes our prior record for the same proto (bumped `seq`); the next gossip tick
+/// carries it mesh-wide. Emits a `service` event so subscribed connectors re-query.
+fn advertise(
+    st: &mut State,
+    mesh: MeshId,
+    proto: String,
+    port: u16,
+    name: String,
+    meta: serde_json::Value,
+) -> Response {
+    let now = now_ms();
+    {
+        let Some(ms) = st.meshes.get_mut(&mesh) else {
+            return no_mesh(mesh);
+        };
+        let member = ms.my_id();
+        ms.service_seq += 1;
+        let rec = ServiceRecord {
+            member,
+            proto: proto.clone(),
+            port,
+            name,
+            meta,
+            seq: ms.service_seq,
+        };
+        match ms
+            .services
+            .iter_mut()
+            .find(|e| e.rec.member == member && e.rec.proto == proto)
+        {
+            Some(e) => {
+                e.rec = rec;
+                e.last_refresh_ms = now;
+            }
+            None => {
+                if ms.services.len() >= MAX_SERVICES {
+                    return err("service registry full");
+                }
+                ms.services.push(ServiceEntry {
+                    rec,
+                    last_refresh_ms: now,
+                });
+            }
+        }
+    }
+    emit(
+        st,
+        "service",
+        Some(mesh),
+        serde_json::json!({ "kind": "advertised", "mesh": mesh, "proto": proto }),
+    );
+    Response::Ok
+}
+
+/// Withdraw a service this node advertised (docs/EXTENSIONS.md §6). Removed locally and no
+/// longer gossiped; peers expire it after [`registry::SERVICE_TTL_MS`].
+fn unadvertise(st: &mut State, mesh: MeshId, proto: String) -> Response {
+    {
+        let Some(ms) = st.meshes.get_mut(&mesh) else {
+            return no_mesh(mesh);
+        };
+        let member = ms.my_id();
+        let before = ms.services.len();
+        ms.services
+            .retain(|e| !(e.rec.member == member && e.rec.proto == proto));
+        if ms.services.len() == before {
+            return err("no such advertised service");
+        }
+    }
+    emit(
+        st,
+        "service",
+        Some(mesh),
+        serde_json::json!({ "kind": "withdrawn", "mesh": mesh, "proto": proto }),
+    );
+    Response::Ok
+}
+
+/// Discover services advertised in `mesh` (optionally one `proto`), each resolved to the
+/// owner's overlay IP + online state (docs/EXTENSIONS.md §6). Expired peer entries are
+/// hidden; our own entries never expire.
+fn list_services(st: &State, mesh: MeshId, proto: Option<String>) -> Response {
+    let Some(ms) = st.meshes.get(&mesh) else {
+        return no_mesh(mesh);
+    };
+    let now = now_ms();
+    let me = ms.my_id();
+    let p = ms.mesh.charter.overlay_prefix;
+    let roster = ms.roster();
+    let links = ms.links.lock().unwrap();
+    let mut out = Vec::new();
+    for e in &ms.services {
+        if let Some(f) = &proto {
+            if &e.rec.proto != f {
+                continue;
+            }
+        }
+        if e.rec.member != me && now.saturating_sub(e.last_refresh_ms) >= registry::SERVICE_TTL_MS {
+            continue;
+        }
+        let member_name = roster
+            .iter()
+            .find(|c| c.id == e.rec.member)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let online = e.rec.member == me
+            || links
+                .get(&e.rec.member)
+                .map(|l| l.last_seen_ms != 0 && now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS)
+                .unwrap_or(false);
+        out.push(ServiceView {
+            mesh,
+            member: e.rec.member,
+            member_name,
+            overlay_ip: format!("{}.{}.{}.{}", p[0], p[1], ms.mesh.id, e.rec.member),
+            proto: e.rec.proto.clone(),
+            port: e.rec.port,
+            name: e.rec.name.clone(),
+            meta: e.rec.meta.clone(),
+            online,
+        });
+    }
+    Response::Services(out)
+}
+
+/// 🟢 Short hex fingerprint of a public key (for display).
 fn fp(pk: &PubKey) -> String {
     pk[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -3039,10 +4133,12 @@ fn expel_name(p: ExpelPolicy) -> String {
     }
 }
 
+/// 🟢 Lowercase hex of bytes.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 🟢 Parse 64 hex chars into a 32-byte array; `None` if malformed.
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
     if s.len() != 64 {

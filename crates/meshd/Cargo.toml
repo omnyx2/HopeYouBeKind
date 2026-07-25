@@ -28,3 +28,10 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Embeds a VERSIONINFO resource into meshd.exe (CompanyName/ProductName/version) so Windows
+# Defender stops false-flagging the bare binary. Windows target only — see build.rs / BUILD.md.
+# `winres` (not the newer `winresource`) is chosen for a tiny, low-MSRV dep tree that builds
+# cleanly under the pinned 1.79 the Windows CI job uses.
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

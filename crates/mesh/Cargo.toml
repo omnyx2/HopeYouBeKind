@@ -15,6 +15,10 @@ x25519-dalek.workspace = true
 rand.workspace = true
 blake2.workspace = true
 chacha20poly1305.workspace = true
+# Connector service-registry metadata + IPC event payloads are free-form JSON
+# (docs/EXTENSIONS.md); the registry also gossips as JSON (bincode can't round-trip
+# serde_json::Value, which uses deserialize_any).
+serde_json.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -10,6 +10,59 @@
 //! ⚠️ This changes the system routing table and needs root. Every change is
 //! saved and restored (`restore_routes`). Untested across the full two-machine
 //! path — verify on a spare host. See `docs/EXIT_NODE.md`.
+//!
+//! ## Public API (each fn is defined three times — one per `#[cfg(target_os)]` macOS/Linux/
+//! Windows — plus a no-op fallback; the per-OS bodies differ but the CONTRACT below is shared).
+//! When editing, change ALL three OS branches: a fix to one does not touch the others.
+//!
+//! ### Edit-risk legend (each fn's `///` carries a `RISK:` tag)
+//! - 🔴 **HIGH** — mutates LIVE system routing / pf / firewall / DNS (root, per-OS). Blast radius
+//!   = all host traffic: a wrong edit can silently kill connectivity or loop the tunnel, and it
+//!   may only show on the 2nd toggle / after a network change / on one OS. **Every full-tunnel
+//!   regression so far lived in a 🔴 fn.** Editing one ⇒ re-test full-tunnel ON *and* OFF on all
+//!   three OSes + confirm restore leaves the host exactly as before.
+//! - 🟡 **MEDIUM** — parses an external tool's output or does save/restore bookkeeping. Doesn't
+//!   mutate routing directly, but a wrong parse / missed file makes a 🔴 fn silently misbehave
+//!   (e.g. pin via the wrong gateway). Verify against the tool's REAL output, not assumed format.
+//! - 🟢 **LOW** — pure / local / no-op. Safe to edit.
+//!
+//! **Client side (the node consuming an exit):**
+//! - 🔴 [`route_through`]`(tun, exit_ip)` — turn full-tunnel ON: pin a `/32` to `exit_ip` via the
+//!   REAL gateway (so the encrypted outer packets to the exit DON'T re-enter the tunnel), then
+//!   point the default route at `tun`. **Invariant: pin BEFORE diverting, and divert only if the
+//!   pin succeeded** — otherwise the exit's own outer packets loop into the tun (flood, no
+//!   egress, kill-switch revert). The pin must be idempotent (delete any stale `/32` first).
+//!   Saves the prior gateway + the pinned IP to disk for `restore_routes`.
+//! - 🔴 [`restore_routes`]`()` — turn full-tunnel OFF: put the saved default gateway back and
+//!   delete the `/32` pin. Symmetric inverse of `route_through`. If it fails, the host can be
+//!   left on a dead tunnel (internet "broken" with no clue) — best-effort but logs failures.
+//! - 🔴 [`set_dns`]`(servers)` / 🟡 [`restore_dns`]`()` — point the host resolver through the
+//!   tunnel and back. Saves the prior DNS config. Called alongside route_through/restore_routes
+//!   so DNS isn't answered by a local resolver the exit can't reach.
+//! - 🟡 [`clear_exit_pin`]`()` — drop the `/32` pin + saved-gateway bookkeeping WITHOUT touching
+//!   the live default route. For the network-change watcher: a pin made via the OLD gateway
+//!   blackholes the exit after a network switch, and a stale saved-gateway would make a later
+//!   `restore_routes` install a DEAD default. Clear them when not full-tunnelling / before re-pin.
+//! - 🟡 [`current_gateway`]`()` — the real default gateway as a stable string; the netchange
+//!   watcher polls it to detect Wi-Fi↔cellular/new-network transitions. Must return the PHYSICAL
+//!   gateway, never our own tun (macOS reports the tun as an iface, not an IP — filtered out); a
+//!   wrong result makes the watcher fight the full-tunnel route it set.
+//!
+//! **Exit side (the node serving others):**
+//! - 🔴 [`enable_nat`]`(isolate)` — turn this node into an exit: enable IP forwarding + source-NAT
+//!   the overlay range (`100.64.0.0/10`) out the WAN. `isolate` adds a rule pinning traffic we
+//!   forward FOR OTHERS to the real WAN. **⚠ `isolate` must only apply to traffic from OTHER
+//!   members, never our own** — the `100.64/10` selector also matches THIS node's own overlay IP,
+//!   so the caller gates `isolate` to real (pinned) exit nodes; a plain client must pass
+//!   `isolate=false` (else its own full-tunnel egress gets diverted off the tun → broken). The
+//!   rules are NOT fully idempotent across OSes (Linux appends iptables dups on each call).
+//! - 🔴 [`disable_nat`]`()` — undo `enable_nat`: remove the NAT/forwarding rules and the isolate
+//!   routing, restore the prior firewall state.
+//!
+//! Bookkeeping is on-disk temp files (`SAVED`, `EXIT_HOST_SAVED`, `DNS_SAVED`, pf/route state)
+//! so a meshd restart can still restore. Helpers: 🟡 [`run`] (fire-and-forget) /
+//! 🟡 [`run_checked`] (surfaces the error) wrap shell-outs; the OS gateway/iface lookups (🟡)
+//! parse the platform route tool.
 
 use std::net::IpAddr;
 #[cfg(any(unix, windows))]
@@ -28,6 +81,9 @@ const DNS_SAVED: &str = "/tmp/lattice-saved-resolv";
 #[cfg(unix)]
 const EXIT_HOST_SAVED: &str = "/tmp/lattice-saved-exit-host";
 
+/// **RISK 🟡 MED** — runs a shell-out and SWALLOWS failures (only logs). Itself trivial, but it
+/// is the engine of the 🔴 fns: a step that silently failed here is invisible. Use [`run_checked`]
+/// when the caller must surface the failure (route/DNS apply paths).
 #[cfg(any(unix, windows))]
 fn run(cmd: &str, args: &[&str]) {
     match Command::new(cmd).args(args).status() {
@@ -37,7 +93,7 @@ fn run(cmd: &str, args: &[&str]) {
     }
 }
 
-/// Like [`run`] but returns the failure instead of swallowing it, so the apply
+/// **RISK 🟡 MED** — like [`run`] but returns the failure instead of swallowing it, so the apply
 /// paths (route/DNS) can surface a real error to the user (dp_error) rather than
 /// silently claiming success while the OS-side plumbing never took effect.
 #[cfg(any(unix, windows))]
@@ -73,6 +129,11 @@ fn run_checked(cmd: &str, args: &[&str]) -> Result<(), String> {
 }
 
 // ----------------------------- macOS -----------------------------
+/// **RISK 🔴 HIGH** (mutates the live default route + the exit /32 pin; loop source; 2 regressions).
+/// macOS full-tunnel ON (see module header `route_through` contract). Pins `exit_ip/32` via the
+/// real gateway (`route add -host`, idempotent: delete-first), then `route change default
+/// -interface tun`. Fail-closed: the default is diverted ONLY if the pin succeeded, so a failed
+/// pin can't loop the exit's own outer packets into the tun. Saves gateway→`SAVED`, exit→`EXIT_HOST_SAVED`.
 #[cfg(target_os = "macos")]
 pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     let Some(gw) = macos_default_gateway() else {
@@ -84,12 +145,23 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     // later connect to that IP fail with EADDRNOTAVAIL.
     let _ = std::fs::write(EXIT_HOST_SAVED, exit_ip.to_string());
     let mut errs = Vec::new();
-    if let Err(e) = run_checked("route", &["-q", "add", "-host", &exit_ip.to_string(), &gw]) {
+    // Idempotent pin: drop any stale /32 to the exit first (a prior full-tunnel cycle whose
+    // restore raced a kill-switch revert can leave one — possibly via the OLD tun). Without
+    // this, `route add -host` fails with "File exists" and the stale (often tun-pointing)
+    // route stays, so the exit's own outer tunnel packets loop back into the tun.
+    let es = exit_ip.to_string();
+    run("route", &["-q", "delete", "-host", &es]);
+    if let Err(e) = run_checked("route", &["-q", "add", "-host", &es, &gw]) {
         errs.push(e);
     }
-    // Send everything else into the tunnel.
-    if let Err(e) = run_checked("route", &["-q", "change", "default", "-interface", tun]) {
-        errs.push(e);
+    // Only divert the default INTO the tunnel once the exit endpoint is pinned OFF it. If the
+    // pin failed, diverting would route the outer tunnel packets (to the exit's public IP)
+    // back into the tun → a packet flood that never reaches the exit and a kill-switch revert.
+    // Fail closed instead: leave the default alone and surface the error.
+    if errs.is_empty() {
+        if let Err(e) = run_checked("route", &["-q", "change", "default", "-interface", tun]) {
+            errs.push(e);
+        }
     }
     if errs.is_empty() {
         tracing::warn!(%exit_ip, tun, "default route diverted through exit node");
@@ -99,6 +171,25 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     }
 }
 
+/// **RISK 🔴 HIGH** — add a `/32` host route so ONLY `ip`'s traffic enters the mesh `iface` (tun),
+/// WITHOUT touching the default route (domain split-tunnel, docs/SPLIT_TUNNEL.md). Idempotent
+/// (delete-first). Everything else keeps using the real default. Inverse: [`unroute_host`].
+#[cfg(target_os = "macos")]
+pub fn route_host_via_iface(ip: std::net::Ipv4Addr, iface: &str) -> Result<(), String> {
+    let s = ip.to_string();
+    run("route", &["-q", "delete", "-host", &s]);
+    run_checked("route", &["-q", "add", "-host", &s, "-interface", iface])
+}
+
+/// **RISK 🟡 MED** — remove a `/32` host route added by [`route_host_via_iface`] (best-effort).
+#[cfg(target_os = "macos")]
+pub fn unroute_host(ip: std::net::Ipv4Addr) {
+    run("route", &["-q", "delete", "-host", &ip.to_string()]);
+}
+
+/// **RISK 🔴 HIGH** (restores the live default; if it fails the host is stranded on a dead tunnel).
+/// macOS full-tunnel OFF (inverse of [`route_through`]): restore the saved default gateway and
+/// delete the `/32` exit pin. Best-effort.
 #[cfg(target_os = "macos")]
 pub fn restore_routes() {
     if let Ok(gw) = std::fs::read_to_string(SAVED) {
@@ -113,6 +204,8 @@ pub fn restore_routes() {
     }
 }
 
+/// **RISK 🟡 MED** (deletes a /32 + saved-gw bookkeeping; doesn't touch the live default — but a
+/// wrong call during full-tunnel could strip the pin and reopen the loop window).
 /// Remove left-behind full-tunnel route bookkeeping WITHOUT touching the live default
 /// route. Used by the network-change watcher: a `/32` pin made via the OLD gateway
 /// blackholes the exit's IP after the network changes (`connect()` → `EADDRNOTAVAIL`),
@@ -129,6 +222,7 @@ pub fn clear_exit_pin() {
     let _ = std::fs::remove_file(SAVED);
 }
 
+/// **RISK 🟡 MED** (read-only, but the netchange watcher acts on it — see `macos_default_gateway`).
 /// The current default gateway (a stable string while the network is unchanged) — the
 /// network-change watcher polls this to detect Wi-Fi↔cellular / new-network transitions.
 #[cfg(target_os = "macos")]
@@ -136,6 +230,9 @@ pub fn current_gateway() -> Option<String> {
     macos_default_gateway()
 }
 
+/// **RISK 🟡 MED** (parses `route get default`; the "tun reported as iface, not IP" filter is
+/// load-bearing — without it the netchange watcher mistakes our own full-tunnel for a new network
+/// and fights the route it set). Feeds the 🔴 route/NAT fns.
 #[cfg(target_os = "macos")]
 fn macos_default_gateway() -> Option<String> {
     let out = Command::new("route")
@@ -160,6 +257,8 @@ fn macos_default_gateway() -> Option<String> {
 #[cfg(target_os = "macos")]
 const PF_WAS_OFF: &str = "/tmp/lattice-pf-was-off";
 
+/// **RISK 🟡 MED** (parses `route get default`; feeds the 🔴 NAT/DNS fns).
+/// The interface of the current default route (e.g. `en0`) — the WAN we NAT/route-to out of.
 #[cfg(target_os = "macos")]
 fn macos_default_iface() -> Option<String> {
     let out = Command::new("route")
@@ -173,8 +272,15 @@ fn macos_default_iface() -> Option<String> {
     })
 }
 
+/// **RISK 🔴 HIGH** (writes/loads a pf ruleset; the isolate/own-IP rule was a full-tunnel regression).
+/// macOS exit NAT for ONE overlay `subnet` (per-mesh `exitable`, docs/SPLIT_TUNNEL.md /
+/// EXIT_SHARING). Enables IP forwarding and writes a pf ruleset NATting only `subnet`
+/// (`nat on <wan> from <subnet> -> (<wan>)`) so ONLY that mesh's members can egress through us —
+/// not all `100.64/10`. `isolate` adds the `route-to` pin (pinned exits only). Remembers pf's
+/// prior on/off state in `PF_WAS_OFF`. NOTE: writes a single pf file — enabling two meshes on the
+/// SAME macOS node keeps only the last (a documented limitation; real exits are Linux).
 #[cfg(target_os = "macos")]
-pub fn enable_nat(isolate: bool) {
+pub fn enable_nat(subnet: &str, isolate: bool) {
     run("sysctl", &["-w", "net.inet.ip.forwarding=1"]);
     let Some(wan) = macos_default_iface() else {
         tracing::warn!("no default interface; macOS exit NAT not applied");
@@ -183,15 +289,18 @@ pub fn enable_nat(isolate: bool) {
     // Source-NAT tunnelled (overlay-range) traffic out the WAN. A ruleset with
     // only a nat rule leaves the filter ruleset empty == default-pass, so
     // forwarded packets (tun→WAN, enabled by ip.forwarding) pass and get NAT'd.
-    let mut conf = format!("nat on {wan} from 100.64.0.0/10 to any -> ({wan})\n");
+    let mut conf = format!("nat on {wan} from {subnet} to any -> ({wan})\n");
     // Exit-policy ISOLATE (docs/EXIT_POLICY.md): force traffic we forward FOR OTHERS
     // (sourced from the overlay range) out the real gateway via pf `route-to`, so it leaves
     // our own WAN even if our own full-tunnel later diverts the default route to the tun.
     // The gateway is captured now, while the default route is still the real one.
     if isolate {
         if let Some(gw) = macos_default_gateway() {
+            // `to ! 100.64.0.0/10` excludes overlay-internal destinations: our own overlay IP is
+            // inside <subnet>, so a plain `to any` would divert member↔member replies out the real
+            // WAN and break the overlay for this node. Only forwarded INTERNET traffic isolates.
             conf.push_str(&format!(
-                "pass out route-to ({wan} {gw}) inet from 100.64.0.0/10 to any\n"
+                "pass out route-to ({wan} {gw}) inet from {subnet} to ! 100.64.0.0/10\n"
             ));
             tracing::warn!(
                 wan,
@@ -217,12 +326,20 @@ pub fn enable_nat(isolate: bool) {
     }
     run("pfctl", &["-f", "/tmp/lattice-pf.conf"]);
     run("pfctl", &["-e"]); // harmless "already enabled" if it was on
-    tracing::warn!(wan, "macOS exit NAT enabled (pf nat 100.64.0.0/10 -> WAN)");
+    tracing::warn!(
+        wan,
+        subnet,
+        "macOS exit NAT enabled (this mesh serves as an exit)"
+    );
 }
 
+/// **RISK 🔴 HIGH** (reloads the system pf ruleset + pf on/off state; a wrong edit leaves pf wrong).
+/// macOS undo [`enable_nat`]: stop serving as an exit. Since macOS keeps a single pf file, this
+/// restores the system pf ruleset entirely (`_subnet` accepted for signature parity — on macOS we
+/// don't serve multiple exit subnets, so tearing one down clears our NAT). Puts pf's on/off state
+/// back and disables IP forwarding.
 #[cfg(target_os = "macos")]
-pub fn disable_nat() {
-    // Restore the system pf ruleset, then put pf's enabled/disabled state back.
+pub fn disable_nat(_subnet: &str) {
     run("pfctl", &["-f", "/etc/pf.conf"]);
     if std::fs::remove_file(PF_WAS_OFF).is_ok() {
         run("pfctl", &["-d"]); // pf was off before us → turn it back off
@@ -231,8 +348,10 @@ pub fn disable_nat() {
     run("sysctl", &["-w", "net.inet.ip.forwarding=0"]);
 }
 
+/// **RISK 🟡 MED** (parses `networksetup` output; feeds the 🔴 `set_dns`).
 /// The network service (e.g. "Wi-Fi") whose device is the current default-route
-/// interface — what `networksetup` keys DNS changes on.
+/// interface — what `networksetup` keys DNS changes on. Maps `macos_default_iface()`'s device
+/// name to the human service name via `networksetup -listnetworkserviceorder`.
 #[cfg(target_os = "macos")]
 fn macos_primary_service() -> Option<String> {
     let iface = macos_default_iface()?;
@@ -257,6 +376,10 @@ fn macos_primary_service() -> Option<String> {
     None
 }
 
+/// **RISK 🔴 HIGH** (overrides the system resolver; wrong → no DNS / leaks to a local resolver).
+/// macOS full-tunnel DNS (see module header `set_dns` contract): point the primary network
+/// service's resolvers at `servers` via `networksetup -setdnsservers`, saving the service name to
+/// `DNS_SAVED` for [`restore_dns`]. No-op on empty `servers`.
 #[cfg(target_os = "macos")]
 pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     if servers.is_empty() {
@@ -276,6 +399,8 @@ pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     Ok(())
 }
 
+/// **RISK 🟡 MED** (best-effort DNS restore from saved bookkeeping).
+/// macOS undo [`set_dns`]: clear our DNS override on the saved service (back to DHCP-provided).
 #[cfg(target_os = "macos")]
 pub fn restore_dns() {
     if let Ok(svc) = std::fs::read_to_string(DNS_SAVED) {
@@ -287,6 +412,12 @@ pub fn restore_dns() {
 }
 
 // ----------------------------- Linux -----------------------------
+/// **RISK 🔴 HIGH** (mutates the live default + exit /32 pin).
+/// Linux full-tunnel ON (see module header `route_through` contract). `ip route add
+/// <exit_ip>/32 via <gw> dev <dev>` to pin the exit off the tunnel, then `ip route replace
+/// default dev <tun>`. Saves `<gw> <dev>`→`SAVED`, exit→`EXIT_HOST_SAVED`. (`ip route replace`
+/// is idempotent on the default; the /32 add is not delete-first here — Linux `add` of an
+/// existing route errors but `replace`d default still applies.)
 #[cfg(target_os = "linux")]
 pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     let Some((gw, dev)) = linux_default_route() else {
@@ -322,6 +453,25 @@ pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     }
 }
 
+/// **RISK 🔴 HIGH** — add a `/32` host route so ONLY `ip`'s traffic enters the mesh `iface` (tun),
+/// WITHOUT touching the default route (domain split-tunnel). `ip route replace` is idempotent.
+#[cfg(target_os = "linux")]
+pub fn route_host_via_iface(ip: std::net::Ipv4Addr, iface: &str) -> Result<(), String> {
+    run_checked(
+        "ip",
+        &["route", "replace", &format!("{ip}/32"), "dev", iface],
+    )
+}
+
+/// **RISK 🟡 MED** — remove a `/32` host route added by [`route_host_via_iface`] (best-effort).
+#[cfg(target_os = "linux")]
+pub fn unroute_host(ip: std::net::Ipv4Addr) {
+    run("ip", &["route", "del", &format!("{ip}/32")]);
+}
+
+/// **RISK 🔴 HIGH** (restores the live default; failure strands the host on a dead tunnel).
+/// Linux full-tunnel OFF (inverse of [`route_through`]): `ip route replace default via <gw> dev
+/// <dev>` from `SAVED`, then delete the `/32` exit pin.
 #[cfg(target_os = "linux")]
 pub fn restore_routes() {
     if let Ok(s) = std::fs::read_to_string(SAVED) {
@@ -342,6 +492,8 @@ pub fn restore_routes() {
     }
 }
 
+/// **RISK 🟡 MED** — Linux: drop the `/32` exit pin + saved-default bookkeeping without touching
+/// the live default (see module header `clear_exit_pin` contract — used by the netchange watcher).
 #[cfg(target_os = "linux")]
 pub fn clear_exit_pin() {
     if let Ok(exit_ip) = std::fs::read_to_string(EXIT_HOST_SAVED) {
@@ -352,11 +504,13 @@ pub fn clear_exit_pin() {
     let _ = std::fs::remove_file(SAVED);
 }
 
+/// **RISK 🟡 MED** — Linux: the real default gateway IP (see module header `current_gateway` contract).
 #[cfg(target_os = "linux")]
 pub fn current_gateway() -> Option<String> {
     linux_default_route().map(|(gw, _)| gw)
 }
 
+/// **RISK 🔴 HIGH** (rewrites `/etc/resolv.conf`; wrong → system-wide DNS broken).
 /// Point the host resolver at `servers` (full-tunnel DNS). Backs up the current
 /// `/etc/resolv.conf` — a symlink (systemd-resolved stub) or a plain file — and
 /// replaces it with a static one. So DNS goes through the tunnel to the exit's
@@ -384,6 +538,8 @@ pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     Ok(())
 }
 
+/// **RISK 🟡 MED** — Linux undo [`set_dns`]: restore the saved `/etc/resolv.conf` (re-create the systemd-resolved
+/// symlink, or rewrite the saved file content).
 #[cfg(target_os = "linux")]
 pub fn restore_dns() {
     if let Ok(saved) = std::fs::read_to_string(DNS_SAVED) {
@@ -398,6 +554,8 @@ pub fn restore_dns() {
     }
 }
 
+/// **RISK 🟡 MED** — parse `ip route show default` into `(gateway, dev)` — the real next-hop + WAN
+/// interface. Feeds the 🔴 route/NAT fns.
 #[cfg(target_os = "linux")]
 fn linux_default_route() -> Option<(String, String)> {
     let out = Command::new("ip")
@@ -424,102 +582,194 @@ fn linux_default_route() -> Option<(String, String)> {
 const ISO_TABLE: &str = "100";
 #[cfg(target_os = "linux")]
 const ISO_PRIO: &str = "1000";
-
+/// Higher priority (lower number) than `ISO_PRIO`: overlay-destined traffic bypasses the isolate
+/// rule and uses `main` (which has the tun route), so a pinned exit's own overlay IP — which sits
+/// INSIDE the served subnet — never gets its member↔member replies diverted out the real WAN.
 #[cfg(target_os = "linux")]
-pub fn enable_nat(isolate: bool) {
+const ISO_BYPASS_PRIO: &str = "999";
+
+/// **RISK 🔴 HIGH** (iptables MASQUERADE/FORWARD + isolate source-routing).
+/// Linux exit NAT for ONE overlay `subnet` (per-mesh `exitable`): IP forwarding + iptables
+/// `POSTROUTING MASQUERADE` for `<subnet>` out the WAN + `FORWARD ACCEPT` inserted at the TOP
+/// (before any distro default `FORWARD -j REJECT`). ONLY that mesh's subnet is NAT'd, so serving
+/// one mesh never proxies another. When `isolate`, adds source routing for `<subnet>` (pinned
+/// exits only). Idempotent (delete-then-add). Also **purges EVERY legacy all-overlay
+/// `100.64.0.0/10` rule** (MASQUERADE + FORWARD ACCEPT) from older always-on builds — this runs on
+/// the serving path too, not just `disable_nat`, so a pinned exit (which never hits `disable_nat`)
+/// doesn't accumulate blanket `FORWARD -s/-d 100.64.0.0/10 ACCEPT` rules that would forward for
+/// meshes it never opted into (a policy leak on a `FORWARD -P DROP` host; harmless-but-messy on
+/// `FORWARD -P ACCEPT`). Found by a post-network-change cross-check.
+#[cfg(target_os = "linux")]
+pub fn enable_nat(subnet: &str, isolate: bool) {
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"]);
+    // Purge legacy all-overlay (100.64.0.0/10) MASQUERADE + FORWARD ACCEPT from older builds.
+    // Must run here (serving path) as well as in `disable_nat`: a pinned exit only ever calls
+    // `enable_nat`, so otherwise its legacy blanket FORWARD rules never get cleaned.
+    purge_legacy_overlay_nat();
     if let Some((gw, wan)) = linux_default_route() {
-        run(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-s",
-                "100.64.0.0/10",
-                "-o",
-                &wan,
-                "-j",
-                "MASQUERADE",
-            ],
+        // Idempotent: delete any prior copy of our rule, then add exactly one.
+        let masq = [
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "-o",
+            &wan,
+            "-j",
+            "MASQUERADE",
+        ];
+        let _ = Command::new("iptables").args(masq).status();
+        let mut add = masq;
+        add[2] = "-A";
+        run("iptables", &add);
+        // INSERT at the top, not append: distros ship a default `FORWARD -j REJECT`, so an
+        // appended ACCEPT never runs. Delete-then-insert to stay idempotent.
+        for dir in ["-s", "-d"] {
+            let _ = Command::new("iptables")
+                .args(["-D", "FORWARD", dir, subnet, "-j", "ACCEPT"])
+                .status();
+            run(
+                "iptables",
+                &["-I", "FORWARD", "1", dir, subnet, "-j", "ACCEPT"],
+            );
+        }
+        tracing::warn!(
+            wan,
+            subnet,
+            "exit NAT enabled — this mesh serves as an exit"
         );
-        // INSERT at the top, not append: distros like RHEL/Oracle Linux ship a
-        // default `FORWARD -j REJECT` rule, so an appended ACCEPT never runs and
-        // forwarded (exit) traffic is rejected. -I puts us before that REJECT.
-        run(
-            "iptables",
-            &["-I", "FORWARD", "1", "-s", "100.64.0.0/10", "-j", "ACCEPT"],
-        );
-        run(
-            "iptables",
-            &["-I", "FORWARD", "1", "-d", "100.64.0.0/10", "-j", "ACCEPT"],
-        );
-        tracing::warn!(wan, "exit NAT enabled (masquerade)");
         if isolate {
-            // Exit-policy ISOLATE: pin traffic we forward FOR OTHERS (sourced from the
-            // overlay range 100.64/10) to the REAL default gateway via a side table, so it
-            // leaves our own WAN even if our own full-tunnel later diverts the main-table
-            // default. Our own traffic (real src IP) is unaffected and still follows main.
+            // Pin traffic we forward FOR OTHERS (sourced from <subnet>) to the REAL gateway via a
+            // side table, so it leaves our own WAN even if we also full-tunnel. Own traffic
+            // (real src IP) still follows main.
             run(
                 "ip",
                 &[
                     "route", "replace", "default", "via", &gw, "dev", &wan, "table", ISO_TABLE,
                 ],
             );
-            // `ip rule add` isn't idempotent — clear any stale duplicate first (ok if absent).
+            // Overlay-internal traffic (member↔member, and our OWN replies — sourced from our
+            // overlay IP, which is INSIDE <subnet>) must stay on the tun, never get diverted to the
+            // real WAN. Insert a higher-priority rule that sends every overlay-destined packet to
+            // `main` (which holds the tun route) BEFORE the source-keyed isolate rule can grab it.
+            // Without this, a pinned exit's replies to other members leak out the WAN and the
+            // overlay silently breaks for that node (a real regression the per-subnet NAT exposed).
             let _ = Command::new("ip")
-                .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
+                .args([
+                    "rule",
+                    "del",
+                    "to",
+                    "100.64.0.0/10",
+                    "lookup",
+                    "main",
+                    "priority",
+                    ISO_BYPASS_PRIO,
+                ])
                 .status();
             run(
                 "ip",
                 &[
                     "rule",
                     "add",
-                    "from",
+                    "to",
                     "100.64.0.0/10",
                     "lookup",
-                    ISO_TABLE,
+                    "main",
                     "priority",
-                    ISO_PRIO,
+                    ISO_BYPASS_PRIO,
                 ],
             );
-            tracing::warn!(
-                gw,
-                table = ISO_TABLE,
-                "exit-policy isolate: forwarded traffic pinned to real WAN"
+            let _ = Command::new("ip")
+                .args(["rule", "del", "from", subnet, "lookup", ISO_TABLE])
+                .status();
+            run(
+                "ip",
+                &[
+                    "rule", "add", "from", subnet, "lookup", ISO_TABLE, "priority", ISO_PRIO,
+                ],
             );
         }
     }
 }
 
+/// **RISK 🔴 HIGH** — Linux stop serving `subnet` as an exit: delete its MASQUERADE + FORWARD +
+/// isolate rules. Other exitable subnets are untouched. Leaves ip_forward on (harmless; other
+/// meshes may still serve).
 #[cfg(target_os = "linux")]
-pub fn disable_nat() {
+pub fn disable_nat(subnet: &str) {
     if let Some((_, wan)) = linux_default_route() {
-        run(
-            "iptables",
-            &[
+        let _ = Command::new("iptables")
+            .args([
                 "-t",
                 "nat",
                 "-D",
                 "POSTROUTING",
                 "-s",
-                "100.64.0.0/10",
+                subnet,
                 "-o",
                 &wan,
                 "-j",
                 "MASQUERADE",
-            ],
-        );
+            ])
+            .status();
     }
-    // Tear down the isolate source-routing (harmless if it was never installed).
+    for dir in ["-s", "-d"] {
+        let _ = Command::new("iptables")
+            .args(["-D", "FORWARD", dir, subnet, "-j", "ACCEPT"])
+            .status();
+    }
+    // Migration cleanup: older builds enabled NAT unconditionally at bringup and (not being
+    // idempotent) piled up many `-s 100.64.0.0/10 MASQUERADE` rules on every interface. If those
+    // linger, this node keeps forwarding ALL overlay traffic regardless of `exitable` — so purge
+    // every leftover all-overlay rule here (found the hard way via a cross-node test).
+    purge_legacy_overlay_nat();
+    let _ = Command::new("ip")
+        .args(["rule", "del", "from", subnet, "lookup", ISO_TABLE])
+        .status();
+}
+
+/// **RISK 🔴 HIGH** — remove EVERY leftover all-overlay (`100.64.0.0/10`) MASQUERADE (nat) and
+/// ACCEPT (FORWARD) rule, on any interface, from older always-on builds. Parses `iptables-save`
+/// and deletes each matching rule by its exact spec (there can be many duplicates). Idempotent.
+#[cfg(target_os = "linux")]
+fn purge_legacy_overlay_nat() {
+    // nat POSTROUTING MASQUERADE for 100.64.0.0/10 (on any -o interface).
+    if let Ok(out) = Command::new("iptables-save").args(["-t", "nat"]).output() {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let l = line.trim();
+            if l.starts_with("-A POSTROUTING")
+                && l.contains("100.64.0.0/10")
+                && l.contains("MASQUERADE")
+            {
+                let mut args = vec!["-t".to_string(), "nat".to_string(), "-D".to_string()];
+                args.extend(l["-A ".len()..].split_whitespace().map(String::from));
+                let a: Vec<&str> = args.iter().map(String::as_str).collect();
+                let _ = Command::new("iptables").args(&a).status();
+            }
+        }
+    }
+    // filter FORWARD ACCEPT for 100.64.0.0/10.
+    if let Ok(out) = Command::new("iptables-save")
+        .arg("-t")
+        .arg("filter")
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let l = line.trim();
+            if l.starts_with("-A FORWARD") && l.contains("100.64.0.0/10") && l.contains("ACCEPT") {
+                let mut args = vec!["-D".to_string()];
+                args.extend(l["-A ".len()..].split_whitespace().map(String::from));
+                let a: Vec<&str> = args.iter().map(String::as_str).collect();
+                let _ = Command::new("iptables").args(&a).status();
+            }
+        }
+    }
+    // The legacy isolate rule keyed on the whole overlay range, too.
     let _ = Command::new("ip")
         .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
         .status();
-    let _ = Command::new("ip")
-        .args(["route", "flush", "table", ISO_TABLE])
-        .status();
-    run("sysctl", &["-w", "net.ipv4.ip_forward=0"]);
 }
 
 // ----------------------------- Windows -----------------------------
@@ -529,6 +779,8 @@ pub fn disable_nat() {
 #[cfg(target_os = "windows")]
 const WIN_SAVED: &str = r"C:\Windows\Temp\lattice-saved-route.txt";
 
+/// **RISK 🟡 MED** — run a PowerShell `script` fire-and-forget via the full `System32` powershell
+/// path (meshd runs elevated with a minimal PATH, so a bare `powershell` can fail to launch).
 #[cfg(target_os = "windows")]
 fn ps(script: &str) {
     // Full path: meshd runs elevated (RunAs) with a possibly minimal PATH, so a bare
@@ -541,7 +793,7 @@ fn ps(script: &str) {
     );
 }
 
-/// Like [`ps`] but returns whether powershell.exe could be launched and exited 0.
+/// **RISK 🟡 MED** — like [`ps`] but returns whether powershell.exe could be launched and exited 0.
 /// Note: the apply scripts use `$ErrorActionPreference='SilentlyContinue'`, so this
 /// catches "powershell not found / not elevated", not per-cmdlet failures.
 #[cfg(target_os = "windows")]
@@ -554,6 +806,12 @@ fn ps_checked(script: &str) -> Result<(), String> {
     )
 }
 
+/// **RISK 🔴 HIGH** (overrides the live default via two /1 routes + exit /32 pin, in PowerShell).
+/// Windows full-tunnel ON (see module header `route_through` contract). Pins `exit_ip/32` via the
+/// saved default's next-hop, then overrides the default with two `/1` routes via the Wintun
+/// adapter (`0.0.0.0/1` + `128.0.0.0/1` — more specific than `0.0.0.0/0`, so they win WITHOUT
+/// deleting the real default, OpenVPN-style). Idempotent: deletes any prior `/1` and `{exit}/32`
+/// first (a leftover made `New-NetRoute` fail "already exists" → the "not fully applied" bug).
 #[cfg(target_os = "windows")]
 pub fn route_through(tun: &str, exit_ip: IpAddr) -> Result<(), String> {
     // Save the current default route (gateway + ifIndex), pin a host route to the
@@ -596,6 +854,38 @@ try {{
     Ok(())
 }
 
+/// **RISK 🔴 HIGH** — add a `/32` host route so ONLY `ip`'s traffic enters the mesh `iface` (the
+/// Wintun adapter), WITHOUT touching the default (domain split-tunnel). Delete-first idempotent.
+#[cfg(target_os = "windows")]
+pub fn route_host_via_iface(ip: std::net::Ipv4Addr, iface: &str) -> Result<(), String> {
+    let script = format!(
+        r#"
+$ErrorActionPreference='Stop'
+try {{
+  $idx = (Get-NetAdapter -Name '{iface}' -ErrorAction SilentlyContinue).ifIndex
+  if (-not $idx) {{ throw 'tun adapter "{iface}" not found' }}
+  Remove-NetRoute -DestinationPrefix '{ip}/32' -Confirm:$false -ErrorAction SilentlyContinue
+  New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex $idx -NextHop 0.0.0.0 -RouteMetric 1 -PolicyStore ActiveStore | Out-Null
+  exit 0
+}} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}
+"#
+    );
+    ps_checked(&script)
+}
+
+/// **RISK 🟡 MED** — remove a `/32` host route added by [`route_host_via_iface`] (best-effort).
+#[cfg(target_os = "windows")]
+pub fn unroute_host(ip: std::net::Ipv4Addr) {
+    ps(&format!(
+        "Remove-NetRoute -DestinationPrefix '{ip}/32' -Confirm:$false -ErrorAction SilentlyContinue"
+    ));
+}
+
+/// **RISK 🔴 HIGH** (removes the /1 overrides; if it silently fails ALL traffic stays on the dead tunnel).
+/// Windows full-tunnel OFF (inverse of [`route_through`]): remove the two `/1` overrides (this is
+/// what hands the default back to the real gateway) + the `/32` pin. Each removal is independent
+/// and a real failure is logged — if it silently fails (e.g. not elevated) the `/1` routes
+/// survive and ALL traffic stays on the dead tunnel (internet looks broken with no clue).
 #[cfg(target_os = "windows")]
 pub fn restore_routes() {
     // Symmetric with `route_through`: removing the two /1 overrides is what hands the
@@ -627,6 +917,8 @@ exit 0
     }
 }
 
+/// **RISK 🟡 MED** — Windows: drop the `/32` exit pin + saved-route bookkeeping without touching
+/// the live default (see module header `clear_exit_pin` contract).
 #[cfg(target_os = "windows")]
 pub fn clear_exit_pin() {
     let script = format!(
@@ -643,6 +935,7 @@ if (Test-Path '{saved}') {{
     ps(&script);
 }
 
+/// **RISK 🟡 MED** — Windows: the real default-route next-hop IP (see module header `current_gateway` contract).
 #[cfg(target_os = "windows")]
 pub fn current_gateway() -> Option<String> {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
@@ -660,12 +953,24 @@ pub fn current_gateway() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// **RISK 🔴 HIGH** (WinNAT + forwarding; isolate is best-effort, no source routing on Windows).
+/// Windows exit NAT (see module header `enable_nat` contract). Enables interface forwarding +
+/// `New-NetNat` (WinNAT) for `100.64.0.0/10`. `isolate` is BEST-EFFORT only: WinNAT egresses via
+/// the system route, so forwarded traffic leaves the real adapter UNLESS this node also
+/// full-tunnels (Windows has no simple source-based routing — full source-pinning is a TODO).
 #[cfg(target_os = "windows")]
-pub fn enable_nat(isolate: bool) {
-    // Forward between interfaces + WinNAT for the overlay range.
+pub fn enable_nat(subnet: &str, isolate: bool) {
+    // Forward + WinNAT for ONLY this mesh's overlay `subnet` (per-mesh exitable) — a NetNat named
+    // after the subnet so multiple exitable meshes coexist and tear down independently.
+    let name = format!("Lattice_{}", subnet.replace(['.', '/'], "_"));
     ps("Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue");
-    ps("if (-not (Get-NetNat -Name Lattice -ErrorAction SilentlyContinue)) { New-NetNat -Name Lattice -InternalIPInterfaceAddressPrefix 100.64.0.0/10 }");
-    tracing::warn!("windows exit NAT enabled (WinNAT 100.64.0.0/10)");
+    ps(&format!(
+        "if (-not (Get-NetNat -Name {name} -ErrorAction SilentlyContinue)) {{ New-NetNat -Name {name} -InternalIPInterfaceAddressPrefix {subnet} }}"
+    ));
+    tracing::warn!(
+        subnet,
+        "windows exit NAT enabled — this mesh serves as an exit"
+    );
     // Exit-policy ISOLATE on Windows is best-effort: WinNAT egresses via the system route
     // to the destination, so when this node is NOT itself full-tunnelling, forwarded
     // traffic already leaves the real adapter (isolate holds). But Windows has no simple
@@ -680,11 +985,20 @@ pub fn enable_nat(isolate: bool) {
     }
 }
 
+/// **RISK 🟡 MED** — Windows stop serving `subnet`: remove its WinNAT instance (+ the legacy
+/// `Lattice` one from older builds).
 #[cfg(target_os = "windows")]
-pub fn disable_nat() {
+pub fn disable_nat(subnet: &str) {
+    let name = format!("Lattice_{}", subnet.replace(['.', '/'], "_"));
+    ps(&format!(
+        "Remove-NetNat -Name {name} -Confirm:$false -ErrorAction SilentlyContinue"
+    ));
     ps("Remove-NetNat -Name Lattice -Confirm:$false -ErrorAction SilentlyContinue");
 }
 
+/// **RISK 🔴 HIGH** (sets the Lattice adapter's DNS; wrong → no resolution through the tunnel).
+/// Windows full-tunnel DNS (see module header `set_dns` contract): set the `Lattice` adapter's
+/// DNS to the first server (full-tunnel routes it through the exit).
 #[cfg(target_os = "windows")]
 pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     if let Some(first) = servers.first() {
@@ -696,6 +1010,7 @@ pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     Ok(())
 }
 
+/// **RISK 🟡 MED** — Windows undo [`set_dns`]: reset the `Lattice` adapter's DNS to automatic.
 #[cfg(target_os = "windows")]
 pub fn restore_dns() {
     ps("Set-DnsClientServerAddress -InterfaceAlias 'Lattice' -ResetServerAddresses -ErrorAction SilentlyContinue");
@@ -709,11 +1024,17 @@ pub fn route_through(_tun: &str, _exit_ip: IpAddr) -> Result<(), String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn restore_routes() {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn enable_nat(_isolate: bool) {
+pub fn route_host_via_iface(_ip: std::net::Ipv4Addr, _iface: &str) -> Result<(), String> {
+    Err("split-tunnel routing not implemented on this platform".into())
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn unroute_host(_ip: std::net::Ipv4Addr) {}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn enable_nat(_subnet: &str, _isolate: bool) {
     tracing::warn!("exit-node NAT not implemented on this platform");
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn disable_nat() {}
+pub fn disable_nat(_subnet: &str) {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn set_dns(_servers: &[IpAddr]) -> Result<(), String> {
     Ok(())

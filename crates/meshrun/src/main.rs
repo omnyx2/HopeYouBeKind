@@ -90,6 +90,8 @@ async fn main() -> anyhow::Result<()> {
         // The standalone runner has no supervisor to read decrypt-fail stats / traffic.
         std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         std::sync::Arc::new(std::sync::Mutex::new(lattice_meshrun::Traffic::default())),
+        // The standalone runner has no split-tunnel rules.
+        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
     )
     .await;
     Ok(())

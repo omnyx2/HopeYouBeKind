@@ -170,6 +170,87 @@ pub enum Request {
         #[serde(default)]
         algo: Option<String>,
     },
+
+    // --- extensions / connectors (docs/EXTENSIONS.md) -------------------------------
+    /// (Connector) Authenticate this connection as an enabled extension. The daemon
+    /// checks `token` against the grant created by `EnableExtension`; on success the
+    /// connection gains the granted scopes (returned in [`Response::HelloOk`]) and may
+    /// `Subscribe` / `Advertise`. Must be the connector's first request.
+    Hello {
+        id: String,
+        #[serde(default)]
+        version: String,
+        token: String,
+    },
+    /// (Connector) Turn this connection into an event stream for the given bus `topics`
+    /// (`peer` | `service` | `exit` | `health`), each gated by the matching granted scope.
+    /// After this, the daemon pushes [`Response::Event`] lines on the same connection while
+    /// the connection still serves normal request/response. Requires a prior `Hello`.
+    Subscribe { topics: Vec<String> },
+    /// (Management/GUI) Enable an extension and grant it a subset of the scopes it
+    /// requested. Mints (or refreshes) a local token the connector authenticates with.
+    /// Returns [`Response::Extension`]. `meshes` scopes the grant to specific meshes (an
+    /// allow-list of mesh ids); `all_meshes` grants every mesh incl. ones joined later.
+    /// With both empty/false the extension is enabled but allowed on NO mesh — so a
+    /// connector can't silently reach a mesh the user didn't pick (docs/EXTENSIONS.md §3).
+    EnableExtension {
+        id: String,
+        scopes: Vec<String>,
+        #[serde(default)]
+        all_meshes: bool,
+        #[serde(default)]
+        meshes: Vec<MeshId>,
+    },
+    /// (Management/GUI) Disable an extension: revoke its grant so its token stops working
+    /// and live connector connections lose their scopes on next check.
+    DisableExtension { id: String },
+    /// (Management/GUI) List installed extension grants. Returns [`Response::Extensions`].
+    ListExtensions,
+    /// (Connector) Advertise that THIS node offers `proto` on its overlay IP at `port`,
+    /// so peers' connectors discover it. Gossips mesh-wide (newest wins) and expires if
+    /// not refreshed. Requires the `registry:advertise` scope. Returns [`Response::Ok`].
+    Advertise {
+        mesh: MeshId,
+        proto: String,
+        port: u16,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        meta: serde_json::Value,
+    },
+    /// (Connector) Withdraw a service this node advertised. Requires `registry:advertise`.
+    Unadvertise { mesh: MeshId, proto: String },
+    /// Discover services advertised in a mesh (optionally filtered to one `proto`), each
+    /// with the owner's overlay IP + online state. Returns [`Response::Services`].
+    ListServices {
+        mesh: MeshId,
+        #[serde(default)]
+        proto: Option<String>,
+    },
+
+    // --- domain split-tunnel (docs/SPLIT_TUNNEL.md) — LOCAL to this node ------------------
+    /// Add a local split rule: traffic to `domain` (and subdomains) egresses via member `exit`
+    /// in `mesh` — the rule carries its own exit, so the mesh-wide exit is untouched and normal
+    /// traffic keeps using your own network. `exit = 0` falls back to the mesh's configured exit.
+    SplitAdd {
+        domain: String,
+        mesh: MeshId,
+        #[serde(default)]
+        exit: MemberId,
+    },
+    /// Remove a split rule by exact `domain`.
+    SplitDel { domain: String },
+    /// List split rules + whether the proxy is currently active. Returns [`Response::Split`].
+    SplitList,
+    /// Turn split mode ON for `mesh`: start the local DNS proxy + point the host resolver at it,
+    /// so this mesh's rules take effect. Default internet is untouched.
+    SplitOn { mesh: MeshId },
+    /// Turn split mode OFF: stop the proxy, remove injected `/32` routes, restore DNS.
+    SplitOff,
+
+    /// Set whether THIS node serves as an internet exit for `mesh`'s members (per-mesh opt-in,
+    /// docs/EXIT_SHARING.md). `enabled=false` (default) = no member can egress through us.
+    SetExitable { mesh: MeshId, enabled: bool },
 }
 
 /// A P-C6 wrapped invite: the serialized [`InviteBlob`] sealed under (algo, salt, n).
@@ -215,6 +296,83 @@ pub enum Response {
     Error {
         message: String,
     },
+
+    // --- extensions / connectors (docs/EXTENSIONS.md) -------------------------------
+    /// `Hello` accepted — the scopes this connection now holds.
+    HelloOk {
+        scopes: Vec<String>,
+    },
+    /// One extension grant (from `EnableExtension` / `ListExtensions`).
+    Extension(ExtensionView),
+    /// Installed extension grants (from `ListExtensions`).
+    Extensions(Vec<ExtensionView>),
+    /// Discovered services (from `ListServices`).
+    Services(Vec<ServiceView>),
+    /// Split-tunnel state (from `SplitList`).
+    Split(SplitView),
+    /// A pushed event on a `Subscribe`'d connection — NOT a reply to a request. `seq` is
+    /// monotonic per connection; a gap means events were dropped (the connector lagged)
+    /// and it should re-query current state. A `topic` of `"_lagged"` is the explicit
+    /// drop marker.
+    Event {
+        topic: String,
+        seq: u64,
+        ts_ms: u64,
+        data: serde_json::Value,
+    },
+}
+
+/// One extension grant, projected for the management UI (from `EnableExtension` /
+/// `ListExtensions`). The `token` is local-only (0600 state) — it authenticates which
+/// connector a connection claims to be, not a network credential.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExtensionView {
+    pub id: String,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+    pub token: String,
+    /// The grant is allowed on every mesh (incl. future) — overrides `meshes`.
+    #[serde(default)]
+    pub all_meshes: bool,
+    /// The specific meshes this grant is allowed on (when `all_meshes` is false).
+    #[serde(default)]
+    pub meshes: Vec<MeshId>,
+}
+
+/// One discovered service (from `ListServices`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceView {
+    pub mesh: MeshId,
+    pub member: MemberId,
+    pub member_name: String,
+    /// The owner's overlay IP — where a connector connects to reach the service.
+    pub overlay_ip: String,
+    pub proto: String,
+    pub port: u16,
+    pub name: String,
+    pub meta: serde_json::Value,
+    /// Whether the owner is currently live (recent data-plane contact); self = always true.
+    pub online: bool,
+}
+
+/// Split-tunnel state (from `SplitList`, docs/SPLIT_TUNNEL.md). Local to this node.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SplitView {
+    /// The configured domain→mesh rules.
+    pub rules: Vec<SplitRuleView>,
+    /// The mesh whose split proxy is currently running, or `None` if split mode is off.
+    #[serde(default)]
+    pub active_mesh: Option<MeshId>,
+}
+
+/// One split-tunnel rule projected for the UI/CLI.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SplitRuleView {
+    pub domain: String,
+    pub mesh: MeshId,
+    /// The exit member this domain routes through (`0` = the mesh's configured exit).
+    #[serde(default)]
+    pub exit: MemberId,
 }
 
 /// A self-contained invite: everything a joiner needs to install the mesh and key
@@ -259,6 +417,10 @@ pub struct MeshSummary {
     pub epoch: u64,
     pub exit: Option<MemberId>,
     pub is_current: bool,
+    /// Whether THIS node lets this mesh's members use it as their internet exit (docs/
+    /// EXIT_SHARING.md). `#[serde(default)]` so older meshd loads as false.
+    #[serde(default)]
+    pub exitable: bool,
     /// `Some(secs)` while an attack alert has armed this mesh's destroy grace (P-C7) —
     /// drives the global alert banner; `None` = not armed.
     #[serde(default)]
@@ -292,6 +454,16 @@ pub struct MemberView {
     /// the UI shows a reason exactly when there's a problem to explain.
     #[serde(default)]
     pub reason: Option<String>,
+    /// How we currently reach this member — the auto-discovered path (docs/SPLIT_TUNNEL.md is
+    /// separate; this is discovery, docs/DISCOVERY.md): `direct` (a fresh direct frame),
+    /// `relay` (reachable only via a public hop), `offline` (not heard), or `me`. For the
+    /// `lattice conns` connection book. `#[serde(default)]` so older meshd fills "".
+    #[serde(default)]
+    pub path: String,
+    /// Seconds since we last heard ANY frame from this member (direct or relayed); `None` if
+    /// never. Shown as the last-contact age in the connection book.
+    #[serde(default)]
+    pub last_seen_secs: Option<u64>,
 }
 
 /// The per-mesh detail view (§7).
@@ -302,6 +474,10 @@ pub struct MeshDetail {
     pub epoch: u64,
     pub me: MemberId,
     pub exit: Option<MemberId>,
+    /// Whether THIS node lets this mesh's members use it as their internet exit (per-mesh
+    /// opt-in, docs/EXIT_SHARING.md). `#[serde(default)]` so older meshd loads as false.
+    #[serde(default)]
+    pub exitable: bool,
     /// Charter (immutable governance), rendered for display.
     pub invite: String,
     pub trigger: String,

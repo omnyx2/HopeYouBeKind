@@ -56,6 +56,9 @@
             <button class="nav-item" data-tab="traffic" data-grp="user">
               <span class="nav-ico">📈</span> Traffic
             </button>
+            <button class="nav-item" data-tab="extensions" data-grp="user">
+              <span class="nav-ico">🧩</span> Extensions
+            </button>
             <!-- Mesh mode (scoped to the opened mesh) -->
             <button class="nav-item" data-tab="mesh-overview" data-grp="mesh">
               <span class="nav-ico">⬢</span> Overview
@@ -192,6 +195,16 @@
               </div>
               <p class="muted small">Ask the mesh owner which <b>algorithm</b> the invite uses — a wrong choice won't open it.</p>
             </div>
+          </section>
+
+          <!-- User mode: Extensions — connectors that bridge external apps onto the mesh
+               (docs/EXTENSIONS.md). Enable a connector + grant scopes, see discovered services. -->
+          <section data-panel="extensions" class="panel hidden">
+            <h1 class="panel-title">Extensions</h1>
+            <p class="panel-sub">Connectors are separate programs that use the mesh — they
+              discover members and advertise services (folder sync, VNC, …). You choose
+              <b>what each one may see</b>. <span class="muted small">(docs/EXTENSIONS.md)</span></p>
+            <div id="ext-body"></div>
           </section>
 
           <!-- Mesh mode: Overview (docs/GUI_PAGES.md §3) -->

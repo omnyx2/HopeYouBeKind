@@ -1,0 +1,3 @@
+# This crate is its own workspace root, so it builds to a local target/ dir
+# (the repo-root /target ignore is anchored and doesn't cover it).
+/target

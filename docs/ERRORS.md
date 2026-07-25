@@ -5,6 +5,143 @@ A running log of real failures we hit, their root cause, what we shipped to fix 
 membership / discovery / health). Newest first. Each entry: Incident → Root cause →
 Why it was hard to diagnose → Shipped → Remaining design gaps.
 
+> **READ THIS FILE BEFORE STARTING WORK** (CLAUDE.md "Working memory" step 0): the quick-log
+> just below + the blast-radius map. Don't re-make a logged mistake. When a fix causes/reveals an
+> error during implementation, add a one-line quick-log entry here.
+
+---
+
+## Quick log — "modified X → got error Y → fixed by Z" (newest first)
+
+- **2026-07-25** · wired the v0.7.8 legacy-`100.64/10` purge into **`disable_nat` only** → a
+  **pinned exit** (Oracle) only ever calls `enable_nat`, so it NEVER purged → **130 leftover
+  `FORWARD -s/-d 100.64.0.0/10 ACCEPT` rules** from the old always-on build accumulated on the live
+  exit (found by a post-network-change cross-check: `iptables-save | grep -c 100.64.0.0/10` = 130
+  on Oracle vs 0 on lablinux, which had gone through `disable_nat`). Harmless on Oracle
+  (`FORWARD -P ACCEPT`) but a real forwarding-policy leak on a `FORWARD -P DROP` host (blanket
+  overlay ACCEPT forwards for meshes never opted into). Fix (v0.7.10): call
+  `purge_legacy_overlay_nat()` at the top of `enable_nat` too, and cleaned the 130 live.
+  **Lesson: a migration-cleanup step must run on EVERY bringup path a node can take (serving AND
+  non-serving), not just the teardown path.**
+
+- **2026-07-25** · made exit NAT/`isolate` **per-subnet** (v0.7.8, `100.80.<id>.0/24`) in
+  `exit.rs::enable_nat` → on a **pinned exit** (Oracle) the Linux `ip rule from <subnet> lookup
+  <iso-table>` (and macOS pf `route-to … to any`) then **also matched the exit's OWN overlay IP**
+  (which is inside that subnet), so the node's member↔member replies were routed out the real WAN
+  instead of the tun → the exit stayed visible in gossip (`conns` = direct) but its **data path
+  died** (Mac→Oracle overlay ssh/ping timed out) after a restart. Same class as the v0.7.4 macOS
+  route-to/own-IP bug, reintroduced on Linux by the subnet narrowing. **Confirmed by diffing the
+  last-working baseline (per CLAUDE.md), NOT by guessing a rekey/handshake timeout** (my first,
+  wrong hypothesis — the user correctly insisted it was a code regression). Ground truth:
+  `ip route get 100.80.1.7 from 100.80.1.1` → `via <gw> dev ens3 table 100` (leaked to WAN).
+  Fix (v0.7.9): overlay-destined traffic bypasses the isolate rule — Linux adds a higher-priority
+  `ip rule to 100.64.0.0/10 lookup main priority 999`; macOS uses `to ! 100.64.0.0/10`. Only
+  forwarded INTERNET traffic isolates. Live-verified: after the bypass rule the route → `dev tun0`
+  and overlay ssh returned `TUNNEL_OK`. **Lesson: "worked before, broke after a version bump" =
+  diff the code first; a live-reachable node whose overlay data path is dead is a routing/pf bug,
+  not an OS wedge.**
+
+- **2026-07-23** · deploying a new meshd to lablinux over ssh → `setsid`/`nohup` background
+  launches DIDN'T persist (died with the ssh session) AND the poisoned shell `grep` wrapper +
+  interleaved `sudo` password prompts mangled the output so the swap looked like it "kept failing"
+  (stale 975d26c in the log) when the `cp` had actually worked. Fix: (1) install a **systemd unit**
+  for headless meshd (like Oracle) — reliable + survives reboot; (2) run remote commands from a
+  **self-contained script that writes results to a file**, then `cat` the file, instead of piping
+  live output through the mangling shell; (3) use `command grep` on remote output.
+
+Granular implementation errors from active work (the design-lesson write-ups are further down).
+
+- **2026-06-24** · ran `cargo build -p meshd` in the bundle script → **no-op** (`error: package
+  ID 'meshd' did not match`; package is `lattice-meshd`, binary is `meshd`) → the following `cp`
+  shipped a **months-old stale binary**. Fix: build `-p lattice-meshd`; `scripts/build-app.sh`
+  now gates on the embedded `build <sha>` == HEAD.
+- **2026-06-24** · read utun throughput as `netstat -I utun6 -b` column **`$7`** → that's
+  **Ibytes, not Opkts** → chased a phantom "2.3M Opkts flood" for ages. Fix: `$5`=Ipkts `$8`=Opkts;
+  and trust the **egress IP** (ground truth) over interface counters (macOS utun counters are
+  unreliable).
+- **2026-06-24** · `ip route get 1.1.1.1 from 100.80.1.7` (no `iif`) → **"Network unreachable"**
+  → wrongly concluded "Oracle forwarding is broken". With `iif tun0` it resolves fine — the
+  no-iif form can't validate a non-local source. Fix: always pass `iif` when simulating forwarding.
+- **2026-06-24** · assumed a **utun kernel wedge** for `Opkts=0` (a real prior failure mode) →
+  spent hours before checking config. The actual causes were a pf rule stealing packets (cb6c868)
+  + a route loop + the exit set to the wrong member. Fix: `Opkts=0` has ≥3 causes — discriminate
+  (in-mesh overlay test, read `/tmp/lattice-pf.conf`, `route get <exit>`), and **check
+  `lattice ls/info` config FIRST** (the exit was mis-set to an idle member the whole time).
+- **2026-06-24** · BSD `sed '0,/re/s//.../'` silently didn't replace in `Cargo.toml` (GNU-ism).
+  Fix: use the Edit tool / a portable `sed` for version bumps.
+
+---
+
+## Blast-radius map — "if you edit X, re-test Y, because…"
+
+A quick-reference regression map distilled from the incidents below. **Before editing an area
+on the left, expect the middle to break and check it.** Most of these have already bitten us once.
+
+| If you touch… | Re-test / re-check… | Because (the trap) |
+|---|---|---|
+| **`crates/meshd/src/exit.rs`** — `route_through` / `restore_routes` / `enable_nat` / `set_dns` | Full-tunnel on **all 3 OS**, the **kill-switch**, and **route loops** | Each `#[cfg(target_os)]` branch is INDEPENDENT — fixing macOS doesn't fix Windows/Linux (e.g. the v0.7.2 idempotent-routes fix was Windows-only; macOS kept looping). |
+| pf/route selectors using **`100.64.0.0/10`** | Whether the rule hits THIS node's **own** overlay IP | The node's own TUN IP `100.80.x.y` ∈ `100.64/10`. A rule meant for "traffic we forward for others" also matches our own egress → on a full-tunnel client it diverts our own traffic (utun Opkts=0 → kill-switch revert). |
+| Any host-route / pin op (`route add -host`, `/32`) | Idempotency + **pin-before-divert, fail-closed** | macOS `route add` fails "File exists" on a stale /32 → must `delete` first. And only divert the default into the tun if the exit /32 pin SUCCEEDED, else the exit's own outer packets loop back into the tun. |
+| `run(...)` → `run_checked(...)` anywhere | The control flow after a **failed** shell-out | Switching to the checked variant changes whether a failed step aborts or silently continues — a "surface the error" change can turn a no-op into an abort (or vice-versa). |
+| **`crates/mesh/src/charter.rs`** — `ExitPolicy` / any `#[default]` | Behaviour on a **pure client** node | A default-on policy runs at bringup on EVERY node, not just exits. (`Isolate` default is why an exit-only pf rule ran on clients.) |
+| **`crates/meshrun/src/lib.rs`** — run loop, TUN read/write, MTU, `CTRL_*` | In-mesh overlay AND exit traffic; **wire-compat** with un-upgraded nodes | New `CTRL_*` tags must be additive (old nodes hit `_ => {}`); changing frame layout/MTU breaks the data path for nodes still on the old build. |
+| **`crates/mesh/src/ipc.rs`** — `Request`/`Response` enums | CLI **and** GUI **and** connectors | Additive variants + `#[serde(default)]` ONLY. A removed/renamed/reordered variant → `"unknown variant"` errors ("extension unreachable" was exactly this: GUI newer than the running daemon). |
+| **`crates/meshd/src/main.rs`** — `serve_conn` / channels / `scope_gate` / event bus | Backpressure, shutdown-ack flush, live-grant re-check | Unbounded channel = memory leak under a stuck client; the Shutdown ack must flush before teardown; scope checks must read the LIVE grant, not a Hello-time snapshot. |
+| Data-plane crypto — nonce / `seq` / body+header keys | Nonce reuse **across a restart** | `seq` reset to 0 on restart while the key persists = keystream reuse. Seed `seq` from a random per-boot start. |
+| **Build / packaging** — `Cargo.toml`, `build.rs`, bundling | That the RIGHT thing built (see `BUILD.md`) | Package `lattice-meshd` ≠ binary `meshd`; GUI builds on **stable**, core on **1.79**; a new dep can drag in an `edition2024`/high-MSRV crate that breaks 1.79 CI (getrandom, winnow). |
+| **Anything you then "test live"** | That you're running the **current build** | A STALE binary masks regressions. Confirm `meshd: version vX.Y.Z build <sha>` in `/tmp/lattice-meshd.log` == `git rev-parse --short HEAD`. A stale 0.5.3 binary hid two full-tunnel regressions for hours (2026-06-24). |
+| Restarting meshd on the **live Mac** | utun/route/pf state accumulation | Many restarts churn utun + leave stale routes/pf, confounding diagnosis. Prefer offline/clean-slate (reboot) testing; diagnose with `curl`/TCP, never `ping` (ICMP blocked on campus). |
+
+**Diagnostic meta-lesson:** `Opkts=0` / "exit not passing traffic" has **multiple** causes —
+a kernel utun wedge, a pf rule stealing packets, OR a route loop. They look identical from the
+interface counter. **Discriminate** before concluding: send to an in-mesh overlay IP (isolates
+the exit code out), read `/tmp/lattice-pf.conf`, and `route get <exit-ip>` (must be the WAN, not
+the tun). On 2026-06-24 a "wedge" was wrongly assumed; it was a pf rule + a route loop.
+
+---
+
+## 2026-06-24 — two macOS full-tunnel regressions, unmasked by fixing a stale build
+
+**Incident:** after finally deploying the *current* build to the Mac (earlier runs had silently
+used a months-old binary), full-tunnel stopped working: the overlay TUN showed `Opkts=0` then a
+huge `Opkts` flood with `Ipkts=0`, egress stayed on the campus IP, and the kill-switch logged
+"full-tunnel exit not passing traffic — reverting".
+
+**Root cause (two independent bugs, both macOS-only, both in the data plane):**
+1. **pf `route-to` captured our own traffic.** `cb6c868` added, under the default
+   `ExitPolicy::Isolate`, `pass out route-to (en0 <gw>) from 100.64.0.0/10 to any` at bringup on
+   *every* node. Our own overlay IP `100.80.x.y` ∈ `100.64/10`, so on a full-tunnel client pf
+   shoved our own egress back out en0 → `Opkts=0`.
+2. **route_through diverted the default even when the exit /32 pin failed.** It did
+   `route add -host <exit> <gw>` (NOT idempotent — fails "File exists" on a stale /32 from a
+   prior on/off cycle) and then ALWAYS `route change default -interface utun`. With the pin
+   failed, the exit's own outer tunnel packets followed the new default back into the tun → a
+   routing loop (the `Opkts` flood), nothing reaches the exit, kill-switch reverts.
+
+**Why it was hard to diagnose:** `Opkts=0` is *identical* to a macOS utun kernel wedge (a real
+prior incident), so a wedge was wrongly assumed at first. Two things broke that assumption: an
+in-mesh overlay packet test (to `100.80.1.1`) also showed `Opkts=0` — but that turned out to be
+bug #1 (pf steals overlay-sourced packets too), not a wedge; and the static smoking gun was
+reading `/tmp/lattice-pf.conf` + confirming `100.80.1.7 ∈ 100.64/10`. Bug #2 was then hidden
+*behind* bug #1 — only once pf stopped stealing packets did the loop become visible.
+
+**Shipped:** (1) `5cfa960` — only install the isolate `route-to` rule on a node that actually
+serves as an exit (publicly-reachable / `MESHD_ADVERTISE` pinned); a client never forwards for
+others. (2) `19465bb` — make the macOS exit pin idempotent (`route delete -host` first) and only
+divert the default once the pin succeeded (fail closed, never loop). Both verified live: pf is
+`nat`-only on the client, `route get <exit>` → en0.
+
+**Remaining gaps (TODO when next here):**
+- Full-tunnel still didn't complete after both fixes (`Ipkts=0`, no return from the exit) —
+  client side is correct, so the next suspect is the **Oracle exit side** or a deeper data-plane
+  change in `0.5.3..v0.6.1` (the v0.6.1..HEAD range was already compared clean). See
+  the macOS-full-tunnel-regressions memory.
+- A stale binary masking regressions is its own failure class → the `build <sha>` startup stamp
+  + `scripts/build-app.sh` anti-stale gates exist now; USE them (BUILD.md).
+- The `isolate`-on-exit heuristic uses `MESHD_ADVERTISE` as the "am I an exit" proxy; a
+  non-pinned LAN exit would miss the rule. Acceptable trade vs. breaking every client; revisit
+  if a real LAN-exit topology needs isolate.
+
 ---
 
 ## 2026-06-21 — four early-access hardening fixes (v0.6.1)

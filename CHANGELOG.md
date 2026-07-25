@@ -11,6 +11,127 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.10] — 2026-07-25
+
+### Fixed
+- **Serving/pinned-exit nodes never purged legacy all-overlay forwarding rules.** The
+  `100.64.0.0/10` legacy-rule purge added in v0.7.8 ran only in `disable_nat` (the non-serving
+  path), so a pinned exit (`MESHD_ADVERTISE`) — which only ever calls `enable_nat` — kept every
+  leftover `FORWARD -s/-d 100.64.0.0/10 ACCEPT` rule from an older always-on build (found 130
+  accumulated on the live Oracle exit via a post-network-change cross-check). Harmless on a
+  `FORWARD -P ACCEPT` host but a forwarding-policy leak on `FORWARD -P DROP` (it would forward for
+  meshes the node never opted into). `enable_nat` now runs the same purge on the serving path.
+
+### Known limitations (documented, not yet fixed)
+- **Split-tunnel / full-tunnel are IPv4-only.** The overlay is IPv4 (`100.64.0.0/10`); on a
+  dual-stack network a matched domain that resolves to IPv6 (AAAA) egresses directly over IPv6,
+  bypassing the mesh exit. Force IPv4 (`curl -4`) to route via the exit. See docs/SPLIT_TUNNEL.md.
+- Changing a split rule's exit member on an already-active rule needs `split off`/`split on` to
+  re-inject the route (the previous flow stays cached until then).
+
+## [0.7.9] — 2026-07-25
+
+### Fixed
+- **Pinned exit's overlay silently broke (isolate + per-subnet NAT regression).** After v0.7.8 made
+  the exit NAT/`isolate` rules per-subnet (`100.80.<id>.0/24`), the Linux `ip rule from <subnet>
+  lookup <iso-table>` (and the macOS pf `route-to ... to any`) also matched the exit node's OWN
+  overlay IP — which sits inside that subnet — so the node's member↔member replies were diverted
+  out the real WAN instead of the tun. A pinned exit (`MESHD_ADVERTISE`) could still be reached
+  via gossip but its data path to other members died (overlay ssh/ping timed out) until a
+  reconcile. Fix: overlay-destined traffic now bypasses the isolate rule — Linux adds a
+  higher-priority `to 100.64.0.0/10 lookup main` rule; macOS uses `to ! 100.64.0.0/10`. Only
+  forwarded INTERNET traffic isolates to the real WAN. Diagnosed by diffing against the last
+  working baseline (per CLAUDE.md), live-verified Mac↔Oracle.
+
+## [0.7.8] — 2026-07-25
+
+### Fixed
+- **`exitable=off` now actually stops serving as an exit.** A node upgraded from an older
+  always-on build kept leftover `100.64.0.0/10` MASQUERADE iptables rules, so it forwarded ALL
+  overlay traffic for everyone regardless of the per-mesh `exitable` toggle. meshd now reconciles
+  NAT at bringup (serve → NAT this mesh's subnet; not serving → disable + **purge every legacy
+  all-overlay rule**). Found via a cross-node test.
+
+## [0.7.7] — 2026-07-25
+
+### Added
+- **Per-mesh `exitable` — opt-in serving as an internet exit** (docs/EXIT_SHARING.md). Whether a
+  mesh's members may use THIS node's internet as their exit is now a per-mesh toggle, **default
+  OFF**. A mesh member (incl. an intruder) can't route their internet through a node unless it
+  explicitly made that mesh exitable — an in-mesh attacker's blast radius stays on nodes that
+  chose to serve. Only the exitable mesh's own subnet (`100.80.<id>.0/24`) is NAT'd, so serving
+  one mesh never proxies another. Dedicated pinned exits (`MESHD_ADVERTISE`) stay exitable
+  automatically. `lattice exitable <mesh> [on|off]` + a toggle in the User-mode Meshes list.
+  Serving is decoupled from consuming.
+
+## [0.7.6] — 2026-07-23
+
+### Added
+- **Per-domain split-tunnel exit** — each split rule now carries its OWN exit member
+  (`lattice split add <domain> <mesh> <exit>`), independent of the mesh-wide exit. So normal
+  traffic keeps using your own network and you never touch the mesh exit. Guarded: the exit can't
+  be this node itself or an unknown member (fixes the "set exit to self → can't connect" trap).
+  Live-verified: with the mesh exit set to *none*, `pornhub.com` still egressed via the chosen
+  member (Oracle) while everything else stayed direct. GUI: an exit-member picker on the split card.
+
+## [0.7.5] — 2026-07-23
+
+### Added
+- **Domain split-tunnel** (docs/SPLIT_TUNNEL.md) — keep normal internet direct, but send specific
+  domains (and their subdomains, e.g. `*.pornhub.com`) out through a chosen mesh exit. meshd runs
+  a local DNS proxy that learns the domain→IP mapping and injects a `/32` route into the mesh tun
+  for matched IPs only; the default route is never touched. `lattice split add/rm/list/on/off` +
+  a Configs GUI card. Local to each node, never gossiped. Live-verified (a `*.pornhub.com`
+  connection egressed via the exit while everything else stayed direct).
+- **Connection book** — `lattice conns <mesh>` shows a per-member key→value view of the
+  auto-discovered path: `direct` / `relay` / `offline`, endpoint, and last-seen age. `MemberView`
+  gains `path` + `last_seen_secs`. The learned endpoint was already persisted for fast reconnect;
+  this surfaces which path each member was auto-connected over.
+
+## [0.7.4] — 2026-06-24
+
+### Fixed
+- **macOS full-tunnel broken by two exit-routing regressions** (latent since v0.7.0, exposed
+  once a non-stale build was deployed). (1) The `isolate` exit policy installed a pf `route-to`
+  rule selecting `100.64.0.0/10` on **every** node; that range also matches the node's OWN
+  overlay IP, so on a full-tunnel client pf diverted its own egress back out the physical WAN
+  (utun saw no packets → kill-switch reverted). (2) `route_through` diverted the default route
+  into the tunnel **even when the exit /32 pin failed**, and the macOS pin wasn't idempotent, so
+  a stale /32 from a prior cycle made the exit's own outer packets loop back into the tunnel.
+  Fixes: the isolate `route-to` rule only installs on a node that actually serves as an exit
+  (publicly-reachable / `MESHD_ADVERTISE` pinned); the macOS pin is now delete-first idempotent
+  and the default is diverted **only after** the pin succeeds (fail closed). See `docs/ERRORS.md`.
+
+### Added
+- **Extensions / connector framework (daemon side)** — `meshd` can now host external
+  connector programs over its existing IPC socket (docs/EXTENSIONS.md). Connectors are
+  separate processes that authenticate with `Hello{id,token}`, `Subscribe` to scope-gated
+  event topics (`peer`/`service`/`exit`/`health`) to receive a server-pushed `Event`
+  stream, and use a mesh-wide **service registry** (`Advertise`/`Unadvertise`/
+  `ListServices`, gossiped via `CTRL_REGISTRY` 0x08, soft-state with TTL expiry) to
+  discover each other on the overlay. Grants are created with `EnableExtension{id,scopes}`
+  and persisted to `extensions.json` (0600); a bounded `broadcast` event bus keeps a slow
+  connector from ever back-pressuring the data plane. Wire-compatible (additive IPC +
+  control tag).
+- **Extensions GUI page** — a User-mode **Extensions** tab to enable connectors with
+  per-scope approval (risk-labelled), see/disable existing grants and copy their token,
+  and browse services discovered across all meshes. The first connector (MiniSync) is
+  still to come.
+- **Per-mesh extension scoping** — an extension grant now carries which meshes it may
+  touch (`all_meshes` or an explicit `meshes` allow-list), chosen at enable time. The
+  daemon enforces it on `Advertise`/`Unadvertise`/`ListServices` and filters the event
+  stream by mesh, so enabling one connector never silently exposes a mesh the user didn't
+  pick. Grants written before this load as "no meshes" (must be re-granted).
+
+### Tooling / docs
+- **Build-identity stamp** — `meshd` logs `version vX.Y.Z build <git-sha>` at startup, so the
+  running binary is always identifiable (a stale binary had been masking regressions for hours).
+- **`scripts/build-app.sh`** — one correct desktop build with anti-stale / anti-mix gates;
+  **BUILD.md** build charter, **CLAUDE.md** working agreement, and a **blast-radius regression
+  map** in `docs/ERRORS.md` ("edit X → re-test Y, because…").
+- **Windows `meshd.exe` VERSIONINFO** (via `winres`) to cut Defender false-positives on the
+  unsigned sidecar.
+
 ## [0.7.1] — 2026-06-22
 
 ### Fixed
