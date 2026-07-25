@@ -1723,11 +1723,20 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         // would divert its own full-tunnel egress off the tun and wedge). Regression: 5cfa960.
         (policy_isolate && is_exit_node, exitable || is_exit_node)
     };
-    if serve {
-        // Only this mesh's own subnet is NAT'd (not all 100.64/10), so serving one mesh never
-        // proxies another. enable_nat shells out — run it off the async runtime.
+    // Reconcile NAT to the exitable decision at every bringup. Serving → NAT this mesh's OWN
+    // subnet only (never all 100.64/10). NOT serving → disable_nat, which also PURGES any legacy
+    // all-overlay MASQUERADE left by older always-on builds — else a previously-always-on node
+    // would keep forwarding for everyone despite `exitable=off` (caught by a cross-node test).
+    {
         let subnet = format!("{}.{}.{}.0/24", b.prefix[0], b.prefix[1], b.mesh_id);
-        let _ = tokio::task::spawn_blocking(move || exit::enable_nat(&subnet, isolate)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            if serve {
+                exit::enable_nat(&subnet, isolate);
+            } else {
+                exit::disable_nat(&subnet);
+            }
+        })
+        .await;
     }
     // This node's own reachable address, advertised in the endpoint gossip so peers
     // can reach us without a manual SetPeer (docs/DISCOVERY.md §2). A public node

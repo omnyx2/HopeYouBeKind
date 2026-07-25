@@ -688,8 +688,55 @@ pub fn disable_nat(subnet: &str) {
             .args(["-D", "FORWARD", dir, subnet, "-j", "ACCEPT"])
             .status();
     }
+    // Migration cleanup: older builds enabled NAT unconditionally at bringup and (not being
+    // idempotent) piled up many `-s 100.64.0.0/10 MASQUERADE` rules on every interface. If those
+    // linger, this node keeps forwarding ALL overlay traffic regardless of `exitable` — so purge
+    // every leftover all-overlay rule here (found the hard way via a cross-node test).
+    purge_legacy_overlay_nat();
     let _ = Command::new("ip")
         .args(["rule", "del", "from", subnet, "lookup", ISO_TABLE])
+        .status();
+}
+
+/// **RISK 🔴 HIGH** — remove EVERY leftover all-overlay (`100.64.0.0/10`) MASQUERADE (nat) and
+/// ACCEPT (FORWARD) rule, on any interface, from older always-on builds. Parses `iptables-save`
+/// and deletes each matching rule by its exact spec (there can be many duplicates). Idempotent.
+#[cfg(target_os = "linux")]
+fn purge_legacy_overlay_nat() {
+    // nat POSTROUTING MASQUERADE for 100.64.0.0/10 (on any -o interface).
+    if let Ok(out) = Command::new("iptables-save").args(["-t", "nat"]).output() {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let l = line.trim();
+            if l.starts_with("-A POSTROUTING")
+                && l.contains("100.64.0.0/10")
+                && l.contains("MASQUERADE")
+            {
+                let mut args = vec!["-t".to_string(), "nat".to_string(), "-D".to_string()];
+                args.extend(l["-A ".len()..].split_whitespace().map(String::from));
+                let a: Vec<&str> = args.iter().map(String::as_str).collect();
+                let _ = Command::new("iptables").args(&a).status();
+            }
+        }
+    }
+    // filter FORWARD ACCEPT for 100.64.0.0/10.
+    if let Ok(out) = Command::new("iptables-save")
+        .arg("-t")
+        .arg("filter")
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let l = line.trim();
+            if l.starts_with("-A FORWARD") && l.contains("100.64.0.0/10") && l.contains("ACCEPT") {
+                let mut args = vec!["-D".to_string()];
+                args.extend(l["-A ".len()..].split_whitespace().map(String::from));
+                let a: Vec<&str> = args.iter().map(String::as_str).collect();
+                let _ = Command::new("iptables").args(&a).status();
+            }
+        }
+    }
+    // The legacy isolate rule keyed on the whole overlay range, too.
+    let _ = Command::new("ip")
+        .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
         .status();
 }
 
