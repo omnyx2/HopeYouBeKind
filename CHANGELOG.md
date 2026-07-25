@@ -13,6 +13,14 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 
 ## [0.7.10] — 2026-07-25
 
+### Changed
+- **`lattice ls` / `status` now surface an active split-tunnel.** While split is on, the host
+  resolver is pointed at meshd's `127.0.0.1:53` proxy and matched domains route via a mesh exit —
+  even when no mesh is selected for egress (`is_current=false`, shown as `direct`/Default). That
+  state was previously only visible via `lattice split list`, so a node could be hijacking DNS +
+  routing some domains through a mesh with no hint in the main status. Both views now print a
+  `split-tunnel: ON (mesh #N …) — host DNS → meshd` line.
+
 ### Fixed
 - **Serving/pinned-exit nodes never purged legacy all-overlay forwarding rules.** The
   `100.64.0.0/10` legacy-rule purge added in v0.7.8 ran only in `disable_nat` (the non-serving
