@@ -5,6 +5,15 @@ out through a chosen mesh **exit** — without routing everything through the me
 node (rules are never gossiped). Built in `crates/meshd/src/dns_split.rs` + `exit.rs`
 (route injection) + the `SplitAdd/Del/List/On/Off` IPC; driven by `lattice split`.
 
+**Split-tunnel selects its mesh (since v0.7.11).** Turning split on marks that mesh as the current
+selection — shown as a `split` selection (NOT a full tunnel: general traffic stays direct, only
+matched domains follow the mesh exit). Switching to the **Default network** (`SetCurrent(None)` /
+the GUI "use default network" button) turns split **off** (restores the host DNS + removes the
+injected `/32`s). This closes the old trap where split kept hijacking DNS and routing domains
+through a mesh even after you thought you were on plain "Default". Internally a `full_tunnel` flag
+separates "selected for a full tunnel" from "selected to host split routing", so the network-change
+re-route and shutdown restore only fire for a real full tunnel.
+
 ## Why it needs DNS
 
 A packet on the wire carries a destination **IP**, not a domain name — the name is gone after
@@ -76,11 +85,12 @@ configured exit (back-compat for pre-per-domain `split.json`).
 
 - **Global DNS hijack while on (single point of failure).** Turning split on points the WHOLE host
   resolver at meshd's `127.0.0.1:53` proxy (no secondary), so ALL DNS — not just the matched
-  domains — flows through meshd, even when no mesh is selected for egress (`Default`/`direct`). The
-  proxy forwards non-matched names to the real upstream, so it's transparent in normal operation,
-  but if meshd dies while split is on, system DNS dies with it. It's also easy to forget it's on
-  (one split rule ⇒ meshd owns your resolver); `lattice ls`/`status` now print a `split-tunnel: ON`
-  line so the state isn't invisible. Turn it off with `lattice split off` (restores the prior DNS).
+  domains — flows through meshd. The proxy forwards non-matched names to the real upstream, so it's
+  transparent in normal operation. Mitigations since v0.7.11: split is no longer a hidden global
+  switch (it selects its mesh; the **Default network turns it off**), a clean `shutdown` restores
+  the resolver, and `lattice ls`/`status` show a `split-tunnel: ON` line. Still open: a hard CRASH
+  (not a clean shutdown) while split is on can leave the resolver pointed at the dead proxy until
+  the next start; and even in normal use one split rule means meshd owns your resolver.
 - **One active mesh at a time (mutually exclusive).** Rules are per-mesh (each `SplitRule` carries
   its `mesh` + exit member), but activation is a single global session — `state.split` is one
   `Option<SplitActive>` and the host resolver can only point at one `127.0.0.1:53` proxy.
