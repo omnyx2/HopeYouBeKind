@@ -127,3 +127,16 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
 - **Oracle updated cb6c868 → e069aa7, restarted; fleet data-plane version-matched.** — deploy
 - **Extensions/connector framework committed (+ 2 pre-commit hardening fixes).** — `d2370c1`
 - **GUI version sync to 0.7.3.** — `7e50ea9`
+
+## 2026-07-25 — Per-mesh `exitable` (opt-in exit serving) + legacy-NAT purge
+- **Per-mesh `exitable` toggle, default OFF** — members can only use my internet as exit if I made
+  that mesh exitable; only the mesh's own subnet `100.80.<id>.0/24` is NAT'd (not 100.64/10);
+  pinned exits (`MESHD_ADVERTISE`) stay exitable automatically. — `v0.7.7`
+- **fix: `exitable=off` now actually stops serving** — a node upgraded from the old always-on
+  build kept leftover `100.64.0.0/10` MASQUERADE rules (14 dups on lablinux) → forwarded for
+  everyone. meshd now reconciles NAT at bringup + `disable_nat` purges every legacy all-overlay
+  rule. Found by the cross-node test. — `af13e63` / released `v0.7.8` (`40aa1f2`)
+- **Cross-node verified (Mac client ↔ lablinux #4 exit, v0.7.8 fresh install):**
+  exitable OFF → curl ifconfig.me FAILS (dropped; route→utun6 + overlay healthy, so genuinely
+  dropped at exit); exitable ON → NAT scoped to `100.80.1.0/24` only, curl → 210.107.188.8
+  (lablinux egress); ON→OFF live (no restart) → NAT purged, curl fails again. — verified
