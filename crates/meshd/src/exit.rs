@@ -273,14 +273,14 @@ fn macos_default_iface() -> Option<String> {
 }
 
 /// **RISK 🔴 HIGH** (writes/loads a pf ruleset; the isolate/own-IP rule was a full-tunnel regression).
-/// macOS exit NAT (see module header `enable_nat` contract). Enables IP forwarding and writes a
-/// pf ruleset: `nat on <wan> from 100.64.0.0/10 -> (<wan>)`, plus — when `isolate` — a
-/// `pass out route-to (<wan> <gw>) from 100.64.0.0/10` that pins forwarded traffic to the real
-/// WAN. ⚠ That selector also matches THIS node's OWN overlay IP, so the caller must pass
-/// `isolate=true` ONLY for a real exit node (a client would divert its own egress off the tun).
-/// Remembers pf's prior on/off state in `PF_WAS_OFF` for [`disable_nat`].
+/// macOS exit NAT for ONE overlay `subnet` (per-mesh `exitable`, docs/SPLIT_TUNNEL.md /
+/// EXIT_SHARING). Enables IP forwarding and writes a pf ruleset NATting only `subnet`
+/// (`nat on <wan> from <subnet> -> (<wan>)`) so ONLY that mesh's members can egress through us —
+/// not all `100.64/10`. `isolate` adds the `route-to` pin (pinned exits only). Remembers pf's
+/// prior on/off state in `PF_WAS_OFF`. NOTE: writes a single pf file — enabling two meshes on the
+/// SAME macOS node keeps only the last (a documented limitation; real exits are Linux).
 #[cfg(target_os = "macos")]
-pub fn enable_nat(isolate: bool) {
+pub fn enable_nat(subnet: &str, isolate: bool) {
     run("sysctl", &["-w", "net.inet.ip.forwarding=1"]);
     let Some(wan) = macos_default_iface() else {
         tracing::warn!("no default interface; macOS exit NAT not applied");
@@ -289,7 +289,7 @@ pub fn enable_nat(isolate: bool) {
     // Source-NAT tunnelled (overlay-range) traffic out the WAN. A ruleset with
     // only a nat rule leaves the filter ruleset empty == default-pass, so
     // forwarded packets (tun→WAN, enabled by ip.forwarding) pass and get NAT'd.
-    let mut conf = format!("nat on {wan} from 100.64.0.0/10 to any -> ({wan})\n");
+    let mut conf = format!("nat on {wan} from {subnet} to any -> ({wan})\n");
     // Exit-policy ISOLATE (docs/EXIT_POLICY.md): force traffic we forward FOR OTHERS
     // (sourced from the overlay range) out the real gateway via pf `route-to`, so it leaves
     // our own WAN even if our own full-tunnel later diverts the default route to the tun.
@@ -297,7 +297,7 @@ pub fn enable_nat(isolate: bool) {
     if isolate {
         if let Some(gw) = macos_default_gateway() {
             conf.push_str(&format!(
-                "pass out route-to ({wan} {gw}) inet from 100.64.0.0/10 to any\n"
+                "pass out route-to ({wan} {gw}) inet from {subnet} to any\n"
             ));
             tracing::warn!(
                 wan,
@@ -323,15 +323,20 @@ pub fn enable_nat(isolate: bool) {
     }
     run("pfctl", &["-f", "/tmp/lattice-pf.conf"]);
     run("pfctl", &["-e"]); // harmless "already enabled" if it was on
-    tracing::warn!(wan, "macOS exit NAT enabled (pf nat 100.64.0.0/10 -> WAN)");
+    tracing::warn!(
+        wan,
+        subnet,
+        "macOS exit NAT enabled (this mesh serves as an exit)"
+    );
 }
 
 /// **RISK 🔴 HIGH** (reloads the system pf ruleset + pf on/off state; a wrong edit leaves pf wrong).
-/// macOS undo [`enable_nat`]: reload the system pf ruleset (`/etc/pf.conf`), restore pf's prior
-/// on/off state (off again if `PF_WAS_OFF`), drop our ruleset file, disable IP forwarding.
+/// macOS undo [`enable_nat`]: stop serving as an exit. Since macOS keeps a single pf file, this
+/// restores the system pf ruleset entirely (`_subnet` accepted for signature parity — on macOS we
+/// don't serve multiple exit subnets, so tearing one down clears our NAT). Puts pf's on/off state
+/// back and disables IP forwarding.
 #[cfg(target_os = "macos")]
-pub fn disable_nat() {
-    // Restore the system pf ruleset, then put pf's enabled/disabled state back.
+pub fn disable_nat(_subnet: &str) {
     run("pfctl", &["-f", "/etc/pf.conf"]);
     if std::fs::remove_file(PF_WAS_OFF).is_ok() {
         run("pfctl", &["-d"]); // pf was off before us → turn it back off
@@ -575,90 +580,20 @@ const ISO_TABLE: &str = "100";
 #[cfg(target_os = "linux")]
 const ISO_PRIO: &str = "1000";
 
-/// **RISK 🔴 HIGH** (iptables MASQUERADE/FORWARD + isolate source-routing; same own-IP caveat as macOS).
-/// Linux exit NAT (see module header `enable_nat` contract). IP forwarding + iptables
-/// `POSTROUTING MASQUERADE` for `100.64.0.0/10` out the WAN + `FORWARD ACCEPT` inserted at the
-/// TOP (before any distro default `FORWARD -j REJECT`). When `isolate`, adds source-based
-/// routing: a side table [`ISO_TABLE`] (`default via <gw> dev <wan>`) + `ip rule from
-/// 100.64.0.0/10 lookup <table>`, so forwarded (overlay-sourced) traffic leaves the real WAN even
-/// if this node also full-tunnels. ⚠ Same own-IP caveat as the macOS `route-to`: only for real
-/// exits. NOT idempotent — iptables rules append (dup) on every call (cleanup is a TODO).
+/// **RISK 🔴 HIGH** (iptables MASQUERADE/FORWARD + isolate source-routing).
+/// Linux exit NAT for ONE overlay `subnet` (per-mesh `exitable`): IP forwarding + iptables
+/// `POSTROUTING MASQUERADE` for `<subnet>` out the WAN + `FORWARD ACCEPT` inserted at the TOP
+/// (before any distro default `FORWARD -j REJECT`). ONLY that mesh's subnet is NAT'd, so serving
+/// one mesh never proxies another. When `isolate`, adds source routing for `<subnet>` (pinned
+/// exits only). Idempotent (delete-then-add). Also cleans up the legacy unconditional
+/// `100.64.0.0/10` MASQUERADE from older builds.
 #[cfg(target_os = "linux")]
-pub fn enable_nat(isolate: bool) {
+pub fn enable_nat(subnet: &str, isolate: bool) {
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"]);
     if let Some((gw, wan)) = linux_default_route() {
-        run(
-            "iptables",
-            &[
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-s",
-                "100.64.0.0/10",
-                "-o",
-                &wan,
-                "-j",
-                "MASQUERADE",
-            ],
-        );
-        // INSERT at the top, not append: distros like RHEL/Oracle Linux ship a
-        // default `FORWARD -j REJECT` rule, so an appended ACCEPT never runs and
-        // forwarded (exit) traffic is rejected. -I puts us before that REJECT.
-        run(
-            "iptables",
-            &["-I", "FORWARD", "1", "-s", "100.64.0.0/10", "-j", "ACCEPT"],
-        );
-        run(
-            "iptables",
-            &["-I", "FORWARD", "1", "-d", "100.64.0.0/10", "-j", "ACCEPT"],
-        );
-        tracing::warn!(wan, "exit NAT enabled (masquerade)");
-        if isolate {
-            // Exit-policy ISOLATE: pin traffic we forward FOR OTHERS (sourced from the
-            // overlay range 100.64/10) to the REAL default gateway via a side table, so it
-            // leaves our own WAN even if our own full-tunnel later diverts the main-table
-            // default. Our own traffic (real src IP) is unaffected and still follows main.
-            run(
-                "ip",
-                &[
-                    "route", "replace", "default", "via", &gw, "dev", &wan, "table", ISO_TABLE,
-                ],
-            );
-            // `ip rule add` isn't idempotent — clear any stale duplicate first (ok if absent).
-            let _ = Command::new("ip")
-                .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
-                .status();
-            run(
-                "ip",
-                &[
-                    "rule",
-                    "add",
-                    "from",
-                    "100.64.0.0/10",
-                    "lookup",
-                    ISO_TABLE,
-                    "priority",
-                    ISO_PRIO,
-                ],
-            );
-            tracing::warn!(
-                gw,
-                table = ISO_TABLE,
-                "exit-policy isolate: forwarded traffic pinned to real WAN"
-            );
-        }
-    }
-}
-
-/// **RISK 🔴 HIGH** — Linux undo [`enable_nat`]: delete the MASQUERADE rule, tear down the isolate `ip rule` + flush
-/// the side table, disable IP forwarding. (FORWARD ACCEPT rules are left; harmless.)
-#[cfg(target_os = "linux")]
-pub fn disable_nat() {
-    if let Some((_, wan)) = linux_default_route() {
-        run(
-            "iptables",
-            &[
+        // Remove the legacy all-overlay rule (older builds NAT'd 100.64.0.0/10 unconditionally).
+        let _ = Command::new("iptables")
+            .args([
                 "-t",
                 "nat",
                 "-D",
@@ -669,17 +604,93 @@ pub fn disable_nat() {
                 &wan,
                 "-j",
                 "MASQUERADE",
-            ],
+            ])
+            .status();
+        // Idempotent: delete any prior copy of our rule, then add exactly one.
+        let masq = [
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "-o",
+            &wan,
+            "-j",
+            "MASQUERADE",
+        ];
+        let _ = Command::new("iptables").args(masq).status();
+        let mut add = masq;
+        add[2] = "-A";
+        run("iptables", &add);
+        // INSERT at the top, not append: distros ship a default `FORWARD -j REJECT`, so an
+        // appended ACCEPT never runs. Delete-then-insert to stay idempotent.
+        for dir in ["-s", "-d"] {
+            let _ = Command::new("iptables")
+                .args(["-D", "FORWARD", dir, subnet, "-j", "ACCEPT"])
+                .status();
+            run(
+                "iptables",
+                &["-I", "FORWARD", "1", dir, subnet, "-j", "ACCEPT"],
+            );
+        }
+        tracing::warn!(
+            wan,
+            subnet,
+            "exit NAT enabled — this mesh serves as an exit"
         );
+        if isolate {
+            // Pin traffic we forward FOR OTHERS (sourced from <subnet>) to the REAL gateway via a
+            // side table, so it leaves our own WAN even if we also full-tunnel. Own traffic
+            // (real src IP) still follows main.
+            run(
+                "ip",
+                &[
+                    "route", "replace", "default", "via", &gw, "dev", &wan, "table", ISO_TABLE,
+                ],
+            );
+            let _ = Command::new("ip")
+                .args(["rule", "del", "from", subnet, "lookup", ISO_TABLE])
+                .status();
+            run(
+                "ip",
+                &[
+                    "rule", "add", "from", subnet, "lookup", ISO_TABLE, "priority", ISO_PRIO,
+                ],
+            );
+        }
     }
-    // Tear down the isolate source-routing (harmless if it was never installed).
+}
+
+/// **RISK 🔴 HIGH** — Linux stop serving `subnet` as an exit: delete its MASQUERADE + FORWARD +
+/// isolate rules. Other exitable subnets are untouched. Leaves ip_forward on (harmless; other
+/// meshes may still serve).
+#[cfg(target_os = "linux")]
+pub fn disable_nat(subnet: &str) {
+    if let Some((_, wan)) = linux_default_route() {
+        let _ = Command::new("iptables")
+            .args([
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                subnet,
+                "-o",
+                &wan,
+                "-j",
+                "MASQUERADE",
+            ])
+            .status();
+    }
+    for dir in ["-s", "-d"] {
+        let _ = Command::new("iptables")
+            .args(["-D", "FORWARD", dir, subnet, "-j", "ACCEPT"])
+            .status();
+    }
     let _ = Command::new("ip")
-        .args(["rule", "del", "from", "100.64.0.0/10", "lookup", ISO_TABLE])
+        .args(["rule", "del", "from", subnet, "lookup", ISO_TABLE])
         .status();
-    let _ = Command::new("ip")
-        .args(["route", "flush", "table", ISO_TABLE])
-        .status();
-    run("sysctl", &["-w", "net.ipv4.ip_forward=0"]);
 }
 
 // ----------------------------- Windows -----------------------------
@@ -869,11 +880,18 @@ pub fn current_gateway() -> Option<String> {
 /// the system route, so forwarded traffic leaves the real adapter UNLESS this node also
 /// full-tunnels (Windows has no simple source-based routing — full source-pinning is a TODO).
 #[cfg(target_os = "windows")]
-pub fn enable_nat(isolate: bool) {
-    // Forward between interfaces + WinNAT for the overlay range.
+pub fn enable_nat(subnet: &str, isolate: bool) {
+    // Forward + WinNAT for ONLY this mesh's overlay `subnet` (per-mesh exitable) — a NetNat named
+    // after the subnet so multiple exitable meshes coexist and tear down independently.
+    let name = format!("Lattice_{}", subnet.replace(['.', '/'], "_"));
     ps("Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue");
-    ps("if (-not (Get-NetNat -Name Lattice -ErrorAction SilentlyContinue)) { New-NetNat -Name Lattice -InternalIPInterfaceAddressPrefix 100.64.0.0/10 }");
-    tracing::warn!("windows exit NAT enabled (WinNAT 100.64.0.0/10)");
+    ps(&format!(
+        "if (-not (Get-NetNat -Name {name} -ErrorAction SilentlyContinue)) {{ New-NetNat -Name {name} -InternalIPInterfaceAddressPrefix {subnet} }}"
+    ));
+    tracing::warn!(
+        subnet,
+        "windows exit NAT enabled — this mesh serves as an exit"
+    );
     // Exit-policy ISOLATE on Windows is best-effort: WinNAT egresses via the system route
     // to the destination, so when this node is NOT itself full-tunnelling, forwarded
     // traffic already leaves the real adapter (isolate holds). But Windows has no simple
@@ -888,9 +906,14 @@ pub fn enable_nat(isolate: bool) {
     }
 }
 
-/// **RISK 🟡 MED** — Windows undo [`enable_nat`]: remove the `Lattice` WinNAT instance.
+/// **RISK 🟡 MED** — Windows stop serving `subnet`: remove its WinNAT instance (+ the legacy
+/// `Lattice` one from older builds).
 #[cfg(target_os = "windows")]
-pub fn disable_nat() {
+pub fn disable_nat(subnet: &str) {
+    let name = format!("Lattice_{}", subnet.replace(['.', '/'], "_"));
+    ps(&format!(
+        "Remove-NetNat -Name {name} -Confirm:$false -ErrorAction SilentlyContinue"
+    ));
     ps("Remove-NetNat -Name Lattice -Confirm:$false -ErrorAction SilentlyContinue");
 }
 
@@ -928,11 +951,11 @@ pub fn route_host_via_iface(_ip: std::net::Ipv4Addr, _iface: &str) -> Result<(),
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn unroute_host(_ip: std::net::Ipv4Addr) {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn enable_nat(_isolate: bool) {
+pub fn enable_nat(_subnet: &str, _isolate: bool) {
     tracing::warn!("exit-node NAT not implemented on this platform");
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn disable_nat() {}
+pub fn disable_nat(_subnet: &str) {}
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn set_dns(_servers: &[IpAddr]) -> Result<(), String> {
     Ok(())

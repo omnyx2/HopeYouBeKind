@@ -175,6 +175,7 @@ def cmd_info(sock, a):
     print(f"  expel      {d.get('expel', '?')}")
     print(f"  header     {d.get('header_placement', '?')}")
     print(f"  exit-pol   {d.get('exit_policy', '?')}")
+    print(f"  exitable   {'ON — members may exit through me' if d.get('exitable') else 'off (nobody exits through me)'}")
     print(f"  health     {d['live']}/{len(d['members'])} live · floor {d['threshold']}")
     if d.get("attack_armed_secs_left") is not None:
         print(f"  ⚠ ATTACK   self-destruct in {d['attack_armed_secs_left']}s "
@@ -264,6 +265,19 @@ def cmd_vpn(sock, a):
 def cmd_off(sock, a):
     call(sock, {"SetCurrent": {"mesh": None}})
     print("full tunnel OFF — back to direct internet.")
+
+
+def cmd_exitable(sock, a):
+    # Per-mesh: whether THIS node lets that mesh's members use it as their internet exit.
+    mid = resolve_mesh(sock, a.mesh)
+    if a.state is None:
+        d = call(sock, {"MeshInfo": {"mesh": mid}})["Mesh"]
+        on = d.get("exitable", False)
+        print(f"mesh {mid}: exitable = {'ON — its members may exit through me' if on else 'OFF (default) — nobody exits through me'}")
+        return
+    enabled = a.state == "on"
+    call(sock, {"SetExitable": {"mesh": mid, "enabled": enabled}})
+    print(f"mesh {mid}: exitable {'ON — its members may now use my internet as their exit' if enabled else 'OFF — members can no longer exit through me'}")
 
 
 def cmd_conns(sock, a):
@@ -937,6 +951,11 @@ def build_parser():
     s = sub.add_parser("conns", help="connection book: how each member is reached (direct/relay/offline)")
     s.add_argument("mesh", help="mesh id or name")
     s.set_defaults(fn=cmd_conns)
+
+    s = sub.add_parser("exitable", help="let (or stop) this mesh's members use my internet as their exit")
+    s.add_argument("mesh", help="mesh id or name")
+    s.add_argument("state", nargs="?", choices=["on", "off"], help="on/off (omit to show current)")
+    s.set_defaults(fn=cmd_exitable)
 
     s = sub.add_parser("split", help="domain split-tunnel: send only specific domains via a mesh exit")
     ssub = s.add_subparsers(dest="action")

@@ -191,6 +191,11 @@ struct MeshState {
     /// split traffic goes to the rule's exit without touching the mesh-wide exit. Empty when
     /// split mode is off (docs/SPLIT_TUNNEL.md).
     split_routes: SharedSplitRoutes,
+    /// Whether THIS node lets this mesh's members use it as their internet exit (per-mesh
+    /// opt-in, docs/EXIT_SHARING.md). LOCAL, persisted, never gossiped; default false. When on
+    /// (or on a pinned exit), this mesh's subnet gets forwarding+NAT so members can egress
+    /// through us. Default-off keeps a mesh intruder from turning us into a proxy.
+    exitable: bool,
     /// The OS interface name of this mesh's TUN (set at bringup) — needed to divert
     /// the default route for full-tunnel egress.
     tun_name: Option<String>,
@@ -401,6 +406,9 @@ enum PostAction {
     SplitOn(MeshId),
     /// Stop domain split-tunnel (abort proxy, remove injected `/32` routes, restore DNS).
     SplitOff,
+    /// Apply the (just-changed) `exitable` flag for this mesh: enable/disable forwarding+NAT for
+    /// its subnet so its members can/can't use us as their exit (docs/EXIT_SHARING.md).
+    ApplyExitable(MeshId),
     /// Cleanly stop the whole daemon (after the response is sent to the client).
     Shutdown,
 }
@@ -476,6 +484,10 @@ struct PersistedMesh {
     /// Last-known peer endpoints — re-seeded on load so reconnect is fast (discovery
     /// then re-learns the rest, e.g. after a network change).
     peers: Vec<(MemberId, String)>,
+    /// Whether this node serves as an exit for this mesh (docs/EXIT_SHARING.md). `#[serde(default)]`
+    /// so older state files load as `false` (safe-off).
+    #[serde(default)]
+    exitable: bool,
 }
 
 /// Where to persist (env `MESHD_STATE_DIR`, else `$HOME/.lattice/meshd`), or `None`
@@ -531,6 +543,7 @@ fn to_persisted(ms: &MeshState) -> PersistedMesh {
             .iter()
             .map(|(m, l)| (*m, l.endpoint.to_string()))
             .collect(),
+        exitable: ms.exitable,
     }
 }
 
@@ -725,6 +738,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         links,
         exit_sel,
         split_routes,
+        exitable: p.exitable,
         tun_name: None,
         my_endpoint,
         dp_port: 0,
@@ -762,7 +776,42 @@ fn request_mutates(req: &Request) -> bool {
             | Request::DisableExtension { .. }
             | Request::SplitAdd { .. }
             | Request::SplitDel { .. }
+            | Request::SetExitable { .. }
     )
+}
+
+/// **RISK 🔴 HIGH** — apply the per-mesh `exitable` flag: enable or disable forwarding+NAT for
+/// this mesh's overlay subnet so its members can (or can't) use us as their internet exit
+/// (docs/EXIT_SHARING.md). Only this mesh's subnet is touched — other meshes are unaffected.
+async fn apply_exitable(mesh: MeshId, state: Arc<Mutex<State>>) {
+    // Snapshot: is it now exitable (or a pinned exit), and this mesh's subnet + isolate policy.
+    let info = {
+        let st = state.lock().unwrap();
+        st.meshes.get(&mesh).map(|ms| {
+            let p = ms.mesh.charter.overlay_prefix;
+            let subnet = format!("{}.{}.{}.0/24", p[0], p[1], mesh);
+            let isolate = matches!(ms.mesh.charter.exit_policy, ExitPolicy::Isolate);
+            (ms.exitable, subnet, isolate)
+        })
+    };
+    let Some((exitable, subnet, policy_isolate)) = info else {
+        return;
+    };
+    let pinned = std::env::var("MESHD_ADVERTISE").is_ok();
+    let serve = exitable || pinned;
+    let isolate = policy_isolate && pinned;
+    let _ = tokio::task::spawn_blocking(move || {
+        if serve {
+            exit::enable_nat(&subnet, isolate);
+        } else {
+            exit::disable_nat(&subnet);
+        }
+    })
+    .await;
+    elog!(
+        "meshd: mesh {mesh} exitable={exitable} — {} as an exit for its members",
+        if serve { "serving" } else { "NOT serving" }
+    );
 }
 
 /// Add a local split-tunnel rule (idempotent on `domain`). Persisted; takes effect the next time
@@ -1475,6 +1524,9 @@ where
                             split_enable(mesh, Arc::clone(&state)).await
                         }
                         Some(PostAction::SplitOff) => split_disable(Arc::clone(&state)).await,
+                        Some(PostAction::ApplyExitable(mesh)) => {
+                            apply_exitable(mesh, Arc::clone(&state)).await
+                        }
                         Some(PostAction::Shutdown) => shutdown = true,
                         None => {}
                     }
@@ -1644,32 +1696,39 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     let tun_name = tun.name().map(|s| s.to_string());
     // Exit-egress policy (docs/EXIT_POLICY.md): under Isolate, enable_nat also pins
     // traffic we forward for others to our real WAN. Default Isolate if the mesh is gone.
-    let isolate = {
+    let (isolate, serve) = {
         let mut st = state.lock().unwrap();
         let policy_isolate = st
             .meshes
             .get(&b.mesh_id)
             .map(|ms| matches!(ms.mesh.charter.exit_policy, ExitPolicy::Isolate))
             .unwrap_or(true);
+        let exitable = st
+            .meshes
+            .get(&b.mesh_id)
+            .map(|ms| ms.exitable)
+            .unwrap_or(false);
         if let Some(ms) = st.meshes.get_mut(&b.mesh_id) {
             ms.tun_name = tun_name.clone();
             ms.dp_port = port; // local data-plane port — advertised in the LAN beacon
             ms.dp_error = None; // bound cleanly — clear any prior "port busy" error
         }
-        // The isolate `route-to` rule pins traffic we forward FOR OTHERS to our real WAN, but
-        // its pf selector `from 100.64.0.0/10` ALSO matches THIS node's own overlay source IP
-        // (100.80.x.y ∈ 100.64/10). On a plain full-tunnel client that diverts our OWN egress
-        // back out the physical WAN, so the overlay TUN sees zero packets and the kill-switch
-        // reverts the tunnel. Only a node that actually serves as an exit for others should
-        // install it — i.e. a publicly-reachable, pinned node (MESHD_ADVERTISE set). A client
-        // never forwards for anyone, so it must never get the rule.
+        // SERVE AS AN EXIT for this mesh ONLY if the user made it `exitable` — or this is a
+        // dedicated pinned exit (MESHD_ADVERTISE). Default OFF: a mesh member (incl. an intruder)
+        // can't route their internet through this node unless it explicitly opted in for that
+        // mesh. Blast radius stays on nodes that chose to serve (docs/EXIT_SHARING.md).
         let is_exit_node = std::env::var("MESHD_ADVERTISE").is_ok();
-        policy_isolate && is_exit_node
+        // The isolate `route-to`/side-route pins forwarded traffic to our real WAN; its selector
+        // also matches THIS node's own overlay IP, so only a real pinned exit gets it (a client
+        // would divert its own full-tunnel egress off the tun and wedge). Regression: 5cfa960.
+        (policy_isolate && is_exit_node, exitable || is_exit_node)
     };
-    // enable_nat shells out (pfctl/sysctl on unix, several PowerShell cmdlets on
-    // Windows) — synchronous + slow, so run it off the async runtime to avoid stalling
-    // IPC while a mesh is brought up.
-    let _ = tokio::task::spawn_blocking(move || exit::enable_nat(isolate)).await;
+    if serve {
+        // Only this mesh's own subnet is NAT'd (not all 100.64/10), so serving one mesh never
+        // proxies another. enable_nat shells out — run it off the async runtime.
+        let subnet = format!("{}.{}.{}.0/24", b.prefix[0], b.prefix[1], b.mesh_id);
+        let _ = tokio::task::spawn_blocking(move || exit::enable_nat(&subnet, isolate)).await;
+    }
     // This node's own reachable address, advertised in the endpoint gossip so peers
     // can reach us without a manual SetPeer (docs/DISCOVERY.md §2). A public node
     // (the Oracle exit) PINS it via MESHD_ADVERTISE=ip:port — never overridden;
@@ -2935,6 +2994,15 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
         }
         Request::SplitOff => (Response::Ok, Some(PostAction::SplitOff)),
 
+        Request::SetExitable { mesh, enabled } => {
+            if let Some(ms) = st.meshes.get_mut(&mesh) {
+                ms.exitable = enabled;
+                (Response::Ok, Some(PostAction::ApplyExitable(mesh)))
+            } else {
+                (no_mesh(mesh), None)
+            }
+        }
+
         Request::CreateInvite {
             mesh,
             name,
@@ -3214,6 +3282,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             links,
             exit_sel,
             split_routes,
+            exitable: false,
             tun_name: None,
             my_endpoint,
             dp_port: 0,
@@ -3381,6 +3450,7 @@ fn create_mesh(
             links,
             exit_sel,
             split_routes,
+            exitable: false,
             tun_name: None,
             my_endpoint,
             dp_port: 0,
@@ -3679,6 +3749,7 @@ fn detail(ms: &MeshState) -> MeshDetail {
         epoch: ms.epoch,
         me: ms.my_id(),
         exit: ms.mesh.exit,
+        exitable: ms.exitable,
         invite: format!("{:?}", ch.invite),
         trigger: format!("{:?}", ch.trigger),
         max_members: ch.max_members,

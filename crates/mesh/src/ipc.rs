@@ -247,6 +247,10 @@ pub enum Request {
     SplitOn { mesh: MeshId },
     /// Turn split mode OFF: stop the proxy, remove injected `/32` routes, restore DNS.
     SplitOff,
+
+    /// Set whether THIS node serves as an internet exit for `mesh`'s members (per-mesh opt-in,
+    /// docs/EXIT_SHARING.md). `enabled=false` (default) = no member can egress through us.
+    SetExitable { mesh: MeshId, enabled: bool },
 }
 
 /// A P-C6 wrapped invite: the serialized [`InviteBlob`] sealed under (algo, salt, n).
@@ -466,6 +470,10 @@ pub struct MeshDetail {
     pub epoch: u64,
     pub me: MemberId,
     pub exit: Option<MemberId>,
+    /// Whether THIS node lets this mesh's members use it as their internet exit (per-mesh
+    /// opt-in, docs/EXIT_SHARING.md). `#[serde(default)]` so older meshd loads as false.
+    #[serde(default)]
+    pub exitable: bool,
     /// Charter (immutable governance), rendered for display.
     pub invite: String,
     pub trigger: String,
