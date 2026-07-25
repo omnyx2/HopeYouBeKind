@@ -593,27 +593,20 @@ const ISO_BYPASS_PRIO: &str = "999";
 /// `POSTROUTING MASQUERADE` for `<subnet>` out the WAN + `FORWARD ACCEPT` inserted at the TOP
 /// (before any distro default `FORWARD -j REJECT`). ONLY that mesh's subnet is NAT'd, so serving
 /// one mesh never proxies another. When `isolate`, adds source routing for `<subnet>` (pinned
-/// exits only). Idempotent (delete-then-add). Also cleans up the legacy unconditional
-/// `100.64.0.0/10` MASQUERADE from older builds.
+/// exits only). Idempotent (delete-then-add). Also **purges EVERY legacy all-overlay
+/// `100.64.0.0/10` rule** (MASQUERADE + FORWARD ACCEPT) from older always-on builds — this runs on
+/// the serving path too, not just `disable_nat`, so a pinned exit (which never hits `disable_nat`)
+/// doesn't accumulate blanket `FORWARD -s/-d 100.64.0.0/10 ACCEPT` rules that would forward for
+/// meshes it never opted into (a policy leak on a `FORWARD -P DROP` host; harmless-but-messy on
+/// `FORWARD -P ACCEPT`). Found by a post-network-change cross-check.
 #[cfg(target_os = "linux")]
 pub fn enable_nat(subnet: &str, isolate: bool) {
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"]);
+    // Purge legacy all-overlay (100.64.0.0/10) MASQUERADE + FORWARD ACCEPT from older builds.
+    // Must run here (serving path) as well as in `disable_nat`: a pinned exit only ever calls
+    // `enable_nat`, so otherwise its legacy blanket FORWARD rules never get cleaned.
+    purge_legacy_overlay_nat();
     if let Some((gw, wan)) = linux_default_route() {
-        // Remove the legacy all-overlay rule (older builds NAT'd 100.64.0.0/10 unconditionally).
-        let _ = Command::new("iptables")
-            .args([
-                "-t",
-                "nat",
-                "-D",
-                "POSTROUTING",
-                "-s",
-                "100.64.0.0/10",
-                "-o",
-                &wan,
-                "-j",
-                "MASQUERADE",
-            ])
-            .status();
         // Idempotent: delete any prior copy of our rule, then add exactly one.
         let masq = [
             "-t",

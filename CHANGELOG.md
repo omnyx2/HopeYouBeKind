@@ -11,6 +11,24 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.10] — 2026-07-25
+
+### Fixed
+- **Serving/pinned-exit nodes never purged legacy all-overlay forwarding rules.** The
+  `100.64.0.0/10` legacy-rule purge added in v0.7.8 ran only in `disable_nat` (the non-serving
+  path), so a pinned exit (`MESHD_ADVERTISE`) — which only ever calls `enable_nat` — kept every
+  leftover `FORWARD -s/-d 100.64.0.0/10 ACCEPT` rule from an older always-on build (found 130
+  accumulated on the live Oracle exit via a post-network-change cross-check). Harmless on a
+  `FORWARD -P ACCEPT` host but a forwarding-policy leak on `FORWARD -P DROP` (it would forward for
+  meshes the node never opted into). `enable_nat` now runs the same purge on the serving path.
+
+### Known limitations (documented, not yet fixed)
+- **Split-tunnel / full-tunnel are IPv4-only.** The overlay is IPv4 (`100.64.0.0/10`); on a
+  dual-stack network a matched domain that resolves to IPv6 (AAAA) egresses directly over IPv6,
+  bypassing the mesh exit. Force IPv4 (`curl -4`) to route via the exit. See docs/SPLIT_TUNNEL.md.
+- Changing a split rule's exit member on an already-active rule needs `split off`/`split on` to
+  re-inject the route (the previous flow stays cached until then).
+
 ## [0.7.9] — 2026-07-25
 
 ### Fixed
