@@ -172,3 +172,19 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
 - **Mac kept at v0.7.9 (user decision 2026-07-25)** — the v0.7.10 fix is Linux-only
   (`#[cfg(target_os="linux")]`), so the macOS binary is functionally identical; avoided another
   utun-risky live-VPN dmg swap. Fleet: Oracle+lablinux v0.7.10, Mac v0.7.9 (byte-equivalent behavior).
+
+## 2026-07-25 — v0.7.11: split-tunnel tied to mesh selection (user: "fix the FUNCTIONALITY")
+- **Bug**: split-tunnel was a hidden global switch decoupled from egress selection — on Default
+  (`current=None`) it still hijacked host DNS (127.0.0.1) + routed matched domains via a mesh,
+  invisible in ls/status ("network is Default, why does pornhub go via Oracle?"). Surfacing it in
+  ls/status (first attempt) was rejected — wanted the behavior fixed.
+- **Fix (1ab77c2)**: split now SELECTS its mesh (sets `current`, new `full_tunnel=false` flag so
+  it's NOT a full tunnel — general traffic stays direct); the **Default network turns split off**
+  (restores DNS + removes /32s); shutdown restores DNS when split is on. `current` was hard-wired
+  to full-tunnel (network-change re-route loop + shutdown keyed on `current.is_some()`) → added
+  `full_tunnel: bool` and gated those on it so a split selection never diverts the default route.
+  CLI + GUI show `split` vs full `egress`.
+- **Validated**: offline (state gating) + lablinux data-plane (SplitOn→is_current=1 & egress=direct
+  & DNS=127.0.0.1; SplitOff→deselect+DNS restored; SetCurrent(None)→split off) + **Mac LIVE**
+  (split on → pornhub via utun6/Oracle, ls shows SPLIT; Default network → pornhub via en0 direct,
+  DNS restored). Fleet all v0.7.11 (Mac dmg, Oracle+lablinux binary). Merged to main (PR + 77e54a3).

@@ -4,4 +4,4 @@ Scratchpad. Charter in CLAUDE.md → "Working memory". Only OPEN items here.
 
 ---
 
-_(empty — no open items; last task's record is in COMPLETE.md 2026-07-25)_
+_(empty — no open items; see COMPLETE.md 2026-07-25 for the last task)_
