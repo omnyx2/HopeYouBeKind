@@ -74,6 +74,14 @@ configured exit (back-compat for pre-per-domain `split.json`).
 
 ## Limits / not-yet
 
+- **One active mesh at a time (mutually exclusive).** Rules are per-mesh (each `SplitRule` carries
+  its `mesh` + exit member), but activation is a single global session — `state.split` is one
+  `Option<SplitActive>` and the host resolver can only point at one `127.0.0.1:53` proxy.
+  `split on <mesh>` first tears down any prior session (`split_disable` — removes injected `/32`s,
+  restores DNS) and then injects **only that mesh's** rules. So enabling split on a second mesh
+  doesn't conflict/corrupt — it cleanly **replaces** the first (last-wins); `split list` shows the
+  single active mesh. You cannot split two meshes' domains simultaneously (needed because the same
+  domain's `/32` could only point into one mesh's tun, and there's one OS resolver to hijack).
 - **A-records / IPv4 only.** The overlay is IPv4 (`100.64.0.0/10`) and only A-records get a `/32`
   injected; AAAA (IPv6) isn't. **Consequence — IPv6 leak on dual-stack networks:** if the client
   has working IPv6 and the matched domain has an AAAA record, the OS prefers IPv6 and the request
