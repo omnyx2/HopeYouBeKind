@@ -619,6 +619,7 @@ async function renderMeshes() {
       <div>
         <button class="small-btn" data-manage="${m.id}">manage ›</button>
         <button class="small-btn" data-egress="${m.id}">make egress</button>
+        <button class="small-btn ${m.exitable ? "on" : ""}" data-exitable="${m.id}" title="Let this mesh's members use MY internet as their exit">${m.exitable ? "exitable ✓" : "exitable"}</button>
       </div>
     </li>`;
   }).join("") : `<li class="empty">no meshes yet — create one above</li>`;
@@ -641,6 +642,16 @@ el("mesh-list").addEventListener("click", async (e) => {
     try { await meshd({ SetCurrent: { mesh: id } }); toast("egress set"); }
     catch (x) { toast(String(x)); }
     CURRENT_MESH = id;
+    return refreshMode();
+  }
+  const exitable = e.target.closest("[data-exitable]");
+  if (exitable) {
+    const id = parseInt(exitable.dataset.exitable, 10);
+    const turnOn = !exitable.classList.contains("on");
+    try {
+      await meshd({ SetExitable: { mesh: id, enabled: turnOn } });
+      toast(turnOn ? "this mesh's members may now exit through me" : "stopped serving as exit for this mesh");
+    } catch (x) { toast(String(x)); }
     return refreshMode();
   }
 });

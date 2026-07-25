@@ -417,6 +417,10 @@ pub struct MeshSummary {
     pub epoch: u64,
     pub exit: Option<MemberId>,
     pub is_current: bool,
+    /// Whether THIS node lets this mesh's members use it as their internet exit (docs/
+    /// EXIT_SHARING.md). `#[serde(default)]` so older meshd loads as false.
+    #[serde(default)]
+    pub exitable: bool,
     /// `Some(secs)` while an attack alert has armed this mesh's destroy grace (P-C7) —
     /// drives the global alert banner; `None` = not armed.
     #[serde(default)]

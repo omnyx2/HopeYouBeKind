@@ -2653,6 +2653,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     epoch: ms.epoch,
                     exit: ms.mesh.exit,
                     is_current: cur == Some(ms.mesh.id),
+                    exitable: ms.exitable,
                     attack_armed_secs_left: ms.attack_armed_at.map(|armed| {
                         ATTACK_GRACE_SECS.saturating_sub(now.saturating_sub(armed) / 1000)
                     }),
