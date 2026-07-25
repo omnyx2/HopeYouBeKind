@@ -156,22 +156,27 @@ def cmd_ls(sock, a):
     if not meshes:
         print("no meshes yet — create one with `lattice new <name>`")
         return
+    # A mesh can be 'current' as a FULL tunnel (all traffic) or as a SPLIT selection (only matched
+    # domains; general traffic stays direct). Distinguish the two so split isn't shown as full egress.
+    sv = call(sock, "SplitList").get("Split", {})
+    am = sv.get("active_mesh")
     print(f"{'ID':>2}  {'NAME':<16} {'MEMBERS':>7} {'EPOCH':>5}  {'EXIT':>5}  EGRESS")
     for m in meshes:
-        egress = "→ THIS MESH" if m.get("is_current") else "direct"
+        if m["id"] == am:
+            egress = "→ SPLIT (domains only)"
+        elif m.get("is_current"):
+            egress = "→ THIS MESH (full)"
+        else:
+            egress = "direct"
         exit_s = f"#{m['exit']}" if m.get("exit") is not None else "—"
         flag = " ⚠ATTACK" if m.get("attack_armed_secs_left") is not None else ""
         print(f"{m['id']:>2}  {m['name']:<16} {m['members']:>7} {m['epoch']:>5}  "
               f"{exit_s:>5}  {egress}{flag}")
-    # Surface split-tunnel even when no mesh is 'current' (egress=direct): while it's ON the host
-    # DNS is pointed at meshd's proxy and matched domains route via a mesh exit — otherwise invisible.
-    sv = call(sock, "SplitList").get("Split", {})
-    am = sv.get("active_mesh")
     if am is not None:
         nm = next((m["name"] for m in meshes if m["id"] == am), str(am))
         n = sum(1 for r in sv.get("rules", []) if r.get("mesh") == am)
-        print(f"\nsplit-tunnel: ON (mesh #{am} {nm}) — {n} domain(s) exit via it even on 'direct'; "
-              f"host DNS → meshd. `lattice split list` / `split off`")
+        print(f"\nsplit-tunnel: ON (mesh #{am} {nm}) — {n} domain(s) via its exit, rest direct; "
+              f"host DNS → meshd. `split off` (or pick Default) to stop.")
 
 
 def cmd_info(sock, a):
