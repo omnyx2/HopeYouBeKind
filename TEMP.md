@@ -56,6 +56,20 @@ Windows offline (skipped) — reinstall when it's back on a reachable network. S
 1234, piped `echo 1234|sudo -S`, meshd relaunch `/tmp/lab-start.sh`). Use `command grep` for
 remote output (shell has a poisoned grep wrapper).
 
+### Current task: per-mesh `exitable` (who may use ME as their exit) — CONFIRMED design
+Security policy: serving as an exit = per-mesh opt-in, default OFF. A compromised mesh member
+can't proxy through my node unless I made that mesh `exitable`. Decoupled from my own egress.
+- `exitable` per-mesh flag: LOCAL, persisted, never gossiped, default false.
+- NAT/forwarding gated: only the exitable mesh's OWN subnet (100.80.<mesh_id>.0/24) gets
+  MASQUERADE+FORWARD, NOT all 100.64/10 (else other meshes leak through). Currently enable_nat
+  runs unconditionally at bringup for all 100.64/10 → change to per-subnet + gated.
+- Effective exitable = flag || node_pinned (MESHD_ADVERTISE set) — so Oracle (pinned dedicated
+  exit) keeps serving with zero migration; clients default off, opt-in per mesh.
+- Build: exit.rs enable_nat/disable_nat take a subnet CIDR (🔴 per-OS); MeshState+PersistedMesh
+  `exitable`; bringup gates; IPC SetExitable{mesh,enabled}; CLI `lattice exitable`; GUI toggle in
+  User>Meshes row. Extension per-mesh scoping (policy #3) already built (grant.meshes + live re-check).
+- Deploy note: after upgrade, only pinned/exitable meshes serve — set Oracle exitable if not pinned-detected.
+
 ### Open / deferred (both features shipped; these are polish)
 - F1: per-domain DIFFERENT exits (finish ToExit(Some(NodeId))); AAAA/IPv6; SNI.
 - F2: persist path-history (so `conns` shows last-good path after a restart, before re-verify);

@@ -15,6 +15,26 @@ commit. The durable record; `TEMP.md` only holds open items.
   pin → en0 (no loop — fix 19465bb); **full-tunnel egress = Oracle on try 1** and stays up past
   the kill-switch window. Closes the "clean verification" TEMP item. — config/deploy, no commit
 
+## Per-mesh `exitable` (opt-in serving as exit) — BUILT + macOS live-verified (2026-07-25)
+
+User security policy: serving as an internet exit for a mesh's members = per-mesh opt-in, default
+OFF, decoupled from my own egress. A mesh intruder can't proxy through a node unless it made that
+mesh exitable. Expresses the "all meshes / selected only / never" policy as per-mesh flags.
+- exit.rs enable_nat(subnet)/disable_nat(subnet): NAT only the mesh's overlay subnet
+  (100.80.<id>.0/24), not all 100.64/10 — serving one mesh never proxies another. 3 OS, idempotent,
+  cleans legacy all-overlay rule. bringup serves only if exitable||pinned (Oracle stays working).
+- MeshState/PersistedMesh exitable (local, persisted, serde-default false); IPC SetExitable +
+  ApplyExitable; MeshSummary/MeshDetail.exitable; CLI `lattice exitable <mesh> [on|off]` + info;
+  GUI toggle in User>Meshes row. Extension per-mesh scoping (policy #3) already existed.
+- Commits 42eadac (core+CLI) + 1ef6032 (GUI+docs+EXIT_SHARING.md). 86 tests, fmt/clippy clean,
+  offline on/off/persist verified.
+- **LIVE (Mac, build 1ef6032): exitable OFF = no active NAT (stale pf file was old build's, not
+  loaded); exitable ON = pf `nat on en0 from 100.80.1.0/24` (mesh-1 subnet ONLY, not 100.64/10);
+  OFF removes it.** Per-mesh scoping proven. TODO: full cross-node (lablinux→Mac only when Mac
+  exitable) + Oracle/lablinux deploy + fleet reinstall.
+- Note: Mac GUI showed a white screen after the meshd swap — webview glitch (frontend unchanged);
+  ⌘Q + relaunch fixes it. meshd was fine (CLI worked throughout).
+
 ## Current-computer-as-exit — cross-node LIVE-verified on lablinux (2026-07-23)
 
 Verified per-domain split-tunnel where the exit is ANOTHER member (incl. this computer acting as
