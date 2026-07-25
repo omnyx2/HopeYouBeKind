@@ -11,6 +11,18 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.7] — 2026-07-25
+
+### Added
+- **Per-mesh `exitable` — opt-in serving as an internet exit** (docs/EXIT_SHARING.md). Whether a
+  mesh's members may use THIS node's internet as their exit is now a per-mesh toggle, **default
+  OFF**. A mesh member (incl. an intruder) can't route their internet through a node unless it
+  explicitly made that mesh exitable — an in-mesh attacker's blast radius stays on nodes that
+  chose to serve. Only the exitable mesh's own subnet (`100.80.<id>.0/24`) is NAT'd, so serving
+  one mesh never proxies another. Dedicated pinned exits (`MESHD_ADVERTISE`) stay exitable
+  automatically. `lattice exitable <mesh> [on|off]` + a toggle in the User-mode Meshes list.
+  Serving is decoupled from consuming.
+
 ## [0.7.6] — 2026-07-23
 
 ### Added
