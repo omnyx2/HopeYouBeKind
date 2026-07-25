@@ -13,6 +13,17 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-07-25** · wired the v0.7.8 legacy-`100.64/10` purge into **`disable_nat` only** → a
+  **pinned exit** (Oracle) only ever calls `enable_nat`, so it NEVER purged → **130 leftover
+  `FORWARD -s/-d 100.64.0.0/10 ACCEPT` rules** from the old always-on build accumulated on the live
+  exit (found by a post-network-change cross-check: `iptables-save | grep -c 100.64.0.0/10` = 130
+  on Oracle vs 0 on lablinux, which had gone through `disable_nat`). Harmless on Oracle
+  (`FORWARD -P ACCEPT`) but a real forwarding-policy leak on a `FORWARD -P DROP` host (blanket
+  overlay ACCEPT forwards for meshes never opted into). Fix (v0.7.10): call
+  `purge_legacy_overlay_nat()` at the top of `enable_nat` too, and cleaned the 130 live.
+  **Lesson: a migration-cleanup step must run on EVERY bringup path a node can take (serving AND
+  non-serving), not just the teardown path.**
+
 - **2026-07-25** · made exit NAT/`isolate` **per-subnet** (v0.7.8, `100.80.<id>.0/24`) in
   `exit.rs::enable_nat` → on a **pinned exit** (Oracle) the Linux `ip rule from <subnet> lookup
   <iso-table>` (and macOS pf `route-to … to any`) then **also matched the exit's OWN overlay IP**

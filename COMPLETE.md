@@ -152,3 +152,20 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
   overlay ssh `TUNNEL_OK`; Oracle-exit egress = 138.2.14.219 (isolate still works); NAT =
   `100.80.1.0/24` only. Diagnosis method: diffed last-working baseline (NOT a guessed rekey/OS
   wedge) — logged in docs/ERRORS.md. — verified
+
+## 2026-07-25 — full empirical cross-check (Mac on hotspot) + v0.7.10 hygiene fix
+- **Cross-check matrix ALL PASS** after Mac switched to an IPv6/CGNAT hotspot: self-healing
+  re-learned the new endpoint and reconnected to both nodes (data-path TCP verified, not just
+  gossip); version uniformity; full connectivity matrix; exitable OFF→drop / ON→210.107.188.8 /
+  ON→OFF-live-purge / per-subnet NAT; Oracle isolate exit egress 138.2.14.219 + overlay
+  simultaneously; split-tunnel; 66+6 unit tests, fmt, clippy clean.
+- **Finding #1 (fixed, v0.7.10 `205495d`)**: the v0.7.8 legacy-`100.64/10` purge only ran in
+  `disable_nat`, so a pinned exit (enable_nat-only) accumulated 130 leftover `FORWARD 100.64/10
+  ACCEPT` rules. `enable_nat` now purges too. Oracle cleaned live + **auto-purge code-path
+  validated** (injected 7 fake rules → restart → bringup auto-cleared to 0). lablinux→v0.7.10 too.
+- **Finding #2 (documented limitation)**: split/full-tunnel is IPv4-only → on a dual-stack/IPv6
+  network a matched domain (AAAA) leaks out over IPv6, bypassing the exit; `curl -4` workaround.
+  docs/SPLIT_TUNNEL.md + IPV6_PLAN.md.
+- **Finding #3 (minor)**: changing an active split rule's exit member needs `split off/on` re-inject.
+- Docs organized: SPLIT_TUNNEL / EXIT_SHARING / EXIT_POLICY (§4 Mechanism → per-subnet + overlay
+  bypass) / ERRORS.md / CHANGELOG. Fleet: Oracle+lablinux v0.7.10, Mac v0.7.9 (Linux-only fix).

@@ -101,18 +101,33 @@ when a node becomes an exit (`enable_nat`):
 Keep a routing path to the **real** default gateway and force overlay-sourced traffic onto it,
 independent of the full-tunnel default:
 
+Since v0.7.8 the rule is keyed on the **served mesh's own subnet** (`100.80.<id>.0/24`), not the
+whole `100.64.0.0/10` — so serving one mesh never diverts another's. But that subnet **contains the
+exit's OWN overlay IP**, so overlay-internal traffic (member↔member, and the exit's own replies)
+must be excluded or it leaks out the real WAN (regression fixed in v0.7.9 — see the ⚠ note below).
+
 - **Linux** (canonical):
   ```sh
   # snapshot the real default into a side table once
-  ip route add default via <real_gw> dev <real_if> table 100      # "real" table
-  # overlay-sourced (=forwarded) traffic always uses the real table
-  ip rule add from 100.64.0.0/10 lookup 100 priority 1000
+  ip route replace default via <real_gw> dev <real_if> table 100    # "real" table
+  # overlay-DESTINED traffic bypasses isolate first (stays on the tun via the main table)
+  ip rule add to 100.64.0.0/10 lookup main priority 999
+  # forwarded (subnet-sourced, internet-bound) traffic always uses the real table
+  ip rule add from 100.80.<id>.0/24 lookup 100 priority 1000
   ```
-  The node's own full-tunnel still does `ip route replace default dev tun` in the **main**
-  table; the `ip rule` makes forwarded traffic bypass it. Torn down on `disable_nat`.
+  The node's own full-tunnel still does `ip route replace default dev tun` in the **main** table;
+  the priority-1000 rule makes forwarded *internet* traffic bypass it, while the priority-999 rule
+  keeps overlay-internal traffic (incl. the exit's own member↔member replies) on the tun. Torn down
+  on `disable_nat`.
 - **macOS:** pf `route-to` on the NAT ruleset, e.g.
-  `pass out route-to (<real_if> <real_gw>) inet from 100.64.0.0/10 to any` so overlay-sourced
-  forwarded traffic leaves via the real gateway even while the default route points at the TUN.
+  `pass out route-to (<real_if> <real_gw>) inet from 100.80.<id>.0/24 to ! 100.64.0.0/10` — the
+  `to ! 100.64.0.0/10` excludes overlay-internal destinations so only forwarded internet traffic
+  leaves via the real gateway (even while the default route points at the TUN).
+
+> ⚠ **v0.7.9 regression (fixed):** without the overlay-dest exclusion the isolate rule matched the
+> exit's own overlay IP (inside `<subnet>`), so a pinned exit's member↔member replies were routed
+> out the real WAN — the node stayed visible in gossip but its overlay data path died after a
+> restart. Diagnosed by diffing the last-working baseline (docs/ERRORS.md).
 - **Windows:** WinNAT egresses its `InternalIPInterfaceAddressPrefix` (100.64.0.0/10) via the
   external adapter; verify it is the real adapter and not the Wintun under full-tunnel (pin with
   a per-prefix route / interface metric if needed).

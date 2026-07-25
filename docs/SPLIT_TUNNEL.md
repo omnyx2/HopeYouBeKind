@@ -74,7 +74,14 @@ configured exit (back-compat for pre-per-domain `split.json`).
 
 ## Limits / not-yet
 
-- **A-records / IPv4 only.** AAAA (IPv6) isn't injected yet.
+- **A-records / IPv4 only.** The overlay is IPv4 (`100.64.0.0/10`) and only A-records get a `/32`
+  injected; AAAA (IPv6) isn't. **Consequence — IPv6 leak on dual-stack networks:** if the client
+  has working IPv6 and the matched domain has an AAAA record, the OS prefers IPv6 and the request
+  egresses **directly over IPv6, bypassing the mesh exit entirely** (verified on an IPv6 hotspot —
+  a `*.ifconfig.me` split rule was skipped and the client's own IPv6 came back). Workaround until
+  IPv6 support lands ([`IPV6_PLAN.md`](IPV6_PLAN.md)): force IPv4 (`curl -4`), or use the split on
+  an IPv4-only path. The same caveat applies to full-tunnel — IPv6 traffic is not routed through
+  the exit and is not kill-switched.
 - **DNS is resolved locally** (via the captured upstream), not through the exit. Fine when the
   block is at the connection level (the campus case); a site behind DNS poisoning would need the
   query itself tunnelled — not done.

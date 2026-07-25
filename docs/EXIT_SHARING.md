@@ -50,10 +50,16 @@ is expressed as **per-mesh flags**: all-on = every mesh may; one-on = just that 
 ## Implementation
 
 - `crates/meshd/src/exit.rs` — `enable_nat(subnet, isolate)` / `disable_nat(subnet)` (3 OS, 🔴):
-  forwarding + NAT for exactly one overlay subnet. Idempotent; cleans up the legacy all-`100.64/10`
-  rule from older builds. Linux is per-subnet (multi-mesh correct); macOS keeps a single pf file
-  (one exitable mesh at a time — a documented limit, since real exits are Linux); Windows
-  per-subnet WinNAT.
+  forwarding + NAT for exactly one overlay subnet. Idempotent; **both paths** purge every legacy
+  all-`100.64/10` MASQUERADE + FORWARD-ACCEPT rule from older always-on builds (v0.7.10 — a pinned
+  exit only ever calls `enable_nat`, so the purge had to run there too, not just in `disable_nat`).
+  Linux is per-subnet (multi-mesh correct); macOS keeps a single pf file (one exitable mesh at a
+  time — a documented limit, since real exits are Linux); Windows per-subnet WinNAT.
+- **`isolate` interaction (v0.7.9):** on a pinned exit the isolate rule pins *forwarded* traffic to
+  the real WAN, but the served subnet contains the exit's OWN overlay IP — so overlay-internal
+  traffic must bypass isolate (Linux `ip rule to 100.64.0.0/10 lookup main` at higher priority;
+  macOS `route-to … to ! 100.64.0.0/10`), else member↔member replies leak out the WAN. See
+  [`EXIT_POLICY.md`](EXIT_POLICY.md).
 - `crates/meshd/src/main.rs` — `MeshState.exitable` (persisted, serde-default false); `bringup`
   serves only if `exitable || pinned`; IPC `SetExitable` → `PostAction::ApplyExitable` →
   `apply_exitable` enables/disables NAT for the subnet live.
