@@ -74,6 +74,13 @@ configured exit (back-compat for pre-per-domain `split.json`).
 
 ## Limits / not-yet
 
+- **Global DNS hijack while on (single point of failure).** Turning split on points the WHOLE host
+  resolver at meshd's `127.0.0.1:53` proxy (no secondary), so ALL DNS — not just the matched
+  domains — flows through meshd, even when no mesh is selected for egress (`Default`/`direct`). The
+  proxy forwards non-matched names to the real upstream, so it's transparent in normal operation,
+  but if meshd dies while split is on, system DNS dies with it. It's also easy to forget it's on
+  (one split rule ⇒ meshd owns your resolver); `lattice ls`/`status` now print a `split-tunnel: ON`
+  line so the state isn't invisible. Turn it off with `lattice split off` (restores the prior DNS).
 - **One active mesh at a time (mutually exclusive).** Rules are per-mesh (each `SplitRule` carries
   its `mesh` + exit member), but activation is a single global session — `state.split` is one
   `Option<SplitActive>` and the host resolver can only point at one `127.0.0.1:53` proxy.
