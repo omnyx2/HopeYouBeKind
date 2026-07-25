@@ -13,6 +13,23 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-07-25** · made exit NAT/`isolate` **per-subnet** (v0.7.8, `100.80.<id>.0/24`) in
+  `exit.rs::enable_nat` → on a **pinned exit** (Oracle) the Linux `ip rule from <subnet> lookup
+  <iso-table>` (and macOS pf `route-to … to any`) then **also matched the exit's OWN overlay IP**
+  (which is inside that subnet), so the node's member↔member replies were routed out the real WAN
+  instead of the tun → the exit stayed visible in gossip (`conns` = direct) but its **data path
+  died** (Mac→Oracle overlay ssh/ping timed out) after a restart. Same class as the v0.7.4 macOS
+  route-to/own-IP bug, reintroduced on Linux by the subnet narrowing. **Confirmed by diffing the
+  last-working baseline (per CLAUDE.md), NOT by guessing a rekey/handshake timeout** (my first,
+  wrong hypothesis — the user correctly insisted it was a code regression). Ground truth:
+  `ip route get 100.80.1.7 from 100.80.1.1` → `via <gw> dev ens3 table 100` (leaked to WAN).
+  Fix (v0.7.9): overlay-destined traffic bypasses the isolate rule — Linux adds a higher-priority
+  `ip rule to 100.64.0.0/10 lookup main priority 999`; macOS uses `to ! 100.64.0.0/10`. Only
+  forwarded INTERNET traffic isolates. Live-verified: after the bypass rule the route → `dev tun0`
+  and overlay ssh returned `TUNNEL_OK`. **Lesson: "worked before, broke after a version bump" =
+  diff the code first; a live-reachable node whose overlay data path is dead is a routing/pf bug,
+  not an OS wedge.**
+
 - **2026-07-23** · deploying a new meshd to lablinux over ssh → `setsid`/`nohup` background
   launches DIDN'T persist (died with the ssh session) AND the poisoned shell `grep` wrapper +
   interleaved `sudo` password prompts mangled the output so the swap looked like it "kept failing"
