@@ -140,3 +140,15 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
   exitable OFF → curl ifconfig.me FAILS (dropped; route→utun6 + overlay healthy, so genuinely
   dropped at exit); exitable ON → NAT scoped to `100.80.1.0/24` only, curl → 210.107.188.8
   (lablinux egress); ON→OFF live (no restart) → NAT purged, curl fails again. — verified
+
+## 2026-07-25 — v0.7.9: pinned-exit isolate/own-IP regression (found by user's "diff the code" call)
+- **fix**: v0.7.8's per-subnet isolate rule (`ip rule from 100.80.<id>.0/24 lookup 100`, and macOS
+  `route-to … to any`) also matched the exit's OWN overlay IP → member↔member replies leaked out
+  the real WAN → pinned exit (Oracle) visible in gossip but overlay data path dead after restart.
+  Fix: overlay-dest traffic bypasses isolate (Linux `ip rule to 100.64.0.0/10 lookup main prio
+  999`; macOS `to ! 100.64.0.0/10`). Only forwarded INTERNET isolates. — `3a3646e` / `v0.7.9`
+- **Oracle deployed v0.7.9 + code-path verified**: cleared rules → restart → bringup AUTO-added
+  999 bypass + 1000 isolate; `ip route get 100.80.1.7 from 100.80.1.1` → `dev tun0`; Mac→Oracle
+  overlay ssh `TUNNEL_OK`; Oracle-exit egress = 138.2.14.219 (isolate still works); NAT =
+  `100.80.1.0/24` only. Diagnosis method: diffed last-working baseline (NOT a guessed rekey/OS
+  wedge) — logged in docs/ERRORS.md. — verified
