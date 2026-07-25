@@ -169,3 +169,6 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
 - **Finding #3 (minor)**: changing an active split rule's exit member needs `split off/on` re-inject.
 - Docs organized: SPLIT_TUNNEL / EXIT_SHARING / EXIT_POLICY (§4 Mechanism → per-subnet + overlay
   bypass) / ERRORS.md / CHANGELOG. Fleet: Oracle+lablinux v0.7.10, Mac v0.7.9 (Linux-only fix).
+- **Mac kept at v0.7.9 (user decision 2026-07-25)** — the v0.7.10 fix is Linux-only
+  (`#[cfg(target_os="linux")]`), so the macOS binary is functionally identical; avoided another
+  utun-risky live-VPN dmg swap. Fleet: Oracle+lablinux v0.7.10, Mac v0.7.9 (byte-equivalent behavior).
