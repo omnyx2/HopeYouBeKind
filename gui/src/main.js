@@ -596,7 +596,13 @@ async function renderMeshes() {
     el("mesh-list").innerHTML = `<li class="empty">meshd not reachable — start it: <code>./target/debug/meshd</code></li>`;
     return;
   }
-  const noEgress = !meshes.some((m) => m.is_current);
+  // A mesh is 'current' either as a FULL tunnel (all traffic) or a SPLIT selection (only matched
+  // domains; general traffic stays direct). Tell them apart via the split proxy's active mesh.
+  let splitMesh = null;
+  try { splitMesh = ((await meshd("SplitList")).Split || {}).active_mesh ?? null; } catch {}
+  // General traffic is on the default network unless a mesh is a FULL egress; a split selection
+  // leaves general traffic direct, so it doesn't count here (it gets its own "split" pill below).
+  const noEgress = !meshes.some((m) => m.is_current && m.id !== splitMesh);
   const originRow = `<li>
       <div class="peer-left">
         <span class="dot ${noEgress ? "connected" : "known"}"></span>
@@ -607,7 +613,9 @@ async function renderMeshes() {
       <div><button class="small-btn" data-origin ${noEgress ? "disabled" : ""}>use this</button></div>
     </li>`;
   const rows = meshes.length ? meshes.map((m) => {
-    const egress = m.is_current ? `<span class="pill on">egress</span>` : "";
+    const egress = m.id === splitMesh
+      ? `<span class="pill on" title="only matched domains route via this mesh; general traffic stays direct">split</span>`
+      : (m.is_current ? `<span class="pill on">egress</span>` : "");
     const exit = m.exit != null ? `exit #${m.exit}` : "no exit";
     return `<li>
       <div class="peer-left">

@@ -281,8 +281,15 @@ impl MeshState {
 #[derive(Default)]
 struct State {
     meshes: HashMap<MeshId, MeshState>,
-    /// The mesh currently selected for egress (the §1 cur-mesh).
+    /// The mesh currently selected for egress (the §1 cur-mesh). Set by BOTH full-tunnel
+    /// (`SetCurrent`) and split-tunnel (`SplitOn`) — it means "the selected mesh", not "full
+    /// tunnel". Use [`State::full_tunnel`] to tell the two apart.
     current: Option<MeshId>,
+    /// True only when `current` was selected as a FULL tunnel (`SetCurrent`), false when it was
+    /// selected merely to host split-tunnel routing (`SplitOn`, general traffic stays direct).
+    /// The network-change re-route + shutdown restore key off THIS, not `current.is_some()`, so a
+    /// split selection never accidentally diverts the default route.
+    full_tunnel: bool,
     /// Whether to spawn data-plane loops (`DATA_PLANE=1`).
     data_plane: bool,
     /// Freshly minted identities (member + enc keypair) awaiting an invite, keyed
@@ -1579,12 +1586,20 @@ where
 /// intact — a later start restores it.
 async fn shutdown_daemon(state: &Arc<Mutex<State>>) {
     elog!("meshd: shutdown requested — restoring routes, aborting data plane, exiting");
-    let full_tunnel = state.lock().unwrap().current.is_some();
+    let (full_tunnel, split_on) = {
+        let st = state.lock().unwrap();
+        (st.full_tunnel, st.split.is_some())
+    };
     let _ = tokio::task::spawn_blocking(move || {
         if full_tunnel {
             exit::restore_routes();
             exit::restore_dns();
         } else {
+            // A split-tunnel also pointed the host resolver at meshd's 127.0.0.1 proxy — restore it
+            // so DNS keeps working after we exit (otherwise the resolver dies with the daemon).
+            if split_on {
+                exit::restore_dns();
+            }
             exit::clear_exit_pin();
         }
     })
@@ -2073,7 +2088,10 @@ fn spawn_netchange_watcher(state: Arc<Mutex<State>>) {
             // (1) Re-assert (full-tunnel on) or clean (off) the exit pin via the new gateway.
             let full_tunnel: Option<(String, std::net::IpAddr)> = {
                 let st = state.lock().unwrap();
-                st.current.and_then(|id| {
+                // Only re-assert the full-tunnel diversion after a network change if we are
+                // actually full-tunnelling — a split-tunnel selection (`current` set, general
+                // traffic direct) must NOT get its default route diverted here.
+                st.current.filter(|_| st.full_tunnel).and_then(|id| {
                     let ms = st.meshes.get(&id)?;
                     let exit_id = ms.mesh.exit?;
                     let tun = ms.tun_name.clone()?;
@@ -2431,11 +2449,20 @@ async fn split_enable(mesh: MeshId, state: Arc<Mutex<State>>) {
         std::sync::Arc::clone(&injected),
         Arc::clone(&split_routes),
     ));
-    state.lock().unwrap().split = Some(SplitActive {
-        mesh,
-        task,
-        injected,
-    });
+    {
+        let mut st = state.lock().unwrap();
+        st.split = Some(SplitActive {
+            mesh,
+            task,
+            injected,
+        });
+        // Split SELECTS this mesh (so it's visible + `SetCurrent(None)` turns it off) but is NOT a
+        // full tunnel — general traffic stays direct. Only mark it if we didn't clobber an active
+        // full tunnel.
+        if !st.full_tunnel {
+            st.current = Some(mesh);
+        }
+    }
     elog!("meshd: split-tunnel ON for mesh {mesh} (upstream {upstream}, tun {tun})");
 }
 
@@ -2450,6 +2477,11 @@ async fn split_disable(state: Arc<Mutex<State>>) {
             if let Some(m) = st.meshes.get(&a.mesh) {
                 m.split_routes.lock().unwrap().clear();
             }
+        }
+        // A split selection deselects the mesh when it stops (back to the default network); a full
+        // tunnel keeps its own `current`.
+        if !st.full_tunnel {
+            st.current = None;
         }
         active
     };
@@ -2781,7 +2813,13 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
         Request::SetCurrent { mesh } => match mesh {
             None => {
                 st.current = None;
-                // Back to the default network: undo the full-tunnel diversion.
+                st.full_tunnel = false;
+                // Back to the default network means NOTHING routes through a mesh: also drop
+                // split-tunnel (its DNS hijack + injected /32s) so "default" is truly direct.
+                if st.split.is_some() {
+                    return (Response::Ok, Some(PostAction::SplitOff));
+                }
+                // Undo the full-tunnel diversion.
                 exit::restore_routes();
                 exit::restore_dns();
                 (Response::Ok, None)
@@ -2811,6 +2849,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     None => return (no_mesh(id), None),
                 };
                 st.current = Some(id);
+                st.full_tunnel = true;
                 let action = match plan {
                     (Some(tun), Some(ip)) => {
                         // Point DNS through the tunnel BEFORE diverting the default
@@ -2881,7 +2920,13 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
         Request::Shutdown => (Response::Ok, Some(PostAction::Shutdown)),
 
         Request::GetPolicy => {
-            let default = match st.current.and_then(|id| st.meshes.get(&id)) {
+            // General egress is only "via mesh" under a FULL tunnel; a split selection leaves
+            // general traffic direct (only matched domains follow the mesh exit).
+            let default = match st
+                .current
+                .filter(|_| st.full_tunnel)
+                .and_then(|id| st.meshes.get(&id))
+            {
                 Some(ms) => match ms.mesh.exit {
                     Some(e) => format!("via mesh {} exit {}", ms.mesh.id, e),
                     None => "direct".into(),
@@ -2999,9 +3044,12 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             if !st.meshes.contains_key(&mesh) {
                 (no_mesh(mesh), None)
             } else {
+                // `split_enable` selects the mesh (sets `current`, leaves `full_tunnel` false) on
+                // success, so a failed bringup never leaves a dangling selection.
                 (Response::Ok, Some(PostAction::SplitOn(mesh)))
             }
         }
+        // `split_disable` deselects the mesh (back to the default network) when it stops.
         Request::SplitOff => (Response::Ok, Some(PostAction::SplitOff)),
 
         Request::SetExitable { mesh, enabled } => {

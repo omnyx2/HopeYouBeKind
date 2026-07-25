@@ -13,6 +13,20 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-07-25** · split-tunnel was a **hidden global switch decoupled from mesh selection** → on
+  "Default network" (`current=None`) it still hijacked the host DNS (`127.0.0.1:53`) and routed
+  matched domains through a mesh, invisible in `ls`/`status` (user: "network is Default, why does
+  pornhub go through Oracle?"). Attempt 1 (just surface it in `ls`/`status`) was rejected — "fix
+  the FUNCTIONALITY." Real fix (v0.7.11): split now **selects** its mesh (sets `current`, with a new
+  `full_tunnel` flag = false so it's NOT a full tunnel — general traffic stays direct), and the
+  **Default network turns split off**. Trap avoided: `current` was hard-wired to full-tunnel (the
+  network-change re-route loop + shutdown restore both keyed on `current.is_some()`), so naively
+  reusing it for split would divert the WHOLE default route on the next network change — added a
+  `full_tunnel: bool` and gated those two paths on it, not `current.is_some()`. Also fixed shutdown
+  to `restore_dns()` when split is on (was leaking the `127.0.0.1` resolver on exit). CLI + GUI now
+  show `split` vs full `egress`. **Lesson: `current` means full-tunnel across the daemon; don't
+  overload it without a separate flag, or a background loop will full-tunnel a split selection.**
+
 - **2026-07-25** · wired the v0.7.8 legacy-`100.64/10` purge into **`disable_nat` only** → a
   **pinned exit** (Oracle) only ever calls `enable_nat`, so it NEVER purged → **130 leftover
   `FORWARD -s/-d 100.64.0.0/10 ACCEPT` rules** from the old always-on build accumulated on the live

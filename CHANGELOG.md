@@ -11,6 +11,20 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.11] — 2026-07-25
+
+### Changed
+- **Split-tunnel is now tied to the selected mesh, and the default network turns it off.**
+  Previously split was a hidden global switch decoupled from egress selection: it kept hijacking
+  the host DNS (`127.0.0.1:53`) and routing matched domains through a mesh even when no mesh was
+  selected (`Default`), with no indication in `ls`/`status`. Now enabling split **selects** that
+  mesh (it shows as the current mesh — as a `split` selection, NOT a full tunnel: general traffic
+  stays direct), and switching to the **Default network** (`SetCurrent(None)` / the GUI button)
+  **turns split off** (restores DNS + removes the injected `/32`s). A new `full_tunnel` flag
+  separates "selected for a full tunnel" from "selected to host split routing", so the
+  network-change re-route and shutdown restore only fire for a real full tunnel. `ls`/`status` and
+  the GUI mesh list now show `split` vs full `egress` distinctly.
+
 ## [0.7.10] — 2026-07-25
 
 ### Changed
