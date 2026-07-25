@@ -11,6 +11,15 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.8] — 2026-07-25
+
+### Fixed
+- **`exitable=off` now actually stops serving as an exit.** A node upgraded from an older
+  always-on build kept leftover `100.64.0.0/10` MASQUERADE iptables rules, so it forwarded ALL
+  overlay traffic for everyone regardless of the per-mesh `exitable` toggle. meshd now reconciles
+  NAT at bringup (serve → NAT this mesh's subnet; not serving → disable + **purge every legacy
+  all-overlay rule**). Found via a cross-node test.
+
 ## [0.7.7] — 2026-07-25
 
 ### Added
