@@ -13,6 +13,23 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-07-28** · on a Linux node, `default network` (turn split off) → **"internet doesn't work"**.
+  Root cause: split/full-tunnel points `/etc/resolv.conf` at meshd's `127.0.0.1:53` proxy and backs
+  up the original to ONE file (`/tmp/lattice-saved-resolv`); when it turned off, `restore_dns` found
+  the backup **empty/missing** and left resolv.conf at the now-dead `127.0.0.1` → every DNS query =
+  `connection refused` (routing was fine — `curl 1.1.1.1` worked, only name resolution died). THREE
+  compounding bugs: (1) **no SIGTERM handler** — `systemctl stop/restart` (which I used for every
+  deploy!) killed meshd without running `shutdown_daemon`, so the restore never ran and the backup
+  was stranded; (2) `restore_dns` had **no fallback** when the backup was gone; (3) `set_dns` could
+  **back up the already-hijacked `127.0.0.1`** as the "original". Fix (v0.7.12): SIGTERM/SIGINT now
+  run the clean shutdown (restore routes+DNS); `restore_dns` falls back to the systemd-resolved stub
+  (or `1.1.1.1`) if the backup is missing and resolv.conf still points at loopback; `set_dns` only
+  captures the backup once. Immediate lablinux repair: `ln -sf /run/systemd/resolve/stub-resolv.conf
+  /etc/resolv.conf`. **Lesson: any daemon that rewrites host DNS/routes MUST restore on SIGTERM, not
+  only on a graceful IPC — `systemctl restart` is a SIGTERM.** (Also: the running meshd was v0.7.11,
+  NOT the suspected v0.7.9 — the systemd unit showed `inactive` but a process still held the socket;
+  verify the ACTUAL pid's `/proc/<pid>/exe --version`, not the unit state.)
+
 - **2026-07-25** · split-tunnel was a **hidden global switch decoupled from mesh selection** → on
   "Default network" (`current=None`) it still hijacked the host DNS (`127.0.0.1:53`) and routed
   matched domains through a mesh, invisible in `ls`/`status` (user: "network is Default, why does
