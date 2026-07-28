@@ -11,6 +11,18 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.13] — 2026-07-28
+
+### Added
+- **Selectable mesh join modes — `secure` (default) + `quick` (bearer)** (docs/JOIN_MODES.md). The
+  strong key-bound flow (`lattice id` → `invite` → `join`) stays the default; `quick` adds a
+  one-round-trip bearer code with no identity ceremony: `lattice invite <mesh> --quick` (single-use,
+  10-min) or `--max N --expire 1h` for a reusable invite link, and `lattice join <code> [--name]`.
+  Admission is authorized by a signed `Grant` the joiner self-registers under (a new additive
+  `Cert.grant` + validation branch). Convergent single-use: `effective_members` deterministically
+  keeps only the earliest `max_uses` certs per grant, so a leaked/reused code's surplus is evicted
+  everywhere with no extra gossip. A mesh created `--join secure` forbids quick invites. GUI invite
+  screen gains a Secure / Quick / Link picker. All additive (wire-compatible; secure flow byte-identical).
 ## [0.7.12] — 2026-07-28
 
 ### Fixed
