@@ -68,24 +68,31 @@ issued_at]` (length-discipline like `Cert::signing_bytes`). A `Grant` is valid i
 master **or** a member whose own cert validly chains to master under the charter's invite policy —
 exactly the check `CreateInvite` already does for "who may invite".
 
-A member cert minted under a grant records the grant instead of a hand-signed inviter:
+A quick member is recorded by a **separate `GrantCert`** — NOT a field on `Cert`. This is deliberate:
+`Cert` is what the classic roster gossips (`CTRL_ROSTER`, bincode), so touching its shape would break
+roster gossip between versions. `GrantCert` is its own type on its own gossip channel, leaving `Cert`
+byte-identical.
 
 ```rust
-// Cert gains one additive, #[serde(default)] field:
-struct Cert {
-    // …existing fields (network, member, id, name, inviter, issued_at, sig)…
-    grant: Option<Grant>,  // Some(g) = self-issued under a quick grant; None = classic inviter-signed
+// A brand-new type — Cert is UNCHANGED:
+struct GrantCert {
+    member: PubKey,     // the joiner's key
+    id: MemberId,
+    name: String,
+    issued_at: u64,
+    grant: Grant,       // the signed capability that authorizes this self-registration
+    sig: [u8; 64],      // the joiner's OWN signature (proves key possession)
 }
 ```
 
-**Validation (additive branch in `valid_members`/`effective_members`):** a cert is authorized if
-EITHER
-- (existing) its `sig` verifies under `inviter`, and `inviter` is master or a valid member; OR
-- (new) `cert.grant` is `Some(g)`, `g` is a **valid Grant** (sig chains to master), `now < g.expires_at`,
-  and the cert's own `sig` verifies under **`cert.member`** (the joiner self-signs its own cert to
-  prove key possession — the grant is what authorizes it, the self-sig binds it to the key).
+**Validation (`grant_members`, alongside the existing `valid_members` for classic certs):** a
+`GrantCert` is admitted if its `grant` is a **valid Grant** (sig chains to master — issuer is the
+master, or an OpenChain member already valid in the classic cert roster), it was minted before the
+grant expired (`issued_at <= grant.expires_at`), the joiner's own `sig` verifies, and it falls within
+the grant's `max_uses` (§6). `roster()` folds the admitted `GrantCert`s in as synthetic member rows.
 
-So the grant delegates "you may add yourself once" without the master being online at join time.
+So the grant delegates "you may add yourself once" without the master being online at join time, and
+without disturbing the classic cert wire format.
 
 ## 4. The quick invite code
 
@@ -164,9 +171,10 @@ enforced in the `CreateQuickInvite` handler. `secure` is always allowed.
 // crates/mesh/src/ipc.rs
 Request::CreateQuickInvite { mesh, name: Option<String>, max_uses: u32, ttl_secs: u64, algo: Option<String> }
 Response::Invite(WrappedInvite)          // reuse — a quick code is still a WrappedInvite
-// JoinMesh stays the same variant; the handler detects QuickInviteBlob vs InviteBlob after unwrap
-//   (add a 1-byte tag / try-quick-then-classic) so `lattice join <code>` works for both.
-// CTRL_ROSTER already gossips Vec<Cert>; Cert.grant rides along (additive serde field).
+// JoinMesh gains an optional `name` (for quick); the handler detects QuickInviteBlob vs InviteBlob
+//   via a 1-byte plaintext tag after unwrap, so `lattice join <code>` works for both.
+// CTRL_ROSTER (Vec<Cert>) is UNCHANGED. Quick members gossip on a NEW append-only tag CTRL_QGRANT
+//   (0x09) as Vec<GrantCert>; old nodes ignore the unknown tag → no roster-gossip skew.
 ```
 
 `name` is optional for quick (a reusable link doesn't know each joiner's name up front → joiner

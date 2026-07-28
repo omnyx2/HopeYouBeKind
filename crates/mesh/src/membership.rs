@@ -51,8 +51,8 @@ pub struct Cert {
 
 /// A signed capability that authorizes **self-registration** into a mesh (the `quick` join mode,
 /// docs/JOIN_MODES.md). Issued by the master or an invite-authorized member and carried inside every
-/// cert minted under it, so the whole mesh can validate the authorization and count uses without the
-/// issuer being online at join time.
+/// [`GrantCert`] minted under it, so the whole mesh can validate the authorization and count uses
+/// without the issuer being online at join time.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Grant {
     /// The mesh identity = master public key (same anchor as [`Cert::network`]).

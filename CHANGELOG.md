@@ -18,11 +18,13 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
   strong key-bound flow (`lattice id` → `invite` → `join`) stays the default; `quick` adds a
   one-round-trip bearer code with no identity ceremony: `lattice invite <mesh> --quick` (single-use,
   10-min) or `--max N --expire 1h` for a reusable invite link, and `lattice join <code> [--name]`.
-  Admission is authorized by a signed `Grant` the joiner self-registers under (a new additive
-  `Cert.grant` + validation branch). Convergent single-use: `effective_members` deterministically
-  keeps only the earliest `max_uses` certs per grant, so a leaked/reused code's surplus is evicted
-  everywhere with no extra gossip. A mesh created `--join secure` forbids quick invites. GUI invite
-  screen gains a Secure / Quick / Link picker. All additive (wire-compatible; secure flow byte-identical).
+  Admission is authorized by a signed `Grant` the joiner self-registers under, recorded as a
+  SEPARATE `GrantCert` (the classic `Cert`/`CTRL_ROSTER` wire format is untouched — quick members
+  gossip on a new append-only tag `CTRL_QGRANT` that old nodes ignore, so there is NO roster-gossip
+  skew). Convergent single-use: `grant_members` deterministically keeps only the earliest `max_uses`
+  per grant, so a leaked/reused code's surplus is evicted everywhere with no extra coordination. A
+  mesh created `--join secure` forbids quick invites. GUI invite screen gains a Secure / Quick / Link
+  picker. Fully wire-compatible with older nodes (they just don't see quick members).
 ## [0.7.12] — 2026-07-28
 
 ### Fixed
