@@ -188,3 +188,18 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
   & DNS=127.0.0.1; SplitOff→deselect+DNS restored; SetCurrent(None)→split off) + **Mac LIVE**
   (split on → pornhub via utun6/Oracle, ls shows SPLIT; Default network → pornhub via en0 direct,
   DNS restored). Fleet all v0.7.11 (Mac dmg, Oracle+lablinux binary). Merged to main (PR + 77e54a3).
+
+## 2026-07-28 — v0.7.12: split/full-tunnel could strand host DNS at dead 127.0.0.1 (SIGTERM)
+- **Bug** (reported on lablinux: "default network → 인터넷 안 됨"): split/full-tunnel points
+  /etc/resolv.conf at meshd's 127.0.0.1:53 proxy; when it turned off the resolver was left at the
+  now-dead 127.0.0.1 → DNS `connection refused` (routing fine, only name resolution died). Three
+  compounding causes: no SIGTERM handler (systemctl stop/restart — used for every deploy — skipped
+  the restore), restore_dns no fallback when backup lost, set_dns could back up the hijacked value.
+- **Fix (1ff85a8)**: SIGTERM/SIGINT now run shutdown_daemon (restore routes+DNS); restore_dns falls
+  back to the systemd-resolved stub / 1.1.1.1 if backup missing & resolv.conf still loopback; set_dns
+  captures the backup once. Immediate lablinux repair: relink resolv.conf → systemd stub.
+- **Validated**: lablinux data-plane — SplitOn→resolv=127.0.0.1, **systemctl restart (SIGTERM)→resolv
+  RESTORED to systemd symlink + DNS works** (was the bug). Deployed all: Mac dmg + Oracle + lablinux
+  binary, all v0.7.12, DNS clean, internet 200, mesh reconnected. Merged to main. Note: the running
+  meshd was v0.7.11 (not the suspected 7.9); systemd unit showed inactive but a manual process held
+  the socket — check /proc/<pid>/exe, not unit state.
