@@ -202,6 +202,7 @@ mod tests {
             expel: ExpelPolicy::CreatorOnly,
             header_placement: HeaderPlacement::Random,
             exit_policy: ExitPolicy::Isolate,
+            join_floor: JoinFloor::Any,
         }
     }
 

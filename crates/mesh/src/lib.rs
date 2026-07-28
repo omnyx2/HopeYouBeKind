@@ -132,6 +132,7 @@ mod tests {
             expel: crate::charter::ExpelPolicy::CreatorOnly,
             header_placement: crate::charter::HeaderPlacement::Random,
             exit_policy: crate::charter::ExitPolicy::Isolate,
+            join_floor: crate::charter::JoinFloor::Any,
         }
     }
 
