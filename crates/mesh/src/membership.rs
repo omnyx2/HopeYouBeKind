@@ -540,6 +540,32 @@ pub fn effective_members<'a>(
         .into_iter()
         .filter(|c| !revoked.contains(&c.member))
         .collect();
+    // Convergent single-use for quick invites (docs/JOIN_MODES.md §6): a `Grant` admits at most
+    // `max_uses` members. If more certs reference one `grant_id` than it allows (a leaked/replayed
+    // bearer code), keep only the earliest `max_uses` — ordered by `issued_at` then member pubkey —
+    // and drop the surplus. This is a deterministic function of the SHARED roster, so every node
+    // computes the same admitted set and the surplus is evicted everywhere WITHOUT extra gossip.
+    let surplus: HashSet<PubKey> = {
+        let mut by_grant: std::collections::HashMap<[u8; 16], Vec<&Cert>> =
+            std::collections::HashMap::new();
+        for c in kept.iter() {
+            if let Some(g) = &c.grant {
+                by_grant.entry(g.grant_id).or_default().push(*c);
+            }
+        }
+        let mut s: HashSet<PubKey> = HashSet::new();
+        for (_gid, mut group) in by_grant {
+            let max = group[0].grant.as_ref().map(|g| g.max_uses).unwrap_or(0) as usize;
+            if group.len() > max {
+                group.sort_by(|a, b| a.issued_at.cmp(&b.issued_at).then(a.member.cmp(&b.member)));
+                for c in group.iter().skip(max) {
+                    s.insert(c.member);
+                }
+            }
+        }
+        s
+    };
+    kept.retain(|c| !surplus.contains(&c.member));
     // Defensive: a roster must have UNIQUE ids. If two valid certs collide on one id
     // (e.g. two members invited at the same instant from different nodes, before either
     // gossiped), keep one deterministically — earliest `issued_at`, then lowest member
@@ -906,5 +932,54 @@ mod tests {
             .collect();
         assert!(gated.contains(&alice.pubkey()));
         assert!(!gated.contains(&dave.pubkey()));
+    }
+
+    #[test]
+    fn single_use_grant_admits_only_the_earliest() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let carol = MemberKey::from_seed(&[9u8; 32]);
+        let dave = MemberKey::from_seed(&[8u8; 32]);
+        let grant = master.grant([7u8; 16], 1, at() + 600_000, at()); // max_uses = 1
+                                                                      // Two nodes self-register under the SAME single-use grant (leaked/replayed code).
+        let c_carol = carol.self_cert(grant.clone(), 5, "carol", at()); // earlier
+        let c_dave = dave.self_cert(grant, 6, "dave", at() + 1); // later → surplus
+        let certs = vec![c_carol, c_dave];
+        let eff: HashSet<PubKey> = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            &[],
+            ExpelPolicy::CreatorOnly,
+        )
+        .iter()
+        .map(|c| c.member)
+        .collect();
+        assert!(eff.contains(&carol.pubkey())); // earliest kept
+        assert!(!eff.contains(&dave.pubkey())); // surplus dropped everywhere (convergent)
+    }
+
+    #[test]
+    fn reusable_grant_admits_up_to_max() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let grant = master.grant([7u8; 16], 2, at() + 600_000, at()); // max_uses = 2
+                                                                      // Three joiners on a link that allows 2 → the third (latest) is dropped.
+        let m: Vec<MemberKey> = (0..3)
+            .map(|i| MemberKey::from_seed(&[20 + i; 32]))
+            .collect();
+        let certs: Vec<Cert> = m
+            .iter()
+            .enumerate()
+            .map(|(i, k)| k.self_cert(grant.clone(), 5 + i as u8, "j", at() + i as u64))
+            .collect();
+        let eff = effective_members(
+            &net,
+            &certs,
+            InviteTopology::OpenChain,
+            &[],
+            ExpelPolicy::CreatorOnly,
+        );
+        assert_eq!(eff.len(), 2); // exactly max_uses admitted
     }
 }

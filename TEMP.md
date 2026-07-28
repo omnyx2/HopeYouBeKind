@@ -18,6 +18,8 @@ Read docs/ERRORS.md blast-radius map before touching IPC enums (additive only!) 
 1b. [x] docs/JOIN_MODES.md spec — DONE (add789f)
 1c. [x] Phase 1: Grant + Cert.grant + validation + 4 tests (70 pass) — DONE
 2. [ ] Write docs/JOIN_MODES.md spec
-3. [ ] Implement: IPC (additive), invite code format, join handler (bearer), grant tracking+gossip, revoke-on-overuse
-4. [ ] CLI (`invite --quick/--reusable/--max/--expire`, join accepts both) + GUI invite picker
+3. [x] Phase 2: IPC (CreateQuickInvite/QuickInviteBlob/join name) + join_quick bearer path — e2e offline OK (a3a130e)
+3b. [ ] Phase 3: convergent single-use — count certs per grant_id, auto-Revocation of surplus (STILL TODO)
+4. [x] Phase 4+5 CLI: invite --quick/--max/--expire, join --name, new --join secure — e2e offline OK
+4b. [ ] GUI invite mode picker + QR (TODO)
 5. [ ] Verify OFFLINE (separate socket/state, no DATA_PLANE) then test mesh

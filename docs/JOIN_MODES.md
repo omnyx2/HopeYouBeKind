@@ -126,20 +126,25 @@ No EncKey is needed (the secret arrived raw), so the whole `sealed_secret`/x2551
 ## 6. Convergent single-use (serverless enforcement)
 
 There is no server to atomically decrement `max_uses`, so `quick` gives **convergent** single-use,
-not atomic:
+not atomic. The enforcement is a **deterministic function of the shared roster** — no extra gossip,
+no explicit revocation:
 
-- the grant is gossiped inside every quick-minted cert (CTRL_ROSTER already carries certs).
-- each member counts **distinct certs carrying the same `grant_id`** = `used`. A cert is honored
-  while `used ≤ max_uses`.
-- if more than `max_uses` certs reference one grant (a leaked/replayed code), the **surplus is the
-  set of certs with the latest `issued_at`** (tie-break: higher `member` pubkey). Members
-  auto-issue a `Revocation` for the surplus member(s) — reusing the existing
-  [`EXPULSION`](EXPULSION.md) `Revocation`/`RevSig`/`effective_members` machinery — under a new
-  built-in authorization: *"any member may revoke a cert that exceeds its grant's `max_uses`."*
-- result: a leaked single-use code can briefly admit a 2nd node, which is then converged out
-  (seconds, bounded by gossip). Short `expires_at` keeps the exposure window tiny.
+- the grant is gossiped inside every quick-minted cert (CTRL_ROSTER already carries certs), so every
+  node eventually sees the same set of certs per `grant_id`.
+- `effective_members` groups certs by `grant_id`; if a group is larger than the grant's `max_uses`,
+  it **keeps only the earliest `max_uses`** — ordered by `issued_at`, tie-broken by member pubkey —
+  and drops the rest. Because the ordering is deterministic and the roster converges, **every node
+  independently computes the same admitted set**, so the surplus is dropped everywhere with zero
+  coordination (implemented next to the existing id-collision dedup in `effective_members`).
+- a dropped cert is simply not `effective` — the node is refused from the live roster (its data-plane
+  traffic is rejected), i.e. convergently evicted; no `Revocation` needs to be minted or gossiped.
+- result: a leaked single-use code can briefly admit a 2nd node before the two certs meet in gossip,
+  after which the deterministic rule evicts the surplus on every node (seconds, bounded by gossip
+  convergence). A short `expires_at` keeps the exposure window tiny.
 
-This is the honest serverless limit and is called out in the security section.
+This is the honest serverless limit and is called out in the security section. (An explicit
+[`EXPULSION`](EXPULSION.md) `Revocation` of the surplus is possible but unnecessary — the roster is
+already the single source of truth and everyone agrees on it deterministically.)
 
 ## 7. Per-mesh floor
 
