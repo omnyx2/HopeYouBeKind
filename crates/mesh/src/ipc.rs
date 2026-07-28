@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::charter::GenesisCharter;
 use crate::keydist::SealedSecret;
-use crate::membership::Cert;
+use crate::membership::{Cert, Grant};
 
 /// A client → daemon request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,6 +55,10 @@ pub enum Request {
         /// full-tunnel (onion). `None` ⇒ `isolate`.
         #[serde(default)]
         exit_policy: Option<String>,
+        /// Lowest-strength join method (docs/JOIN_MODES.md §7), fixed at genesis: `secure` =
+        /// forbid quick (bearer) invites; `None`/anything else = `any` (inviter chooses per invite).
+        #[serde(default)]
+        join: Option<String>,
     },
     /// List the data-plane ciphers a mesh can be created with (populates the dropbox).
     Ciphers,
@@ -155,6 +159,22 @@ pub enum Request {
         #[serde(default)]
         algo: Option<String>,
     },
+    /// Create a **quick** (bearer) invite — no joiner identity needed (docs/JOIN_MODES.md). Issues a
+    /// signed [`Grant`](crate::membership::Grant) authorizing self-registration and returns a
+    /// [`WrappedInvite`] (a [`QuickInviteBlob`]). `max_uses` 1 = single-use; N = a reusable link.
+    /// `name` is optional (a reusable link doesn't know each joiner's name — they supply it or it
+    /// defaults). Refused if the mesh's charter floor is `SecureOnly`.
+    CreateQuickInvite {
+        mesh: MeshId,
+        #[serde(default)]
+        name: Option<String>,
+        /// How many members may self-register under it (1 = single-use).
+        max_uses: u32,
+        /// Time-to-live in seconds from now (the grant's hard deadline).
+        ttl_secs: u64,
+        #[serde(default)]
+        algo: Option<String>,
+    },
     /// List the invite-wrap transform algorithms (P-C6) — the secret the joiner needs.
     InviteAlgorithms,
     /// Flag an attack on a mesh (P-C7 §7): broadcast an alert and arm the destroy
@@ -169,6 +189,10 @@ pub enum Request {
         invite: WrappedInvite,
         #[serde(default)]
         algo: Option<String>,
+        /// The joiner's in-mesh name, used only for a **quick** invite (which — unlike a secure
+        /// invite — doesn't carry a pre-assigned name). `None` ⇒ `node-<id>`. Ignored for secure.
+        #[serde(default)]
+        name: Option<String>,
     },
 
     // --- extensions / connectors (docs/EXTENSIONS.md) -------------------------------
@@ -406,6 +430,54 @@ pub struct InviteBlob {
     /// (no field) still deserialize.
     #[serde(default)]
     pub endpoints: Vec<(MemberId, String)>,
+}
+
+/// A self-contained **quick** invite (docs/JOIN_MODES.md): like [`InviteBlob`] but the mesh secret
+/// travels RAW (bearer — no per-joiner sealing) and admission is authorized by a signed [`Grant`]
+/// the joiner self-registers under, so there's no identity round-trip. Wrapped exactly like a
+/// classic invite but the plaintext is tagged (see [`QUICK_TAG`]) so `join` can tell them apart.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuickInviteBlob {
+    pub mesh_id: MeshId,
+    pub mesh_name: String,
+    /// Governance — carries the master public key (root of trust), same as [`InviteBlob`].
+    pub charter: GenesisCharter,
+    /// The signed capability authorizing self-registration (max_uses + expiry inside).
+    pub grant: Grant,
+    /// The RAW 32-byte mesh secret (bearer). Whoever reads the code can key the mesh — contained by
+    /// the grant's short TTL + `max_uses` + re-cipher (docs/JOIN_MODES.md §10).
+    #[serde(with = "secret_serde")]
+    pub secret: [u8; 32],
+    /// Current cipher epoch (as [`InviteBlob::epoch`]).
+    #[serde(default)]
+    pub epoch: u64,
+    /// Current cipher name (as [`InviteBlob::cipher`]).
+    #[serde(default)]
+    pub cipher: String,
+    /// The current roster so the joiner can validate the chain to master.
+    #[serde(default)]
+    pub certs: Vec<Cert>,
+    /// Bootstrap endpoints (as [`InviteBlob::endpoints`]).
+    #[serde(default)]
+    pub endpoints: Vec<(MemberId, String)>,
+}
+
+/// One-byte-prefixed marker prepended to a wrapped quick-invite's plaintext. Classic invites are
+/// raw JSON (start with `{`), so a `join` unwrap can branch on this without ambiguity.
+pub const QUICK_TAG: &[u8] = b"LQK1\n";
+
+/// serde helper for the raw `[u8; 32]` secret (serde arrays stop at 32 but derive works; kept
+/// explicit for symmetry with the sig helper and to route through a byte sequence).
+mod secret_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let v = Vec::<u8>::deserialize(d)?;
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("secret must be 32 bytes"))
+    }
 }
 
 /// One row in the global "all meshes on this computer" view (§7).

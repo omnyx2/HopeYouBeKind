@@ -2571,6 +2571,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             expel,
             header,
             exit_policy,
+            join,
         } => create_mesh(
             st,
             name,
@@ -2582,6 +2583,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             expel,
             header,
             exit_policy,
+            join,
         ),
 
         Request::ExpelMember { mesh, member } => expel_member(st, mesh, member),
@@ -3233,7 +3235,97 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             )
         }
 
-        Request::JoinMesh { invite, algo } => {
+        Request::CreateQuickInvite {
+            mesh,
+            name: _name,
+            max_uses,
+            ttl_secs,
+            algo,
+        } => {
+            let algo = algo.unwrap_or_else(|| lattice_mesh::invitewrap::DEFAULT_ALGO.to_string());
+            if !lattice_mesh::invitewrap::is_known_algo(&algo) {
+                return (err(&format!("unknown invite algorithm '{algo}'")), None);
+            }
+            if max_uses == 0 {
+                return (err("max_uses must be at least 1"), None);
+            }
+            let ms = match st.meshes.get_mut(&mesh) {
+                Some(m) => m,
+                None => return (no_mesh(mesh), None),
+            };
+            // Charter floor: a mesh created `SecureOnly` refuses quick (bearer) invites so a member
+            // can't weaken it (docs/JOIN_MODES.md §7).
+            if ms.mesh.charter.join_floor == lattice_mesh::charter::JoinFloor::SecureOnly {
+                return (
+                    err("this mesh only allows secure invites (created with --join secure)"),
+                    None,
+                );
+            }
+            // Same "who may invite" gate as CreateInvite: master, or a verified member in OpenChain.
+            let roster = ms.roster();
+            if ms.master.is_none() {
+                if ms.mesh.charter.invite != InviteTopology::OpenChain {
+                    return (
+                        err("only the mesh creator can invite in a master-gated mesh"),
+                        None,
+                    );
+                }
+                if !roster.iter().any(|c| c.member == ms.my_key.pubkey()) {
+                    return (
+                        err("you must be a verified member of this mesh to invite"),
+                        None,
+                    );
+                }
+            }
+            let grant_id: [u8; 16] = rand::random();
+            let expires_at = now_ms().saturating_add(ttl_secs.saturating_mul(1000));
+            // Issue the grant: master-signed if we're the creator, else an OpenChain member grant.
+            let grant = match ms.master.as_ref() {
+                Some(m) => m.grant(grant_id, max_uses, expires_at, now_ms()),
+                None => ms.my_key.grant(
+                    ms.mesh.charter.master_pubkey,
+                    grant_id,
+                    max_uses,
+                    expires_at,
+                    now_ms(),
+                ),
+            };
+            // Bootstrap endpoints (P-D1), same as CreateInvite.
+            let mut endpoints: Vec<(MemberId, String)> = Vec::new();
+            if let Some(ep) = *ms.my_endpoint.lock().unwrap() {
+                endpoints.push((ms.my_id(), ep.to_string()));
+            }
+            for (m, link) in ms.links.lock().unwrap().iter() {
+                endpoints.push((*m, link.endpoint.to_string()));
+            }
+            let blob = lattice_mesh::ipc::QuickInviteBlob {
+                mesh_id: ms.mesh.id,
+                mesh_name: ms.mesh.name.clone(),
+                charter: ms.mesh.charter.clone(),
+                grant,
+                secret: ms.secret, // RAW (bearer) — see docs/JOIN_MODES.md §4
+                epoch: ms.epoch,
+                cipher: ms.cipher.clone(),
+                certs: ms.certs.clone(),
+                endpoints,
+            };
+            // Tag the plaintext so `join` can tell a quick blob from a classic one, then wrap it with
+            // the exact same P-C6 machinery.
+            let mut plain = lattice_mesh::ipc::QUICK_TAG.to_vec();
+            match serde_json::to_vec(&blob) {
+                Ok(b) => plain.extend_from_slice(&b),
+                Err(e) => return (err(&format!("serialize quick invite: {e}")), None),
+            }
+            let salt: [u8; 32] = rand::random();
+            let n: u32 = rand::random();
+            let ct = lattice_mesh::invitewrap::wrap(&algo, &salt, n, &plain);
+            (
+                Response::Invite(lattice_mesh::ipc::WrappedInvite { salt, n, ct }),
+                None,
+            )
+        }
+
+        Request::JoinMesh { invite, algo, name } => {
             // P-C6: unwrap with the out-of-band algorithm before installing.
             let algo = algo.unwrap_or_else(|| lattice_mesh::invitewrap::DEFAULT_ALGO.to_string());
             let plain =
@@ -3246,9 +3338,17 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                         )
                     }
                 };
-            match serde_json::from_slice::<InviteBlob>(&plain) {
-                Ok(blob) => join_mesh(st, blob),
-                Err(e) => (err(&format!("bad invite contents: {e}")), None),
+            // A quick (bearer) invite is tagged; a classic one is raw JSON (docs/JOIN_MODES.md §4).
+            if let Some(body) = plain.strip_prefix(lattice_mesh::ipc::QUICK_TAG) {
+                match serde_json::from_slice::<lattice_mesh::ipc::QuickInviteBlob>(body) {
+                    Ok(blob) => join_quick(st, blob, name),
+                    Err(e) => (err(&format!("bad quick-invite contents: {e}")), None),
+                }
+            } else {
+                match serde_json::from_slice::<InviteBlob>(&plain) {
+                    Ok(blob) => join_mesh(st, blob),
+                    Err(e) => (err(&format!("bad invite contents: {e}")), None),
+                }
             }
         }
 
@@ -3396,6 +3496,149 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     )
 }
 
+/// **RISK 🟡 MED** — install a mesh from a QUICK (bearer) invite (docs/JOIN_MODES.md): no pending
+/// identity, no sealed secret. We generate a fresh key, self-issue a cert authorized by the invite's
+/// signed [`Grant`], adopt the RAW secret, and bring up the data plane. `wanted_name` is the joiner's
+/// chosen name (`None` ⇒ `node-<id>`).
+fn join_quick(
+    st: &mut State,
+    blob: lattice_mesh::ipc::QuickInviteBlob,
+    wanted_name: Option<String>,
+) -> (Response, Option<PostAction>) {
+    if st.meshes.contains_key(&blob.mesh_id) {
+        return (err(&format!("already in mesh {}", blob.mesh_id)), None);
+    }
+    let master = blob.charter.master_pubkey;
+    // Validate the grant: right network, valid signature, not expired, and its issuer is the master
+    // or a verified member of the roster carried in the blob.
+    if blob.grant.network != master || !blob.grant.sig_ok() {
+        return (err("quick invite: grant is invalid"), None);
+    }
+    if now_ms() >= blob.grant.expires_at {
+        return (err("quick invite has expired — ask for a fresh code"), None);
+    }
+    let roster = valid_members(&master, &blob.certs, blob.charter.invite);
+    let issuer_ok =
+        blob.grant.issuer == master || roster.iter().any(|c| c.member == blob.grant.issuer);
+    if !issuer_ok {
+        return (
+            err("quick invite: grant issuer is not an authorized member"),
+            None,
+        );
+    }
+    // Pick the lowest free member id we can see (races on a reusable code converge later, §6).
+    let used: HashSet<MemberId> = blob.certs.iter().map(|c| c.id).collect();
+    let id = match (1u8..=254).find(|i| !used.contains(i)) {
+        Some(i) => i,
+        None => return (err("mesh is full (no free member id)"), None),
+    };
+    let name = wanted_name.unwrap_or_else(|| format!("node-{id}"));
+    // Generate our own identity (no NewIdentity ceremony) and self-issue a cert under the grant.
+    let my_key = MemberKey::generate();
+    let my_enc = EncKey::generate();
+    let my_cert = my_key.self_cert(blob.grant.clone(), id, &name, now_ms());
+    let mut certs = blob.certs.clone();
+    certs.push(my_cert);
+    // Confirm our self-issued cert now validates (chains to master via the grant).
+    let ok = valid_members(&master, &certs, blob.charter.invite)
+        .iter()
+        .any(|c| c.member == my_key.pubkey());
+    if !ok {
+        return (
+            err("quick invite: our self-issued cert does not validate under the grant"),
+            None,
+        );
+    }
+    let secret = blob.secret; // RAW bearer secret
+    let prefix = blob.charter.overlay_prefix;
+    let cipher = if blob.cipher.is_empty() {
+        blob.charter.initial_cipher.clone()
+    } else {
+        blob.cipher.clone()
+    };
+    let epoch = blob.epoch;
+    let mut seed: HashMap<MemberId, SocketAddr> = HashMap::new();
+    for (m, ep) in &blob.endpoints {
+        if *m == id {
+            continue;
+        }
+        if let Ok(addr) = ep.parse() {
+            seed.insert(*m, addr);
+        }
+    }
+    let links = seed_links(seed);
+    let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
+    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
+    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
+    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
+    let mut mesh = Mesh::new(
+        blob.mesh_id,
+        blob.mesh_name.clone(),
+        blob.charter.clone(),
+        id,
+    );
+    mesh.epoch = epoch;
+    let bringup = st.data_plane.then(|| Bringup {
+        mesh_id: blob.mesh_id,
+        my_id: id,
+        prefix,
+        secret,
+        cipher: cipher.clone(),
+        epoch,
+        links: Arc::clone(&links),
+        exit_sel: Arc::clone(&exit_sel),
+        split_routes: Arc::clone(&split_routes),
+        my_endpoint: Arc::clone(&my_endpoint),
+        decrypt_fails: Arc::clone(&decrypt_fails),
+        traffic: Arc::clone(&traffic),
+        header_placement: mesh.charter.header_placement,
+        flows: lattice_proto::flow::default_table(),
+    });
+    st.meshes.insert(
+        blob.mesh_id,
+        MeshState {
+            mesh,
+            master: None,
+            my_key,
+            my_enc,
+            certs,
+            revocations: Vec::new(),
+            invited: Vec::new(),
+            secret,
+            links,
+            exit_sel,
+            split_routes,
+            exitable: false,
+            tun_name: None,
+            my_endpoint,
+            dp_port: 0,
+            dp_error: None,
+            dp_task: None,
+            cipher,
+            epoch,
+            loop_cmd: None,
+            attack_armed_at: None,
+            decrypt_fails,
+            traffic,
+            flows: lattice_proto::flow::default_table(),
+            flow_version: 0,
+            services: Vec::new(),
+            service_seq: 0,
+        },
+    );
+    emit(
+        st,
+        "peer",
+        Some(blob.mesh_id),
+        serde_json::json!({ "kind": "mesh_added", "mesh": blob.mesh_id }),
+    );
+    (
+        Response::MeshCreated { mesh: blob.mesh_id },
+        bringup.map(PostAction::Bringup),
+    )
+}
+
 /// **RISK 🟡 MED** — genesis a brand-new mesh (master keypair, charter, self as first member) and
 /// persist it; returns a `Bringup` PostAction. Mesh-lifecycle correctness.
 fn create_mesh(
@@ -3409,7 +3652,16 @@ fn create_mesh(
     expel: Option<String>,
     header: Option<String>,
     exit_policy: Option<String>,
+    join: Option<String>,
 ) -> (Response, Option<PostAction>) {
+    // Lowest-strength join method this mesh accepts (docs/JOIN_MODES.md §7): `secure` locks out
+    // quick (bearer) invites; anything else (default) allows the inviter to choose per invite.
+    let join_floor = match join.as_deref() {
+        Some("secure") | Some("secure-only") | Some("secureonly") => {
+            lattice_mesh::charter::JoinFloor::SecureOnly
+        }
+        _ => lattice_mesh::charter::JoinFloor::Any,
+    };
     // The mesh id is the real key, but a human picks a mesh by NAME and the GUI lists
     // meshes by name — so two same-named meshes render as indistinguishable "peer" rows
     // and any name-based lookup becomes ambiguous. Keep names non-empty + unique on this
@@ -3483,6 +3735,7 @@ fn create_mesh(
         expel,
         header_placement,
         exit_policy,
+        join_floor, // docs/JOIN_MODES.md §7 (plumbed from CreateMesh in phase 4)
     };
     if let Err(e) = charter.validate() {
         return (err(&e.to_string()), None);

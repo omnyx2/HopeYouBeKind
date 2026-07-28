@@ -14,7 +14,9 @@ Read docs/ERRORS.md blast-radius map before touching IPC enums (additive only!) 
 - "Convergent single-use": serverless can't hard-prevent replay; issuer gossips a pending grant{nonce,max_uses,used_count,expiry} via CTRL_ROSTER; members validate+increment (merge=max); over-count → signed revocation (reuse expulsion machinery). Short expiry makes it practical.
 
 ### Plan
-1. [ ] Explore + map current invite/join/membership/crypto flow (ground the spec)
+1. [x] Explore + map — DONE
+1b. [x] docs/JOIN_MODES.md spec — DONE (add789f)
+1c. [x] Phase 1: Grant + Cert.grant + validation + 4 tests (70 pass) — DONE
 2. [ ] Write docs/JOIN_MODES.md spec
 3. [ ] Implement: IPC (additive), invite code format, join handler (bearer), grant tracking+gossip, revoke-on-overuse
 4. [ ] CLI (`invite --quick/--reusable/--max/--expire`, join accepts both) + GUI invite picker
