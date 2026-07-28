@@ -11,6 +11,21 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.12] — 2026-07-28
+
+### Fixed
+- **Split/full-tunnel could strand the host DNS at the dead `127.0.0.1` proxy → "no internet".**
+  Turning split (or a full tunnel) on points `/etc/resolv.conf` at meshd's `127.0.0.1:53` proxy and
+  backs up the original to a single file. Three ways that broke and left DNS dead when it turned
+  off: (1) **no SIGTERM handler** — `systemctl stop/restart` (or any non-`Shutdown`-IPC kill) never
+  ran the restore, so the proxy address was left in place; (2) **`restore_dns` had no fallback** —
+  if the backup was lost (to that same crash/SIGTERM), it did nothing and left the dead address;
+  (3) **`set_dns` could back up an already-hijacked resolv.conf** as the "original", so restore
+  "restored" `127.0.0.1`. Fixes: meshd now restores routes/DNS on **SIGTERM/SIGINT**; `restore_dns`
+  falls back to the systemd-resolved stub (or `1.1.1.1`) if the backup is missing and resolv.conf
+  still points at loopback; `set_dns` only captures the backup once (never re-captures our own
+  hijack). Found on a Linux node whose DNS died after `default network` (docs/ERRORS.md).
+
 ## [0.7.11] — 2026-07-25
 
 ### Changed
