@@ -47,14 +47,14 @@ use lattice_mesh::ipc::{
 };
 use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{
-    effective_members, valid_members, Cert, MasterKey, MemberKey, PubKey, Revocation,
+    effective_members, valid_members, Cert, GrantCert, MasterKey, MemberKey, PubKey, Revocation,
 };
 use lattice_mesh::registry::{self, ServiceEntry, ServiceRecord};
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
     SharedEndpoint, SharedExit, SharedSplitRoutes, SharedTraffic, Traffic, CTRL_ALLCLEAR,
-    CTRL_ATTACK, CTRL_FLOWS, CTRL_REGISTRY, CTRL_REVOKE, CTRL_ROSTER,
+    CTRL_ATTACK, CTRL_FLOWS, CTRL_QGRANT, CTRL_REGISTRY, CTRL_REVOKE, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::flow::FlowRule;
@@ -174,6 +174,10 @@ struct MeshState {
     /// `roster()` drops a member that carries one authorized under the charter's
     /// `ExpelPolicy` — this is what actually removes a member (re-cipher only denies keys).
     revocations: Vec<Revocation>,
+    /// Quick-invite membership records (docs/JOIN_MODES.md) — members that self-registered under a
+    /// signed `Grant`. Kept SEPARATE from `certs` so the classic cert roster wire format never
+    /// changes; gossiped on their own control channel and folded into `roster()` via `grant_members`.
+    grant_certs: Vec<GrantCert>,
     /// Member ids handed out in invites that have **not yet joined** (id, invitee pubkey,
     /// issued-at ms). Reserved so inviting several people in a row — before any of them
     /// connect and gossip back — assigns DISTINCT ids instead of all reusing the next free
@@ -254,7 +258,43 @@ impl MeshState {
     /// The effective roster (certs chaining to the master, minus authorized
     /// revocations), id-sorted.
     fn roster(&self) -> Vec<Cert> {
-        let mut v: Vec<Cert> = effective_members(
+        let master = self.mesh.charter.master_pubkey;
+        let cert_valid = effective_members(
+            &master,
+            &self.certs,
+            self.topology(),
+            &self.revocations,
+            self.mesh.charter.expel,
+        );
+        let mut v: Vec<Cert> = cert_valid.iter().map(|c| (*c).clone()).collect();
+        // Fold in quick-invite members (a separate record set) as synthetic cert rows so every
+        // existing roster consumer sees them uniformly (docs/JOIN_MODES.md). They chain to the
+        // master via their grant, validated by `grant_members`.
+        for q in lattice_mesh::membership::grant_members(
+            &master,
+            &cert_valid,
+            &self.grant_certs,
+            self.topology(),
+        ) {
+            v.push(Cert {
+                network: master,
+                member: q.member,
+                id: q.id,
+                name: q.name.clone(),
+                inviter: q.member, // self-registered
+                issued_at: q.issued_at,
+                sig: q.sig,
+            });
+        }
+        // A cert member wins over a quick member on an id clash (certs were pushed first; stable).
+        v.sort_by_key(|c| c.id);
+        v.dedup_by_key(|c| c.id);
+        v
+    }
+    /// The classic-cert roster only (NO synthetic quick-member rows) — what `CTRL_ROSTER` gossips,
+    /// so the wire stays byte-identical to older nodes. Quick members ride `CTRL_QGRANT` instead.
+    fn cert_roster(&self) -> Vec<Cert> {
+        effective_members(
             &self.mesh.charter.master_pubkey,
             &self.certs,
             self.topology(),
@@ -263,9 +303,7 @@ impl MeshState {
         )
         .into_iter()
         .cloned()
-        .collect();
-        v.sort_by_key(|c| c.id);
-        v
+        .collect()
     }
     /// This node's in-mesh id (from its own cert).
     fn my_id(&self) -> MemberId {
@@ -475,6 +513,9 @@ struct PersistedMesh {
     /// Signed expulsions (P-revoke). `#[serde(default)]` so older state files load.
     #[serde(default)]
     revocations: Vec<Revocation>,
+    /// Quick-invite membership records (docs/JOIN_MODES.md). `#[serde(default)]` so older files load.
+    #[serde(default)]
+    grant_certs: Vec<GrantCert>,
     /// SDN flow table + version (docs/FLOW_TABLE.md). `#[serde(default)]` so older state
     /// files load; an empty table is treated as the default at restore.
     #[serde(default)]
@@ -534,6 +575,7 @@ fn to_persisted(ms: &MeshState) -> PersistedMesh {
         charter: ms.mesh.charter.clone(),
         certs: ms.certs.clone(),
         revocations: ms.revocations.clone(),
+        grant_certs: ms.grant_certs.clone(),
         flows: ms.flows.clone(),
         flow_version: ms.flow_version,
         secret: ms.secret,
@@ -740,6 +782,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         my_enc,
         certs: p.certs,
         revocations: p.revocations,
+        grant_certs: p.grant_certs,
         invited: Vec::new(),
         secret: p.secret,
         links,
@@ -1966,6 +2009,34 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                         }
                     }
                 }
+                // A peer gossiped quick-invite members (self-registered under a Grant) — merge any
+                // new record for THIS mesh; `roster()` re-validates via `grant_members`, so an
+                // invalid/surplus one simply never counts (docs/JOIN_MODES.md).
+                LoopEvent::Quick(bytes) => {
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = bincode::deserialize::<Vec<GrantCert>>(&bytes) {
+                            let net = ms.mesh.charter.master_pubkey;
+                            let before = ms.roster().len();
+                            for q in incoming {
+                                if ms.grant_certs.len() >= MAX_ROSTER_CERTS {
+                                    break;
+                                }
+                                if q.grant.network == net
+                                    && !ms
+                                        .grant_certs
+                                        .iter()
+                                        .any(|h| h.member == q.member && h.id == q.id)
+                                {
+                                    ms.grant_certs.push(q);
+                                }
+                            }
+                            if ms.roster().len() > before {
+                                persist_after = true;
+                                emit_peer = true;
+                            }
+                        }
+                    }
+                }
             }
             if persist_after {
                 persist(&state);
@@ -2023,8 +2094,9 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
                         if peers.is_empty() {
                             return out;
                         }
-                        // Roster (signed certs) — converges membership across the mesh.
-                        let certs = ms.roster();
+                        // Roster (signed certs) — converges membership across the mesh. Cert-only
+                        // (no synthetic quick rows) so the wire is byte-identical to older nodes.
+                        let certs = ms.cert_roster();
                         if certs.len() >= 2 {
                             if let Ok(body) = bincode::serialize(&certs) {
                                 out.push((CTRL_ROSTER, body, peers.clone(), tx.clone()));
@@ -2034,6 +2106,13 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
                         if !ms.revocations.is_empty() {
                             if let Ok(body) = bincode::serialize(&ms.revocations) {
                                 out.push((CTRL_REVOKE, body, peers.clone(), tx.clone()));
+                            }
+                        }
+                        // Quick-invite members (self-registered under a Grant) — a SEPARATE channel
+                        // (CTRL_QGRANT); old nodes ignore it, keeping the classic roster untouched.
+                        if !ms.grant_certs.is_empty() {
+                            if let Ok(body) = bincode::serialize(&ms.grant_certs) {
+                                out.push((CTRL_QGRANT, body, peers.clone(), tx.clone()));
                             }
                         }
                         // SDN flow table — only once edited away from the default (version > 0);
@@ -3307,6 +3386,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 epoch: ms.epoch,
                 cipher: ms.cipher.clone(),
                 certs: ms.certs.clone(),
+                grant_certs: ms.grant_certs.clone(),
                 endpoints,
             };
             // Tag the plaintext so `join` can tell a quick blob from a classic one, then wrap it with
@@ -3459,6 +3539,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             my_enc,
             certs: invite.certs,
             revocations: Vec::new(),
+            grant_certs: Vec::new(),
             invited: Vec::new(),
             secret,
             links,
@@ -3527,25 +3608,34 @@ fn join_quick(
         );
     }
     // Pick the lowest free member id we can see (races on a reusable code converge later, §6).
-    let used: HashSet<MemberId> = blob.certs.iter().map(|c| c.id).collect();
+    let mut used: HashSet<MemberId> = blob.certs.iter().map(|c| c.id).collect();
+    used.extend(blob.grant_certs.iter().map(|q| q.id));
     let id = match (1u8..=254).find(|i| !used.contains(i)) {
         Some(i) => i,
         None => return (err("mesh is full (no free member id)"), None),
     };
     let name = wanted_name.unwrap_or_else(|| format!("node-{id}"));
-    // Generate our own identity (no NewIdentity ceremony) and self-issue a cert under the grant.
+    // Generate our own identity (no NewIdentity ceremony) and self-register as a separate GrantCert
+    // (kept OUT of `certs` so the classic roster wire format is untouched — docs/JOIN_MODES.md).
     let my_key = MemberKey::generate();
     let my_enc = EncKey::generate();
-    let my_cert = my_key.self_cert(blob.grant.clone(), id, &name, now_ms());
-    let mut certs = blob.certs.clone();
-    certs.push(my_cert);
-    // Confirm our self-issued cert now validates (chains to master via the grant).
-    let ok = valid_members(&master, &certs, blob.charter.invite)
-        .iter()
-        .any(|c| c.member == my_key.pubkey());
+    let my_qcert = my_key.grant_cert(blob.grant.clone(), id, &name, now_ms());
+    let certs = blob.certs.clone();
+    let mut grant_certs = blob.grant_certs.clone();
+    grant_certs.push(my_qcert);
+    // Confirm our self-registration validates under the grant.
+    let cert_valid = valid_members(&master, &certs, blob.charter.invite);
+    let ok = lattice_mesh::membership::grant_members(
+        &master,
+        &cert_valid,
+        &grant_certs,
+        blob.charter.invite,
+    )
+    .iter()
+    .any(|q| q.member == my_key.pubkey());
     if !ok {
         return (
-            err("quick invite: our self-issued cert does not validate under the grant"),
+            err("quick invite: our self-registration does not validate under the grant"),
             None,
         );
     }
@@ -3604,6 +3694,7 @@ fn join_quick(
             my_enc,
             certs,
             revocations: Vec::new(),
+            grant_certs,
             invited: Vec::new(),
             secret,
             links,
@@ -3780,6 +3871,7 @@ fn create_mesh(
             my_enc,
             certs: vec![cert],
             revocations: Vec::new(),
+            grant_certs: Vec::new(),
             invited: Vec::new(),
             secret,
             links,

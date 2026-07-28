@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::charter::GenesisCharter;
 use crate::keydist::SealedSecret;
-use crate::membership::{Cert, Grant};
+use crate::membership::{Cert, Grant, GrantCert};
 
 /// A client → daemon request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -457,6 +457,9 @@ pub struct QuickInviteBlob {
     /// The current roster so the joiner can validate the chain to master.
     #[serde(default)]
     pub certs: Vec<Cert>,
+    /// Existing quick-invite members (so the joiner sees them for id-picking + validation).
+    #[serde(default)]
+    pub grant_certs: Vec<GrantCert>,
     /// Bootstrap endpoints (as [`InviteBlob::endpoints`]).
     #[serde(default)]
     pub endpoints: Vec<(MemberId, String)>,
