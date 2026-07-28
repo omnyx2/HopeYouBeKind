@@ -1101,12 +1101,36 @@ async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666));
     }
+    // Clean up host DNS/routes on SIGTERM (systemctl stop/restart) and SIGINT (Ctrl-C), not just on
+    // the Shutdown IPC — otherwise `systemctl restart` while a split/full-tunnel is on leaves
+    // `/etc/resolv.conf` pointed at our dead 127.0.0.1 proxy and the box loses DNS (2026-07-28
+    // incident, docs/ERRORS.md). `shutdown_daemon` restores then `exit(0)`s.
+    #[cfg(unix)]
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     loop {
-        let (stream, _) = listener.accept().await?;
-        if !peer_allowed(&stream) {
-            continue; // peer_allowed logs the rejection
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                if !peer_allowed(&stream) {
+                    continue; // peer_allowed logs the rejection
+                }
+                tokio::spawn(serve_conn(stream, Arc::clone(&state)));
+            }
+            _ = async {
+                match sigterm.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                elog!("meshd: SIGTERM — restoring host routes/DNS before exit");
+                shutdown_daemon(&state).await; // restores DNS/routes, aborts data plane, exit(0)
+            }
+            _ = tokio::signal::ctrl_c() => {
+                elog!("meshd: SIGINT — restoring host routes/DNS before exit");
+                shutdown_daemon(&state).await;
+            }
         }
-        tokio::spawn(serve_conn(stream, Arc::clone(&state)));
     }
 }
 

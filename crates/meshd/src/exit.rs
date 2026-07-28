@@ -520,12 +520,18 @@ pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
     if servers.is_empty() {
         return Ok(());
     }
-    if let Ok(target) = std::fs::read_link("/etc/resolv.conf") {
-        let _ = std::fs::write(DNS_SAVED, format!("link:{}", target.display()));
-    } else if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
-        let _ = std::fs::write(DNS_SAVED, format!("file:{content}"));
-    } else {
-        let _ = std::fs::write(DNS_SAVED, "none:");
+    // Back up the REAL original only once. If a backup already exists, a prior set_dns (full-tunnel
+    // or split) is still active — keep its backup so we never capture our own hijacked
+    // `/etc/resolv.conf` (which would make `restore_dns` "restore" the dead proxy address). See the
+    // 2026-07-28 DNS-strand incident in docs/ERRORS.md.
+    if !std::path::Path::new(DNS_SAVED).exists() {
+        if let Ok(target) = std::fs::read_link("/etc/resolv.conf") {
+            let _ = std::fs::write(DNS_SAVED, format!("link:{}", target.display()));
+        } else if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
+            let _ = std::fs::write(DNS_SAVED, format!("file:{content}"));
+        } else {
+            let _ = std::fs::write(DNS_SAVED, "none:");
+        }
     }
     let mut conf = String::new();
     for s in servers {
@@ -542,15 +548,37 @@ pub fn set_dns(servers: &[IpAddr]) -> Result<(), String> {
 /// symlink, or rewrite the saved file content).
 #[cfg(target_os = "linux")]
 pub fn restore_dns() {
+    let mut restored = false;
     if let Ok(saved) = std::fs::read_to_string(DNS_SAVED) {
         let _ = std::fs::remove_file("/etc/resolv.conf");
         if let Some(t) = saved.strip_prefix("link:") {
             let _ = std::os::unix::fs::symlink(t.trim(), "/etc/resolv.conf");
+            restored = true;
         } else if let Some(c) = saved.strip_prefix("file:") {
             let _ = std::fs::write("/etc/resolv.conf", c);
+            restored = true;
         }
         let _ = std::fs::remove_file(DNS_SAVED);
         tracing::info!("DNS restored");
+    }
+    // Safety net: NEVER leave the resolver pointed at our now-dead proxy. If we couldn't restore a
+    // real backup (lost e.g. to a SIGTERM/crash that skipped clean shutdown) and `/etc/resolv.conf`
+    // is still a plain file pointing at loopback, fall back to the systemd-resolved stub (if this
+    // host uses it) or a public resolver — otherwise all DNS dies with the daemon.
+    if !restored && std::fs::read_link("/etc/resolv.conf").is_err() {
+        let cur = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+        if cur.trim().is_empty() || cur.contains("127.0.0.1") || cur.contains("127.0.0.53") {
+            let _ = std::fs::remove_file("/etc/resolv.conf");
+            if std::path::Path::new("/run/systemd/resolve/stub-resolv.conf").exists() {
+                let _ = std::os::unix::fs::symlink(
+                    "/run/systemd/resolve/stub-resolv.conf",
+                    "/etc/resolv.conf",
+                );
+            } else {
+                let _ = std::fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n");
+            }
+            tracing::warn!("DNS backup missing/hijacked — fell back to a safe resolver");
+        }
     }
 }
 
