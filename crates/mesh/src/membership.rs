@@ -47,6 +47,75 @@ pub struct Cert {
     /// `inviter`'s signature over the canonical bytes.
     #[serde(with = "sig_serde")]
     pub sig: [u8; 64],
+    /// `Some(g)` when this member **self-issued** its cert under a quick-invite [`Grant`]
+    /// (docs/JOIN_MODES.md): the grant authorizes the self-registration, and `inviter`/`sig` are
+    /// then the member's OWN (self-signed to prove key possession). `None` = classic
+    /// inviter-signed cert. Additive: certs written before quick invites load as `None`.
+    #[serde(default)]
+    pub grant: Option<Grant>,
+}
+
+/// A signed capability that authorizes **self-registration** into a mesh (the `quick` join mode,
+/// docs/JOIN_MODES.md). Issued by the master or an invite-authorized member and carried inside every
+/// cert minted under it, so the whole mesh can validate the authorization and count uses without the
+/// issuer being online at join time.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Grant {
+    /// The mesh identity = master public key (same anchor as [`Cert::network`]).
+    pub network: PubKey,
+    /// Random nonce identifying this grant (dedup + use-counting key).
+    pub grant_id: [u8; 16],
+    /// How many members may self-register under it: `1` = single-use, `N` = a reusable link.
+    pub max_uses: u32,
+    /// Hard deadline (Unix-ms): a cert minted after this is rejected.
+    pub expires_at: u64,
+    /// Who authorized it: the master, or an invite-authorized member (OpenChain).
+    pub issuer: PubKey,
+    pub issued_at: u64,
+    /// `issuer`'s signature over [`grant_signing_bytes`].
+    #[serde(with = "sig_serde")]
+    pub sig: [u8; 64],
+}
+
+/// Canonical bytes an issuer signs over for a [`Grant`] (little-endian scalars, fixed-width fields
+/// so there's no ambiguity — no length-prefix needed since every field is fixed size).
+fn grant_signing_bytes(
+    network: &PubKey,
+    grant_id: &[u8; 16],
+    max_uses: u32,
+    expires_at: u64,
+    issuer: &PubKey,
+    issued_at: u64,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(5 + 32 + 16 + 4 + 8 + 32 + 8);
+    b.extend_from_slice(b"GRANT");
+    b.extend_from_slice(network);
+    b.extend_from_slice(grant_id);
+    b.extend_from_slice(&max_uses.to_le_bytes());
+    b.extend_from_slice(&expires_at.to_le_bytes());
+    b.extend_from_slice(issuer);
+    b.extend_from_slice(&issued_at.to_le_bytes());
+    b
+}
+
+impl Grant {
+    /// Does the grant's signature verify under its own `issuer` key? (Whether that issuer is
+    /// *authorized* — master or a rooted member — is checked in [`valid_members`].)
+    pub fn sig_ok(&self) -> bool {
+        let Ok(vk) = VerifyingKey::from_bytes(&self.issuer) else {
+            return false;
+        };
+        let sig = Signature::from_bytes(&self.sig);
+        let msg = grant_signing_bytes(
+            &self.network,
+            &self.grant_id,
+            self.max_uses,
+            self.expires_at,
+            &self.issuer,
+            self.issued_at,
+        );
+        vk.verify(&msg, &sig).is_ok()
+    }
 }
 
 /// serde's built-in array impls stop at length 32, so route the 64-byte signature
@@ -111,6 +180,29 @@ impl MasterKey {
             inviter: network,
             issued_at,
             sig: self.0.sign(&msg).to_bytes(),
+            grant: None,
+        }
+    }
+    /// Issue a master-signed quick-invite [`Grant`] (inviter = master).
+    pub fn grant(
+        &self,
+        grant_id: [u8; 16],
+        max_uses: u32,
+        expires_at: u64,
+        issued_at: u64,
+    ) -> Grant {
+        let network = self.network();
+        let msg = grant_signing_bytes(
+            &network, &grant_id, max_uses, expires_at, &network, issued_at,
+        );
+        Grant {
+            network,
+            grant_id,
+            max_uses,
+            expires_at,
+            issuer: network,
+            issued_at,
+            sig: self.0.sign(&msg).to_bytes(),
         }
     }
 }
@@ -152,6 +244,47 @@ impl MemberKey {
             inviter,
             issued_at,
             sig: self.0.sign(&msg).to_bytes(),
+            grant: None,
+        }
+    }
+    /// Issue a member-signed quick-invite [`Grant`] (OpenChain: an inviting member authorizes it).
+    pub fn grant(
+        &self,
+        network: PubKey,
+        grant_id: [u8; 16],
+        max_uses: u32,
+        expires_at: u64,
+        issued_at: u64,
+    ) -> Grant {
+        let issuer = self.pubkey();
+        let msg = grant_signing_bytes(
+            &network, &grant_id, max_uses, expires_at, &issuer, issued_at,
+        );
+        Grant {
+            network,
+            grant_id,
+            max_uses,
+            expires_at,
+            issuer,
+            issued_at,
+            sig: self.0.sign(&msg).to_bytes(),
+        }
+    }
+    /// Self-issue a cert under a quick-invite [`Grant`] (the `quick` join, docs/JOIN_MODES.md).
+    /// `inviter` = this member (self-signed to prove key possession); the `grant` is what actually
+    /// authorizes admission (checked by [`valid_members`]).
+    pub fn self_cert(&self, grant: Grant, id: MemberId, name: &str, issued_at: u64) -> Cert {
+        let member = self.pubkey();
+        let msg = signing_bytes(&grant.network, &member, id, name, &member, issued_at);
+        Cert {
+            network: grant.network,
+            member,
+            id,
+            name: name.into(),
+            inviter: member,
+            issued_at,
+            sig: self.0.sign(&msg).to_bytes(),
+            grant: Some(grant),
         }
     }
 }
@@ -191,7 +324,9 @@ pub fn valid_members<'a>(
         .filter(|c| &c.network == master && c.sig_ok())
         .collect();
     // Fixpoint: a member is rooted if its inviter is the master, or (open chain) a
-    // member already known to be rooted.
+    // member already known to be rooted, or (quick) it self-registered under a valid Grant whose
+    // ISSUER is likewise rooted (master, or an OpenChain member). The grant path reuses the same
+    // fixpoint so a member-issued grant only counts once that member is itself rooted.
     let mut rooted: HashSet<PubKey> = HashSet::new();
     let mut changed = true;
     while changed {
@@ -201,7 +336,8 @@ pub fn valid_members<'a>(
                 continue;
             }
             let authorized = &c.inviter == master
-                || (topology == InviteTopology::OpenChain && rooted.contains(&c.inviter));
+                || (topology == InviteTopology::OpenChain && rooted.contains(&c.inviter))
+                || grant_authorizes(c, master, topology, &rooted);
             if authorized {
                 rooted.insert(c.member);
                 changed = true;
@@ -211,6 +347,27 @@ pub fn valid_members<'a>(
     ok.into_iter()
         .filter(|c| rooted.contains(&c.member))
         .collect()
+}
+
+/// Does `c`'s attached quick-invite [`Grant`] authorize it? The grant must sign-verify under its
+/// issuer, be for THIS network, not have expired *before the cert was minted*
+/// (`cert.issued_at <= grant.expires_at`), and its issuer must be the master (always) or — under
+/// OpenChain — an already-rooted member. Expiry here is best-effort (a malicious holder of a leaked
+/// code can forge `issued_at` since the cert is self-signed); the real containment for a leaked
+/// bearer code is the short TTL + `max_uses` surplus-revocation + re-cipher (docs/JOIN_MODES.md §10).
+fn grant_authorizes(
+    c: &Cert,
+    master: &PubKey,
+    topology: InviteTopology,
+    rooted: &HashSet<PubKey>,
+) -> bool {
+    let Some(g) = &c.grant else {
+        return false;
+    };
+    if &g.network != master || !g.sig_ok() || c.issued_at > g.expires_at {
+        return false;
+    }
+    &g.issuer == master || (topology == InviteTopology::OpenChain && rooted.contains(&g.issuer))
 }
 
 // ---- membership revocation (expulsion) -------------------------------------------
@@ -675,5 +832,79 @@ mod tests {
             ),
             b.pubkey()
         ));
+    }
+
+    // ---- quick-invite Grant (docs/JOIN_MODES.md) --------------------------------------
+
+    #[test]
+    fn master_grant_lets_a_member_self_register() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let carol = MemberKey::from_seed(&[9u8; 32]);
+        let grant = master.grant([7u8; 16], 1, at() + 600_000, at());
+        assert!(grant.sig_ok());
+        let cert = carol.self_cert(grant, 5, "carol", at());
+        assert!(cert.sig_ok()); // self-signed (inviter == member)
+        let valid = valid_members(
+            &master.network(),
+            std::slice::from_ref(&cert),
+            InviteTopology::OpenChain,
+        );
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].member, carol.pubkey());
+    }
+
+    #[test]
+    fn cert_minted_after_grant_expiry_is_rejected() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let carol = MemberKey::from_seed(&[9u8; 32]);
+        let grant = master.grant([7u8; 16], 1, at(), at()); // expires_at == at()
+        let cert = carol.self_cert(grant, 5, "carol", at() + 1); // minted 1ms too late
+        let valid = valid_members(
+            &master.network(),
+            std::slice::from_ref(&cert),
+            InviteTopology::OpenChain,
+        );
+        assert!(valid.is_empty());
+    }
+
+    #[test]
+    fn forged_grant_signature_is_rejected() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let carol = MemberKey::from_seed(&[9u8; 32]);
+        let mut grant = master.grant([7u8; 16], 1, at() + 600_000, at());
+        grant.sig[0] ^= 0xff; // tamper
+        let cert = carol.self_cert(grant, 5, "carol", at());
+        let valid = valid_members(
+            &master.network(),
+            std::slice::from_ref(&cert),
+            InviteTopology::OpenChain,
+        );
+        assert!(valid.is_empty());
+    }
+
+    #[test]
+    fn openchain_member_grant_needs_a_rooted_issuer_and_mastergated_refuses_it() {
+        let master = MasterKey::from_seed(&[1u8; 32]);
+        let net = master.network();
+        let alice = MemberKey::from_seed(&[2u8; 32]);
+        let dave = MemberKey::from_seed(&[4u8; 32]);
+        let c_alice = master.issue(alice.pubkey(), 1, "alice", at());
+        // alice (a rooted member) issues a grant; dave self-registers under it.
+        let grant = alice.grant(net, [3u8; 16], 1, at() + 600_000, at());
+        let c_dave = dave.self_cert(grant, 2, "dave", at());
+        let certs = vec![c_alice.clone(), c_dave.clone()];
+        // OpenChain: alice is rooted → her grant authorizes dave.
+        let open: HashSet<PubKey> = valid_members(&net, &certs, InviteTopology::OpenChain)
+            .iter()
+            .map(|c| c.member)
+            .collect();
+        assert!(open.contains(&dave.pubkey()));
+        // MasterGated: only the master may invite/grant → dave's member-granted cert is refused.
+        let gated: HashSet<PubKey> = valid_members(&net, &certs, InviteTopology::MasterGated)
+            .iter()
+            .map(|c| c.member)
+            .collect();
+        assert!(gated.contains(&alice.pubkey()));
+        assert!(!gated.contains(&dave.pubkey()));
     }
 }
