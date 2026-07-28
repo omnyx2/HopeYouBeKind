@@ -580,7 +580,7 @@ el("join-do")?.addEventListener("click", async () => {
   const blob = decodeInvite(el("join-invite").value);
   if (!blob) return toast("invalid invite code");
   try {
-    const r = await meshd({ JoinMesh: { invite: blob, algo: el("join-algo")?.value || null } });
+    const r = await meshd({ JoinMesh: { invite: blob, algo: el("join-algo")?.value || null, name: el("join-name")?.value?.trim() || null } });
     el("join-invite").value = "";
     toast(`joined mesh #${r.MeshCreated.mesh}`);
     CURRENT_MESH = r.MeshCreated.mesh;
@@ -728,36 +728,83 @@ async function renderOverview(id) {
 function inviteCardHtml() {
   return `<div class="card">
     <div class="card-head"><h2 class="card-title">Invite a member</h2></div>
-    <p class="muted small">Paste the joiner's <b>join code</b> + a name → get an <b>invite code</b> to send back.</p>
     <div class="add-row">
-      <input id="ov-inv-name" placeholder="their name in this mesh" />
+      <label class="muted small" style="display:flex;align-items:center;gap:6px">type
+        <select id="ov-inv-mode" class="select">
+          <option value="secure">Secure (verify device)</option>
+          <option value="quick">Quick code (single use)</option>
+          <option value="link">Invite link (N people)</option>
+        </select>
+      </label>
       <label class="muted small" style="display:flex;align-items:center;gap:6px">algorithm
         <select id="ov-inv-algo" class="select">${optList(INVITE_ALGOS, INVITE_ALGOS[0])}</select>
       </label>
     </div>
+    <p id="ov-inv-hint" class="muted small" style="margin-top:6px"></p>
+    <input id="ov-inv-name" placeholder="their name in this mesh" style="margin-top:6px" />
     <textarea id="ov-inv-code" class="code" rows="2" placeholder="paste their join code" style="margin-top:8px"></textarea>
+    <div id="ov-inv-link-opts" class="add-row hidden" style="margin-top:8px">
+      <input id="ov-inv-max" type="number" min="1" value="5" style="width:80px" title="how many people" />
+      <input id="ov-inv-expire" value="1h" style="width:90px" title="expiry, e.g. 10m 1h 1d" />
+    </div>
     <div class="add-row" style="margin-top:8px"><button class="small-btn" id="ov-invite">create invite</button></div>
     <div id="ov-inv-out" class="hidden" style="margin-top:10px">
-      <p class="muted small">Invite code — send it back to them:</p>
+      <p class="muted small">Invite code — send it to them:</p>
       <textarea id="ov-inv-result" class="code" readonly rows="3"></textarea>
       <button class="small-btn" id="ov-inv-copy">Copy</button>
       <p class="small" style="color:#e0a020;margin-top:8px">Tell them the algorithm <b id="ov-inv-algo-out" class="mono"></b> — over a <i>different</i> channel than the code.</p>
     </div>
   </div>`;
 }
+// Duration string → seconds ('600' | '10m' | '2h' | '1d').
+function parseDur(s) {
+  s = String(s || "").trim().toLowerCase();
+  const m = { s: 1, m: 60, h: 3600, d: 86400 };
+  const last = s.slice(-1);
+  return last in m ? Math.round(parseFloat(s) * m[last]) : parseInt(s, 10);
+}
 function wireInviteCard(id) {
+  const mode = () => el("ov-inv-mode").value;
+  const applyMode = () => {
+    const m = mode();
+    el("ov-inv-code").classList.toggle("hidden", m !== "secure");
+    el("ov-inv-link-opts").classList.toggle("hidden", m !== "link");
+    el("ov-inv-name").placeholder = m === "secure" ? "their name in this mesh"
+      : m === "quick" ? "their name (optional)" : "not used for a link";
+    el("ov-inv-name").classList.toggle("hidden", m === "link");
+    el("ov-inv-hint").textContent = m === "secure"
+      ? "Paste the joiner's join code (from their `lattice id`) + a name. Strongest: bound to their device."
+      : m === "quick"
+      ? "One bearer code, no join code needed — they just paste it to join. Single use, ~10 min."
+      : "A link up to N people can join with (until it expires). Bearer — anyone with it can join.";
+  };
+  el("ov-inv-mode").onchange = applyMode;
+  applyMode();
   el("ov-invite").onclick = async () => {
-    const name = el("ov-inv-name").value.trim();
-    const ident = decodeIdentity(el("ov-inv-code").value);
     const algo = el("ov-inv-algo").value || null;
-    if (!name) return toast("name required");
-    if (!ident) return toast("invalid join code");
     try {
-      const r = await meshd({ CreateInvite: { mesh: id, name, member_pubkey_hex: ident.m, enc_pubkey_hex: ident.e, issued_at: ident.t || 0, algo } });
-      el("ov-inv-result").value = encodeInvite(r.Invite);
+      let wrapped;
+      if (mode() === "secure") {
+        const name = el("ov-inv-name").value.trim();
+        const ident = decodeIdentity(el("ov-inv-code").value);
+        if (!name) return toast("name required");
+        if (!ident) return toast("invalid join code");
+        const r = await meshd({ CreateInvite: { mesh: id, name, member_pubkey_hex: ident.m, enc_pubkey_hex: ident.e, issued_at: ident.t || 0, algo } });
+        wrapped = r.Invite;
+      } else {
+        const isLink = mode() === "link";
+        const max_uses = isLink ? Math.max(1, parseInt(el("ov-inv-max").value, 10) || 1) : 1;
+        const ttl_secs = isLink ? Math.max(1, parseDur(el("ov-inv-expire").value) || 3600) : 600;
+        const req = { CreateQuickInvite: { mesh: id, max_uses, ttl_secs, algo } };
+        const nm = el("ov-inv-name").value.trim();
+        if (nm && !isLink) req.CreateQuickInvite.name = nm;
+        const r = await meshd(req);
+        wrapped = r.Invite;
+      }
+      el("ov-inv-result").value = encodeInvite(wrapped);
       el("ov-inv-algo-out").textContent = algo || "(default)";
       el("ov-inv-out").classList.remove("hidden");
-      toast("invite created — send the code AND the algorithm");
+      toast("invite created");
     } catch (e) { toast(String(e)); }
   };
   el("ov-inv-copy").onclick = () => { navigator.clipboard.writeText(el("ov-inv-result").value); toast("copied"); };
