@@ -696,6 +696,40 @@ fn load_split(dir: &std::path::Path) -> Vec<dns_split::SplitRule> {
         .unwrap_or_default()
 }
 
+/// Persist WHICH mesh's split-tunnel is currently on (a separate file so `split.json`'s format is
+/// unchanged) so it survives a restart — otherwise a domain bypass silently drops off every reboot
+/// (the rules stay, but the on/off state was in-memory). `None` (split off) removes the file.
+fn persist_split_active(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    let f = dir.join("split-active.json");
+    let active: Option<MeshId> = st.split.as_ref().map(|s| s.mesh);
+    match active {
+        None => {
+            let _ = std::fs::remove_file(&f);
+        }
+        Some(_) => {
+            if let Ok(json) = serde_json::to_vec(&active) {
+                if std::fs::write(&f, &json).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The mesh whose split-tunnel was on at last persist (`None` = it was off). Re-enabled at startup.
+fn load_split_active(dir: &std::path::Path) -> Option<MeshId> {
+    std::fs::read(dir.join("split-active.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Option<MeshId>>(&b).ok())
+        .flatten()
+}
+
 /// Load the extension grants at startup (id → grant). Missing/corrupt file ⇒ empty.
 fn load_extensions(dir: &std::path::Path) -> HashMap<String, ExtensionGrant> {
     let f = extensions_file(dir);
@@ -1042,6 +1076,14 @@ async fn main() -> anyhow::Result<()> {
         persist(&state.lock().unwrap());
         for b in bringups {
             bringup_dataplane(b, Arc::clone(&state)).await;
+        }
+        // Re-enable split-tunnel if it was on before the restart (its data plane is up now). The
+        // rules already loaded; this restores the on/off state so a domain bypass survives a reboot.
+        if let Some(m) = load_split_active(dir) {
+            if state.lock().unwrap().meshes.contains_key(&m) {
+                split_enable(m, Arc::clone(&state)).await;
+                elog!("meshd: re-enabled split-tunnel for mesh {m} (persisted on/off state)");
+            }
         }
     }
     // P-D4: one LAN-discovery beacon for the whole node. Each round it snapshots the
@@ -2565,6 +2607,7 @@ async fn split_enable(mesh: MeshId, state: Arc<Mutex<State>>) {
         if !st.full_tunnel {
             st.current = Some(mesh);
         }
+        persist_split_active(&st); // survive restart (docs/SPLIT_TUNNEL.md)
     }
     elog!("meshd: split-tunnel ON for mesh {mesh} (upstream {upstream}, tun {tun})");
 }
@@ -2586,6 +2629,7 @@ async fn split_disable(state: Arc<Mutex<State>>) {
         if !st.full_tunnel {
             st.current = None;
         }
+        persist_split_active(&st); // clears the persisted "on" marker
         active
     };
     let Some(active) = active else { return };

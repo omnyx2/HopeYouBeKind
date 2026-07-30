@@ -23,4 +23,5 @@ Read docs/ERRORS.md blast-radius map before touching IPC enums (additive only!) 
 4. [x] Phase 4+5 CLI: invite --quick/--max/--expire, join --name, new --join secure — e2e offline OK
 4b. [x] GUI invite mode picker (secure/quick/link) + join name — builds (QR deferred)
 5. [x] OFFLINE verified: 72 unit tests + 2-node + 3-node CLI (bob/carol join, SecureOnly refuses quick, surplus-drop)
-6. [ ] LIVE fleet test (gossip propagation) + merge to main — REMAINING
+6. [x] WIRE-COMPAT fix (user caught it): grant off Cert → GrantCert + CTRL_QGRANT(0x09) append-only; Cert byte-identical, 72 tests + offline quick OK
+7. [ ] LIVE fleet test (CTRL_QGRANT propagation Oracle↔lablinux) + merge — REMAINING (Oracle rebuilding latest)
