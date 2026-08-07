@@ -170,7 +170,9 @@ def cmd_ls(sock, a):
             egress = "direct"
         exit_s = f"#{m['exit']}" if m.get("exit") is not None else "—"
         flag = " ⚠ATTACK" if m.get("attack_armed_secs_left") is not None else ""
-        print(f"{m['id']:>2}  {m['name']:<16} {m['members']:>7} {m['epoch']:>5}  "
+        star = "★" if m.get("is_default") else " "
+        name = f"{star}{m['name']}"
+        print(f"{m['id']:>2}  {name:<16} {m['members']:>7} {m['epoch']:>5}  "
               f"{exit_s:>5}  {egress}{flag}")
     if am is not None:
         nm = next((m["name"] for m in meshes if m["id"] == am), str(am))
@@ -216,11 +218,21 @@ def cmd_new(sock, a):
         "name": a.name, "my_name": a.me, "max_members": a.max,
         "cipher": a.cipher, "self_destruct": a.ephemeral,
         "master_gated": a.master_gated, "expel": a.expel, "header": a.header,
-        "exit_policy": a.exit_policy}}
+        "exit_policy": a.exit_policy, "join": a.join}}
     r = call(sock, req)
     mid = r["MeshCreated"]["mesh"]
     print(f"created mesh #{mid} '{a.name}' — you are '{a.me}'.")
-    print(f"invite someone: ask them for `lattice id`, then `lattice invite {a.name} <name> <id-code>`")
+    print(f"invite (quick):  lattice invite {a.name} --quick        # one code, no identity step")
+    print(f"invite (secure): ask them for `lattice id`, then `lattice invite {a.name} <name> <id-code>`")
+
+
+def _parse_duration(s):
+    """'600'|'600s'|'10m'|'2h'|'1d' → seconds."""
+    s = str(s).strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s and s[-1] in mult:
+        return int(float(s[:-1]) * mult[s[-1]])
+    return int(s)
 
 
 def cmd_id(sock, a):
@@ -233,6 +245,26 @@ def cmd_id(sock, a):
 
 def cmd_invite(sock, a):
     mid = resolve_mesh(sock, a.mesh)
+    # Quick (bearer) invite: no joiner identity code needed. One code → `lattice join`.
+    if a.quick or a.max is not None or a.expire is not None:
+        max_uses = a.max if a.max is not None else 1
+        ttl = _parse_duration(a.expire) if a.expire is not None else 600
+        req = {"CreateQuickInvite": {"mesh": mid, "max_uses": int(max_uses), "ttl_secs": int(ttl)}}
+        if a.name:
+            req["CreateQuickInvite"]["name"] = a.name
+        if a.algo:
+            req["CreateQuickInvite"]["algo"] = a.algo
+        inv = call(sock, req)["Invite"]
+        kind = f"reusable ×{max_uses}" if int(max_uses) > 1 else "single-use"
+        print(f"# QUICK invite code ({kind}, expires in {ttl}s) — send this ONE line to the joiner:",
+              file=sys.stderr)
+        print("# they just run:  lattice join <this-code>   (no `lattice id` needed)", file=sys.stderr)
+        if a.algo:
+            print(f"# invite-algorithm (out-of-band): {a.algo}", file=sys.stderr)
+        print(b64(inv))
+        return
+    if not a.id_code:
+        die("secure invite needs the joiner's identity code; or use --quick for a bearer code.")
     ident = unb64(read_code(a.id_code))
     # Accept BOTH the CLI/daemon form {member_pubkey_hex,...} AND the GUI short form
     # {m,e,t} so a GUI-minted identity code works in the CLI and vice versa.
@@ -258,9 +290,27 @@ def cmd_join(sock, a):
     req = {"JoinMesh": {"invite": inv}}
     if a.algo:
         req["JoinMesh"]["algo"] = a.algo
+    if getattr(a, "name", None):  # used only for a quick invite (no pre-assigned name)
+        req["JoinMesh"]["name"] = a.name
     r = call(sock, req)
     mid = r.get("MeshCreated", {}).get("mesh")
     print(f"joined mesh #{mid}. `lattice info {mid}` to see peers.")
+
+
+def cmd_default(sock, a):
+    # Set / show / clear the node's preferred DEFAULT mesh (a view hint; does NOT change routing).
+    if a.mesh is None:
+        meshes = call(sock, "ListMeshes").get("Meshes", [])
+        cur = next((m for m in meshes if m.get("is_default")), None)
+        print(f"default mesh: {('#%d %s' % (cur['id'], cur['name'])) if cur else 'none set'}")
+        return
+    if a.mesh in ("none", "off", "clear"):
+        call(sock, {"SetDefaultMesh": {"mesh": None}})
+        print("default mesh cleared.")
+        return
+    mid = resolve_mesh(sock, a.mesh)
+    call(sock, {"SetDefaultMesh": {"mesh": mid}})
+    print(f"default mesh set to #{mid} — the GUI/CLI will pre-select it. (View only; routing unchanged.)")
 
 
 def cmd_exit(sock, a):
@@ -913,22 +963,39 @@ def build_parser():
     s.add_argument("--exit-policy", default=None, dest="exit_policy",
                    help="exit egress when forwarding for others: isolate (default, real WAN, "
                         "no chains) | chain (follow the exit's full-tunnel — onion)")
+    s.add_argument("--join", default=None,
+                   help="lowest-strength join allowed: any (default, inviter picks per invite) | "
+                        "secure (forbid quick/bearer invites)")
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("id", help="mint an identity code to hand to a mesh host")
     s.set_defaults(fn=cmd_id)
 
-    s = sub.add_parser("invite", help="(host) mint an invite for a joiner's identity code")
+    s = sub.add_parser("invite", help="(host) mint an invite — secure (identity code) or --quick (bearer)")
     s.add_argument("mesh", help="mesh id or name")
-    s.add_argument("name", help="the joiner's in-mesh name")
-    s.add_argument("id_code", help="the joiner's identity code (from `lattice id`); '-' = read stdin")
+    s.add_argument("name", nargs="?", default=None,
+                   help="the joiner's in-mesh name (secure invite; optional for --quick)")
+    s.add_argument("id_code", nargs="?", default=None,
+                   help="secure: the joiner's identity code (`lattice id`); '-' = read stdin. Omit for --quick")
+    s.add_argument("--quick", action="store_true",
+                   help="bearer code: no identity step, joiner just runs `lattice join <code>`")
+    s.add_argument("--max", type=int, default=None,
+                   help="quick: how many may join with this code (default 1 = single-use; >1 = reusable link)")
+    s.add_argument("--expire", default=None,
+                   help="quick: code TTL, e.g. 600, 10m, 2h, 1d (default 10m)")
     s.add_argument("--algo", default=None, help="invite-wrap algorithm (secrecy; see `lattice algos`)")
     s.set_defaults(fn=cmd_invite)
 
-    s = sub.add_parser("join", help="join a mesh from an invite code")
+    s = sub.add_parser("join", help="join a mesh from an invite code (secure or quick)")
     s.add_argument("invite_code", help="the invite code (from the host's `lattice invite`); '-' = read stdin")
     s.add_argument("--algo", default=None, help="invite-wrap algorithm the host used")
+    s.add_argument("--name", default=None, help="your in-mesh name (quick invites only; default node-<id>)")
     s.set_defaults(fn=cmd_join)
+
+    s = sub.add_parser("default", help="set the preferred default mesh (GUI/CLI pre-selects it; view only, no routing)")
+    s.add_argument("mesh", nargs="?", default=None,
+                   help="mesh id or name to make default; 'none' to clear; omit to show current")
+    s.set_defaults(fn=cmd_default)
 
     s = sub.add_parser("exit", help="pick which member is the internet exit")
     s.add_argument("mesh", help="mesh id or name")

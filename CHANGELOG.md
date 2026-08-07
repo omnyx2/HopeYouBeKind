@@ -11,6 +11,34 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.13] — 2026-07-28
+
+### Added
+- **Default mesh** — pick a preferred mesh (`lattice default <mesh>`, or the GUI "set default"
+  button) and the GUI opens straight to it on start (★ in `lattice ls`). Persisted across restarts.
+  A view/selection hint only — it does NOT change routing (internet stays direct), matching the
+  "Default network = off" model.
+
+### Fixed
+- **A rootless meshd could wedge a node off the mesh (single-instance guard).** If a non-root meshd
+  (e.g. a leftover/manual instance) held the IPC socket, the systemd root daemon — the only one that
+  can create the TUN — deferred to it and exited, *after* orphaning a half-built data plane, so the
+  surviving owner had no overlay (took a Linux node silently offline). The guard now runs BEFORE any
+  data-plane bringup, and a root `DATA_PLANE` daemon takes the socket over from a non-root
+  (data-plane-less) owner instead of deferring.
+
+### Added
+- **Selectable mesh join modes — `secure` (default) + `quick` (bearer)** (docs/JOIN_MODES.md). The
+  strong key-bound flow (`lattice id` → `invite` → `join`) stays the default; `quick` adds a
+  one-round-trip bearer code with no identity ceremony: `lattice invite <mesh> --quick` (single-use,
+  10-min) or `--max N --expire 1h` for a reusable invite link, and `lattice join <code> [--name]`.
+  Admission is authorized by a signed `Grant` the joiner self-registers under, recorded as a
+  SEPARATE `GrantCert` (the classic `Cert`/`CTRL_ROSTER` wire format is untouched — quick members
+  gossip on a new append-only tag `CTRL_QGRANT` that old nodes ignore, so there is NO roster-gossip
+  skew). Convergent single-use: `grant_members` deterministically keeps only the earliest `max_uses`
+  per grant, so a leaked/reused code's surplus is evicted everywhere with no extra coordination. A
+  mesh created `--join secure` forbids quick invites. GUI invite screen gains a Secure / Quick / Link
+  picker. Fully wire-compatible with older nodes (they just don't see quick members).
 ## [0.7.12] — 2026-07-28
 
 ### Fixed

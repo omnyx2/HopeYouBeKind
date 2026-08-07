@@ -47,14 +47,14 @@ use lattice_mesh::ipc::{
 };
 use lattice_mesh::keydist::{seal_secret, EncKey};
 use lattice_mesh::membership::{
-    effective_members, valid_members, Cert, MasterKey, MemberKey, PubKey, Revocation,
+    effective_members, valid_members, Cert, GrantCert, MasterKey, MemberKey, PubKey, Revocation,
 };
 use lattice_mesh::registry::{self, ServiceEntry, ServiceRecord};
 use lattice_mesh::Mesh;
 use lattice_meshrun::{
     seed_links, DecryptFailStat, DecryptFails, Link, LoopCmd, LoopEvent, PeerLinks, Recipher,
     SharedEndpoint, SharedExit, SharedSplitRoutes, SharedTraffic, Traffic, CTRL_ALLCLEAR,
-    CTRL_ATTACK, CTRL_FLOWS, CTRL_REGISTRY, CTRL_REVOKE, CTRL_ROSTER,
+    CTRL_ATTACK, CTRL_FLOWS, CTRL_QGRANT, CTRL_REGISTRY, CTRL_REVOKE, CTRL_ROSTER,
 };
 use lattice_net::udp::UdpTransport;
 use lattice_proto::flow::FlowRule;
@@ -174,6 +174,10 @@ struct MeshState {
     /// `roster()` drops a member that carries one authorized under the charter's
     /// `ExpelPolicy` — this is what actually removes a member (re-cipher only denies keys).
     revocations: Vec<Revocation>,
+    /// Quick-invite membership records (docs/JOIN_MODES.md) — members that self-registered under a
+    /// signed `Grant`. Kept SEPARATE from `certs` so the classic cert roster wire format never
+    /// changes; gossiped on their own control channel and folded into `roster()` via `grant_members`.
+    grant_certs: Vec<GrantCert>,
     /// Member ids handed out in invites that have **not yet joined** (id, invitee pubkey,
     /// issued-at ms). Reserved so inviting several people in a row — before any of them
     /// connect and gossip back — assigns DISTINCT ids instead of all reusing the next free
@@ -254,7 +258,43 @@ impl MeshState {
     /// The effective roster (certs chaining to the master, minus authorized
     /// revocations), id-sorted.
     fn roster(&self) -> Vec<Cert> {
-        let mut v: Vec<Cert> = effective_members(
+        let master = self.mesh.charter.master_pubkey;
+        let cert_valid = effective_members(
+            &master,
+            &self.certs,
+            self.topology(),
+            &self.revocations,
+            self.mesh.charter.expel,
+        );
+        let mut v: Vec<Cert> = cert_valid.iter().map(|c| (*c).clone()).collect();
+        // Fold in quick-invite members (a separate record set) as synthetic cert rows so every
+        // existing roster consumer sees them uniformly (docs/JOIN_MODES.md). They chain to the
+        // master via their grant, validated by `grant_members`.
+        for q in lattice_mesh::membership::grant_members(
+            &master,
+            &cert_valid,
+            &self.grant_certs,
+            self.topology(),
+        ) {
+            v.push(Cert {
+                network: master,
+                member: q.member,
+                id: q.id,
+                name: q.name.clone(),
+                inviter: q.member, // self-registered
+                issued_at: q.issued_at,
+                sig: q.sig,
+            });
+        }
+        // A cert member wins over a quick member on an id clash (certs were pushed first; stable).
+        v.sort_by_key(|c| c.id);
+        v.dedup_by_key(|c| c.id);
+        v
+    }
+    /// The classic-cert roster only (NO synthetic quick-member rows) — what `CTRL_ROSTER` gossips,
+    /// so the wire stays byte-identical to older nodes. Quick members ride `CTRL_QGRANT` instead.
+    fn cert_roster(&self) -> Vec<Cert> {
+        effective_members(
             &self.mesh.charter.master_pubkey,
             &self.certs,
             self.topology(),
@@ -263,9 +303,7 @@ impl MeshState {
         )
         .into_iter()
         .cloned()
-        .collect();
-        v.sort_by_key(|c| c.id);
-        v
+        .collect()
     }
     /// This node's in-mesh id (from its own cert).
     fn my_id(&self) -> MemberId {
@@ -290,6 +328,11 @@ struct State {
     /// The network-change re-route + shutdown restore key off THIS, not `current.is_some()`, so a
     /// split selection never accidentally diverts the default route.
     full_tunnel: bool,
+    /// The node's preferred "default" mesh (docs-only UX): the mesh the GUI/CLI pre-selects and
+    /// shows first on startup. PERSISTED (survives restart) and purely a view/selection hint — it
+    /// does NOT change routing (unlike `current`), so it can safely persist without any DNS/route
+    /// side effects. `None` = no default set.
+    default_mesh: Option<MeshId>,
     /// Whether to spawn data-plane loops (`DATA_PLANE=1`).
     data_plane: bool,
     /// Freshly minted identities (member + enc keypair) awaiting an invite, keyed
@@ -475,6 +518,9 @@ struct PersistedMesh {
     /// Signed expulsions (P-revoke). `#[serde(default)]` so older state files load.
     #[serde(default)]
     revocations: Vec<Revocation>,
+    /// Quick-invite membership records (docs/JOIN_MODES.md). `#[serde(default)]` so older files load.
+    #[serde(default)]
+    grant_certs: Vec<GrantCert>,
     /// SDN flow table + version (docs/FLOW_TABLE.md). `#[serde(default)]` so older state
     /// files load; an empty table is treated as the default at restore.
     #[serde(default)]
@@ -534,6 +580,7 @@ fn to_persisted(ms: &MeshState) -> PersistedMesh {
         charter: ms.mesh.charter.clone(),
         certs: ms.certs.clone(),
         revocations: ms.revocations.clone(),
+        grant_certs: ms.grant_certs.clone(),
         flows: ms.flows.clone(),
         flow_version: ms.flow_version,
         secret: ms.secret,
@@ -654,6 +701,64 @@ fn load_split(dir: &std::path::Path) -> Vec<dns_split::SplitRule> {
         .unwrap_or_default()
 }
 
+/// Persist WHICH mesh's split-tunnel is currently on (a separate file so `split.json`'s format is
+/// unchanged) so it survives a restart — otherwise a domain bypass silently drops off every reboot
+/// (the rules stay, but the on/off state was in-memory). `None` (split off) removes the file.
+fn persist_split_active(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    let f = dir.join("split-active.json");
+    let active: Option<MeshId> = st.split.as_ref().map(|s| s.mesh);
+    match active {
+        None => {
+            let _ = std::fs::remove_file(&f);
+        }
+        Some(_) => {
+            if let Ok(json) = serde_json::to_vec(&active) {
+                if std::fs::write(&f, &json).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The mesh whose split-tunnel was on at last persist (`None` = it was off). Re-enabled at startup.
+fn load_split_active(dir: &std::path::Path) -> Option<MeshId> {
+    std::fs::read(dir.join("split-active.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Option<MeshId>>(&b).ok())
+        .flatten()
+}
+
+/// Persist the node's preferred default mesh (a view/selection hint; no routing). `None` removes it.
+fn persist_default_mesh(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    let f = dir.join("default-mesh.json");
+    match st.default_mesh {
+        None => {
+            let _ = std::fs::remove_file(&f);
+        }
+        Some(_) => {
+            if let Ok(json) = serde_json::to_vec(&st.default_mesh) {
+                let _ = std::fs::write(&f, &json);
+            }
+        }
+    }
+}
+
+/// The node's preferred default mesh at startup (`None` = unset). Loaded once; safe (no routing).
+fn load_default_mesh(dir: &std::path::Path) -> Option<MeshId> {
+    std::fs::read(dir.join("default-mesh.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Option<MeshId>>(&b).ok())
+        .flatten()
+}
+
 /// Load the extension grants at startup (id → grant). Missing/corrupt file ⇒ empty.
 fn load_extensions(dir: &std::path::Path) -> HashMap<String, ExtensionGrant> {
     let f = extensions_file(dir);
@@ -740,6 +845,7 @@ fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         my_enc,
         certs: p.certs,
         revocations: p.revocations,
+        grant_certs: p.grant_certs,
         invited: Vec::new(),
         secret: p.secret,
         links,
@@ -910,6 +1016,14 @@ async fn main() -> anyhow::Result<()> {
     // env-through-elevation quoting that left meshd not starting at all).
     let data_plane = matches!(std::env::var("DATA_PLANE").as_deref(), Ok("1"))
         || std::env::args().any(|a| a == "--data-plane");
+    // Single-instance guard, run BEFORE any data-plane bringup: if a healthy meshd already owns the
+    // socket, exit now (a deferring start must never create — then orphan — a TUN). A root
+    // data-plane daemon takes the socket over from a rootless (data-plane-less) owner instead.
+    #[cfg(unix)]
+    if should_defer_to_socket_owner(&socket, data_plane) {
+        elog!("meshd: another meshd already owns {socket} — deferring to it, exiting (no second instance)");
+        return Ok(());
+    }
     let pdir = persist_dir();
     {
         let mut st = state.lock().unwrap();
@@ -927,6 +1041,7 @@ async fn main() -> anyhow::Result<()> {
                     st.split_rules.len()
                 );
             }
+            st.default_mesh = load_default_mesh(dir);
             st.extensions = load_extensions(dir);
             if !st.extensions.is_empty() {
                 elog!("meshd: loaded {} extension grant(s)", st.extensions.len());
@@ -999,6 +1114,14 @@ async fn main() -> anyhow::Result<()> {
         persist(&state.lock().unwrap());
         for b in bringups {
             bringup_dataplane(b, Arc::clone(&state)).await;
+        }
+        // Re-enable split-tunnel if it was on before the restart (its data plane is up now). The
+        // rules already loaded; this restores the on/off state so a domain bypass survives a reboot.
+        if let Some(m) = load_split_active(dir) {
+            if state.lock().unwrap().meshes.contains_key(&m) {
+                split_enable(m, Arc::clone(&state)).await;
+                elog!("meshd: re-enabled split-tunnel for mesh {m} (persisted on/off state)");
+            }
         }
     }
     // P-D4: one LAN-discovery beacon for the whole node. Each round it snapshots the
@@ -1076,23 +1199,42 @@ async fn main() -> anyhow::Result<()> {
     accept_loop(&socket, state).await
 }
 
+/// Should a starting meshd DEFER to whoever already owns the IPC `socket` (and exit), or TAKE IT
+/// OVER? Deferring is right when a healthy peer is serving — stealing its socket would orphan its
+/// TUN + leave its data-plane UDP ports bound (`Address already in use`). BUT a **rootless** owner
+/// can't create a TUN at all, so it has NO data plane and would block a real (root, `DATA_PLANE`)
+/// daemon forever — the exact wedge that took lablinux off the mesh (docs/ERRORS.md). So: defer to a
+/// live owner UNLESS we are a root data-plane daemon and the owner is a non-root (data-plane-less)
+/// instance, in which case we take the socket over. Returns `true` = defer + exit.
+#[cfg(unix)]
+fn should_defer_to_socket_owner(socket: &str, data_plane: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if std::os::unix::net::UnixStream::connect(socket).is_err() {
+        return false; // no live owner (missing/stale file) — take over
+    }
+    let we_can_serve = data_plane && unsafe { libc::geteuid() } == 0;
+    let owner_is_rootless = std::fs::metadata(socket).map(|m| m.uid()).unwrap_or(0) != 0;
+    !(we_can_serve && owner_is_rootless)
+}
+
 /// Accept IPC connections forever. The transport is platform-specific (unix socket
 /// vs named pipe) but the per-connection protocol ([`serve_conn`]) is shared.
 #[cfg(unix)]
 /// 🟡 IPC accept loop (unix socket): bind, then for each connection check [`peer_allowed`] and
 /// spawn [`serve_conn`]. Includes the single-instance / stale-socket handling.
 async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
-    // Single-instance guard. Blindly `remove_file` + re-`bind` would steal the socket
-    // from a meshd that is ALREADY running — but that old instance keeps its TUNs and
-    // its already-bound data-plane UDP ports, turning into a zombie that blocks the new
-    // instance's data plane (`Address already in use`) while the GUI unknowingly talks
-    // to whichever won the socket. So: if a live meshd answers on this path, defer to it
-    // and exit cleanly instead of orphaning it.
-    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+    // Single-instance guard (see `should_defer_to_socket_owner`). Blindly `remove_file` + re-`bind`
+    // would steal the socket from a HEALTHY meshd — orphaning its TUN and leaving its data-plane UDP
+    // ports bound (`Address already in use`). So defer to a live owner — UNLESS we're a root
+    // data-plane daemon and the owner is a rootless (data-plane-less) instance that would block us
+    // forever, in which case we take it over. (main() already ran this check before bringup; repeated
+    // here to close the start↔bind race and for the macOS/no-data-plane path.)
+    let data_plane = state.lock().unwrap().data_plane;
+    if should_defer_to_socket_owner(socket, data_plane) {
         elog!("meshd: another meshd already owns {socket} — deferring to it, exiting (no second instance)");
         return Ok(());
     }
-    // No live owner: a leftover socket file is stale — safe to remove and take over.
+    // Either no live owner (stale file) or a rootless owner we're superseding — remove + take over.
     let _ = std::fs::remove_file(socket);
     let listener = tokio::net::UnixListener::bind(socket)?;
     // meshd runs as root (for the TUN) but the desktop app connects as the logged-in
@@ -1966,6 +2108,34 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
                         }
                     }
                 }
+                // A peer gossiped quick-invite members (self-registered under a Grant) — merge any
+                // new record for THIS mesh; `roster()` re-validates via `grant_members`, so an
+                // invalid/surplus one simply never counts (docs/JOIN_MODES.md).
+                LoopEvent::Quick(bytes) => {
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = bincode::deserialize::<Vec<GrantCert>>(&bytes) {
+                            let net = ms.mesh.charter.master_pubkey;
+                            let before = ms.roster().len();
+                            for q in incoming {
+                                if ms.grant_certs.len() >= MAX_ROSTER_CERTS {
+                                    break;
+                                }
+                                if q.grant.network == net
+                                    && !ms
+                                        .grant_certs
+                                        .iter()
+                                        .any(|h| h.member == q.member && h.id == q.id)
+                                {
+                                    ms.grant_certs.push(q);
+                                }
+                            }
+                            if ms.roster().len() > before {
+                                persist_after = true;
+                                emit_peer = true;
+                            }
+                        }
+                    }
+                }
             }
             if persist_after {
                 persist(&state);
@@ -2023,8 +2193,9 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
                         if peers.is_empty() {
                             return out;
                         }
-                        // Roster (signed certs) — converges membership across the mesh.
-                        let certs = ms.roster();
+                        // Roster (signed certs) — converges membership across the mesh. Cert-only
+                        // (no synthetic quick rows) so the wire is byte-identical to older nodes.
+                        let certs = ms.cert_roster();
                         if certs.len() >= 2 {
                             if let Ok(body) = bincode::serialize(&certs) {
                                 out.push((CTRL_ROSTER, body, peers.clone(), tx.clone()));
@@ -2034,6 +2205,13 @@ fn spawn_roster_gossip(state: Arc<Mutex<State>>) {
                         if !ms.revocations.is_empty() {
                             if let Ok(body) = bincode::serialize(&ms.revocations) {
                                 out.push((CTRL_REVOKE, body, peers.clone(), tx.clone()));
+                            }
+                        }
+                        // Quick-invite members (self-registered under a Grant) — a SEPARATE channel
+                        // (CTRL_QGRANT); old nodes ignore it, keeping the classic roster untouched.
+                        if !ms.grant_certs.is_empty() {
+                            if let Ok(body) = bincode::serialize(&ms.grant_certs) {
+                                out.push((CTRL_QGRANT, body, peers.clone(), tx.clone()));
                             }
                         }
                         // SDN flow table — only once edited away from the default (version > 0);
@@ -2486,6 +2664,7 @@ async fn split_enable(mesh: MeshId, state: Arc<Mutex<State>>) {
         if !st.full_tunnel {
             st.current = Some(mesh);
         }
+        persist_split_active(&st); // survive restart (docs/SPLIT_TUNNEL.md)
     }
     elog!("meshd: split-tunnel ON for mesh {mesh} (upstream {upstream}, tun {tun})");
 }
@@ -2507,6 +2686,7 @@ async fn split_disable(state: Arc<Mutex<State>>) {
         if !st.full_tunnel {
             st.current = None;
         }
+        persist_split_active(&st); // clears the persisted "on" marker
         active
     };
     let Some(active) = active else { return };
@@ -2571,6 +2751,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             expel,
             header,
             exit_policy,
+            join,
         } => create_mesh(
             st,
             name,
@@ -2582,6 +2763,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             expel,
             header,
             exit_policy,
+            join,
         ),
 
         Request::ExpelMember { mesh, member } => expel_member(st, mesh, member),
@@ -2707,6 +2889,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
         }
         Request::ListMeshes => {
             let cur = st.current;
+            let def = st.default_mesh;
             let now = now_ms();
             let mut meshes: Vec<MeshSummary> = st
                 .meshes
@@ -2723,6 +2906,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                         ATTACK_GRACE_SECS.saturating_sub(now.saturating_sub(armed) / 1000)
                     }),
                     is_creator: ms.master.is_some(),
+                    is_default: def == Some(ms.mesh.id),
                 })
                 .collect();
             meshes.sort_by_key(|s| s.id);
@@ -2831,6 +3015,18 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     (Response::Ok, None)
                 }
                 None => (no_mesh(mesh), None),
+            }
+        }
+
+        Request::SetDefaultMesh { mesh } => {
+            // A persisted view/selection hint only — does NOT change routing (unlike SetCurrent).
+            match mesh {
+                Some(id) if !st.meshes.contains_key(&id) => (no_mesh(id), None),
+                _ => {
+                    st.default_mesh = mesh;
+                    persist_default_mesh(st);
+                    (Response::Ok, None)
+                }
             }
         }
 
@@ -3233,7 +3429,98 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             )
         }
 
-        Request::JoinMesh { invite, algo } => {
+        Request::CreateQuickInvite {
+            mesh,
+            name: _name,
+            max_uses,
+            ttl_secs,
+            algo,
+        } => {
+            let algo = algo.unwrap_or_else(|| lattice_mesh::invitewrap::DEFAULT_ALGO.to_string());
+            if !lattice_mesh::invitewrap::is_known_algo(&algo) {
+                return (err(&format!("unknown invite algorithm '{algo}'")), None);
+            }
+            if max_uses == 0 {
+                return (err("max_uses must be at least 1"), None);
+            }
+            let ms = match st.meshes.get_mut(&mesh) {
+                Some(m) => m,
+                None => return (no_mesh(mesh), None),
+            };
+            // Charter floor: a mesh created `SecureOnly` refuses quick (bearer) invites so a member
+            // can't weaken it (docs/JOIN_MODES.md §7).
+            if ms.mesh.charter.join_floor == lattice_mesh::charter::JoinFloor::SecureOnly {
+                return (
+                    err("this mesh only allows secure invites (created with --join secure)"),
+                    None,
+                );
+            }
+            // Same "who may invite" gate as CreateInvite: master, or a verified member in OpenChain.
+            let roster = ms.roster();
+            if ms.master.is_none() {
+                if ms.mesh.charter.invite != InviteTopology::OpenChain {
+                    return (
+                        err("only the mesh creator can invite in a master-gated mesh"),
+                        None,
+                    );
+                }
+                if !roster.iter().any(|c| c.member == ms.my_key.pubkey()) {
+                    return (
+                        err("you must be a verified member of this mesh to invite"),
+                        None,
+                    );
+                }
+            }
+            let grant_id: [u8; 16] = rand::random();
+            let expires_at = now_ms().saturating_add(ttl_secs.saturating_mul(1000));
+            // Issue the grant: master-signed if we're the creator, else an OpenChain member grant.
+            let grant = match ms.master.as_ref() {
+                Some(m) => m.grant(grant_id, max_uses, expires_at, now_ms()),
+                None => ms.my_key.grant(
+                    ms.mesh.charter.master_pubkey,
+                    grant_id,
+                    max_uses,
+                    expires_at,
+                    now_ms(),
+                ),
+            };
+            // Bootstrap endpoints (P-D1), same as CreateInvite.
+            let mut endpoints: Vec<(MemberId, String)> = Vec::new();
+            if let Some(ep) = *ms.my_endpoint.lock().unwrap() {
+                endpoints.push((ms.my_id(), ep.to_string()));
+            }
+            for (m, link) in ms.links.lock().unwrap().iter() {
+                endpoints.push((*m, link.endpoint.to_string()));
+            }
+            let blob = lattice_mesh::ipc::QuickInviteBlob {
+                mesh_id: ms.mesh.id,
+                mesh_name: ms.mesh.name.clone(),
+                charter: ms.mesh.charter.clone(),
+                grant,
+                secret: ms.secret, // RAW (bearer) — see docs/JOIN_MODES.md §4
+                epoch: ms.epoch,
+                cipher: ms.cipher.clone(),
+                certs: ms.certs.clone(),
+                grant_certs: ms.grant_certs.clone(),
+                endpoints,
+            };
+            // Tag the plaintext so `join` can tell a quick blob from a classic one, then wrap it with
+            // the exact same P-C6 machinery.
+            let mut plain = lattice_mesh::ipc::QUICK_TAG.to_vec();
+            match serde_json::to_vec(&blob) {
+                Ok(b) => plain.extend_from_slice(&b),
+                Err(e) => return (err(&format!("serialize quick invite: {e}")), None),
+            }
+            let salt: [u8; 32] = rand::random();
+            let n: u32 = rand::random();
+            let ct = lattice_mesh::invitewrap::wrap(&algo, &salt, n, &plain);
+            (
+                Response::Invite(lattice_mesh::ipc::WrappedInvite { salt, n, ct }),
+                None,
+            )
+        }
+
+        Request::JoinMesh { invite, algo, name } => {
             // P-C6: unwrap with the out-of-band algorithm before installing.
             let algo = algo.unwrap_or_else(|| lattice_mesh::invitewrap::DEFAULT_ALGO.to_string());
             let plain =
@@ -3246,9 +3533,17 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                         )
                     }
                 };
-            match serde_json::from_slice::<InviteBlob>(&plain) {
-                Ok(blob) => join_mesh(st, blob),
-                Err(e) => (err(&format!("bad invite contents: {e}")), None),
+            // A quick (bearer) invite is tagged; a classic one is raw JSON (docs/JOIN_MODES.md §4).
+            if let Some(body) = plain.strip_prefix(lattice_mesh::ipc::QUICK_TAG) {
+                match serde_json::from_slice::<lattice_mesh::ipc::QuickInviteBlob>(body) {
+                    Ok(blob) => join_quick(st, blob, name),
+                    Err(e) => (err(&format!("bad quick-invite contents: {e}")), None),
+                }
+            } else {
+                match serde_json::from_slice::<InviteBlob>(&plain) {
+                    Ok(blob) => join_mesh(st, blob),
+                    Err(e) => (err(&format!("bad invite contents: {e}")), None),
+                }
             }
         }
 
@@ -3359,6 +3654,7 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             my_enc,
             certs: invite.certs,
             revocations: Vec::new(),
+            grant_certs: Vec::new(),
             invited: Vec::new(),
             secret,
             links,
@@ -3396,6 +3692,159 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
     )
 }
 
+/// **RISK 🟡 MED** — install a mesh from a QUICK (bearer) invite (docs/JOIN_MODES.md): no pending
+/// identity, no sealed secret. We generate a fresh key, self-issue a cert authorized by the invite's
+/// signed [`Grant`], adopt the RAW secret, and bring up the data plane. `wanted_name` is the joiner's
+/// chosen name (`None` ⇒ `node-<id>`).
+fn join_quick(
+    st: &mut State,
+    blob: lattice_mesh::ipc::QuickInviteBlob,
+    wanted_name: Option<String>,
+) -> (Response, Option<PostAction>) {
+    if st.meshes.contains_key(&blob.mesh_id) {
+        return (err(&format!("already in mesh {}", blob.mesh_id)), None);
+    }
+    let master = blob.charter.master_pubkey;
+    // Validate the grant: right network, valid signature, not expired, and its issuer is the master
+    // or a verified member of the roster carried in the blob.
+    if blob.grant.network != master || !blob.grant.sig_ok() {
+        return (err("quick invite: grant is invalid"), None);
+    }
+    if now_ms() >= blob.grant.expires_at {
+        return (err("quick invite has expired — ask for a fresh code"), None);
+    }
+    let roster = valid_members(&master, &blob.certs, blob.charter.invite);
+    let issuer_ok =
+        blob.grant.issuer == master || roster.iter().any(|c| c.member == blob.grant.issuer);
+    if !issuer_ok {
+        return (
+            err("quick invite: grant issuer is not an authorized member"),
+            None,
+        );
+    }
+    // Pick the lowest free member id we can see (races on a reusable code converge later, §6).
+    let mut used: HashSet<MemberId> = blob.certs.iter().map(|c| c.id).collect();
+    used.extend(blob.grant_certs.iter().map(|q| q.id));
+    let id = match (1u8..=254).find(|i| !used.contains(i)) {
+        Some(i) => i,
+        None => return (err("mesh is full (no free member id)"), None),
+    };
+    let name = wanted_name.unwrap_or_else(|| format!("node-{id}"));
+    // Generate our own identity (no NewIdentity ceremony) and self-register as a separate GrantCert
+    // (kept OUT of `certs` so the classic roster wire format is untouched — docs/JOIN_MODES.md).
+    let my_key = MemberKey::generate();
+    let my_enc = EncKey::generate();
+    let my_qcert = my_key.grant_cert(blob.grant.clone(), id, &name, now_ms());
+    let certs = blob.certs.clone();
+    let mut grant_certs = blob.grant_certs.clone();
+    grant_certs.push(my_qcert);
+    // Confirm our self-registration validates under the grant.
+    let cert_valid = valid_members(&master, &certs, blob.charter.invite);
+    let ok = lattice_mesh::membership::grant_members(
+        &master,
+        &cert_valid,
+        &grant_certs,
+        blob.charter.invite,
+    )
+    .iter()
+    .any(|q| q.member == my_key.pubkey());
+    if !ok {
+        return (
+            err("quick invite: our self-registration does not validate under the grant"),
+            None,
+        );
+    }
+    let secret = blob.secret; // RAW bearer secret
+    let prefix = blob.charter.overlay_prefix;
+    let cipher = if blob.cipher.is_empty() {
+        blob.charter.initial_cipher.clone()
+    } else {
+        blob.cipher.clone()
+    };
+    let epoch = blob.epoch;
+    let mut seed: HashMap<MemberId, SocketAddr> = HashMap::new();
+    for (m, ep) in &blob.endpoints {
+        if *m == id {
+            continue;
+        }
+        if let Ok(addr) = ep.parse() {
+            seed.insert(*m, addr);
+        }
+    }
+    let links = seed_links(seed);
+    let exit_sel: SharedExit = Arc::new(Mutex::new(None));
+    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
+    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
+    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
+    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
+    let mut mesh = Mesh::new(
+        blob.mesh_id,
+        blob.mesh_name.clone(),
+        blob.charter.clone(),
+        id,
+    );
+    mesh.epoch = epoch;
+    let bringup = st.data_plane.then(|| Bringup {
+        mesh_id: blob.mesh_id,
+        my_id: id,
+        prefix,
+        secret,
+        cipher: cipher.clone(),
+        epoch,
+        links: Arc::clone(&links),
+        exit_sel: Arc::clone(&exit_sel),
+        split_routes: Arc::clone(&split_routes),
+        my_endpoint: Arc::clone(&my_endpoint),
+        decrypt_fails: Arc::clone(&decrypt_fails),
+        traffic: Arc::clone(&traffic),
+        header_placement: mesh.charter.header_placement,
+        flows: lattice_proto::flow::default_table(),
+    });
+    st.meshes.insert(
+        blob.mesh_id,
+        MeshState {
+            mesh,
+            master: None,
+            my_key,
+            my_enc,
+            certs,
+            revocations: Vec::new(),
+            grant_certs,
+            invited: Vec::new(),
+            secret,
+            links,
+            exit_sel,
+            split_routes,
+            exitable: false,
+            tun_name: None,
+            my_endpoint,
+            dp_port: 0,
+            dp_error: None,
+            dp_task: None,
+            cipher,
+            epoch,
+            loop_cmd: None,
+            attack_armed_at: None,
+            decrypt_fails,
+            traffic,
+            flows: lattice_proto::flow::default_table(),
+            flow_version: 0,
+            services: Vec::new(),
+            service_seq: 0,
+        },
+    );
+    emit(
+        st,
+        "peer",
+        Some(blob.mesh_id),
+        serde_json::json!({ "kind": "mesh_added", "mesh": blob.mesh_id }),
+    );
+    (
+        Response::MeshCreated { mesh: blob.mesh_id },
+        bringup.map(PostAction::Bringup),
+    )
+}
+
 /// **RISK 🟡 MED** — genesis a brand-new mesh (master keypair, charter, self as first member) and
 /// persist it; returns a `Bringup` PostAction. Mesh-lifecycle correctness.
 fn create_mesh(
@@ -3409,7 +3858,16 @@ fn create_mesh(
     expel: Option<String>,
     header: Option<String>,
     exit_policy: Option<String>,
+    join: Option<String>,
 ) -> (Response, Option<PostAction>) {
+    // Lowest-strength join method this mesh accepts (docs/JOIN_MODES.md §7): `secure` locks out
+    // quick (bearer) invites; anything else (default) allows the inviter to choose per invite.
+    let join_floor = match join.as_deref() {
+        Some("secure") | Some("secure-only") | Some("secureonly") => {
+            lattice_mesh::charter::JoinFloor::SecureOnly
+        }
+        _ => lattice_mesh::charter::JoinFloor::Any,
+    };
     // The mesh id is the real key, but a human picks a mesh by NAME and the GUI lists
     // meshes by name — so two same-named meshes render as indistinguishable "peer" rows
     // and any name-based lookup becomes ambiguous. Keep names non-empty + unique on this
@@ -3483,6 +3941,7 @@ fn create_mesh(
         expel,
         header_placement,
         exit_policy,
+        join_floor, // docs/JOIN_MODES.md §7 (plumbed from CreateMesh in phase 4)
     };
     if let Err(e) = charter.validate() {
         return (err(&e.to_string()), None);
@@ -3527,6 +3986,7 @@ fn create_mesh(
             my_enc,
             certs: vec![cert],
             revocations: Vec::new(),
+            grant_certs: Vec::new(),
             invited: Vec::new(),
             secret,
             links,

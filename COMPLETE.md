@@ -5,6 +5,25 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## v0.7.13 정식 롤아웃 (fleet 전부 dab561f) + join-modes 라이브 검증 (2026-08-07)
+
+v0.7.13 = extensions + per-mesh `exitable` + exit-fixes + **join-modes(secure/quick)** +
+split-persist + meshd single-instance fix + default-mesh. Cert 와이어 byte-identical +
+`CTRL_QGRANT`(0x09) append-only → 혼합버전 배포 안전.
+- **Fleet 전부 v0.7.13 build dab561f + 연결**: Oracle(systemctl restart, direct
+  138.2.14.219:41000), lablinux(LAN SSH 172.28.7.32 바이너리 스왑, relay), Mac(CI dmg
+  clean-swap: backup→shutdown→quit→ditto→relaunch once; `version v0.7.13 build dab561f`,
+  `default` 명령 동작). 홈 메쉬 3노드 정상.
+- **join-modes 라이브 검증**: Oracle이 quick 초대(`invite --quick --max 3 --expire 1h`,
+  12101B bearer 코드) 발행 → lablinux가 신원단계 없이 그 코드로 self-register
+  (`JoinMesh{name:"lab"}` → `MeshCreated`, GrantCert 로컬 유효, 멤버 `lab`). quick bearer
+  가입 경로 e2e 동작 확인. gossip merge 로직은 오프라인 72 유닛테스트로 검증됨.
+- **발견(기존 제약, join-modes 무관)**: pinned-port 노드(Oracle=advertise 41000)는 **2번째
+  메쉬 데이터플레인이 같은 41000에 바인드 충돌**(`Address already in use` → mesh DOWN) →
+  fresh 테스트메쉬(qtest)의 라이브 cross-node gossip은 여기서 막힘. 포트선택 코드는 이번에
+  안 건드림 = pre-existing. ERRORS.md 퀵로그 기록. 테스트메쉬 qtest는 양쪽 정리(rm/RemoveMesh).
+  — deploy+verify, no code change
+
 ## Mac clean-slate reinstall + macOS-fix verification (2026-07-22)
 
 - **Wiped every stale install** (/Applications 0.7.3 app, 0.7.3 dev bundle, ancient Downloads

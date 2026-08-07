@@ -140,6 +140,21 @@ pub struct GenesisCharter {
     /// `#[serde(default)]` ⇒ `Isolate` for older charters that predate the field.
     #[serde(default)]
     pub exit_policy: ExitPolicy,
+    /// Lowest-strength join method this mesh accepts (docs/JOIN_MODES.md). `Any` (default) lets an
+    /// inviter choose secure or quick per invite; `SecureOnly` forbids quick (bearer) invites so a
+    /// member can't weaken a sensitive mesh. `#[serde(default)]` ⇒ `Any` for older charters.
+    #[serde(default)]
+    pub join_floor: JoinFloor,
+}
+
+/// The lowest-strength join method a mesh accepts (docs/JOIN_MODES.md §7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum JoinFloor {
+    /// Inviter may choose `secure` (key-bound) or `quick` (bearer) per invite.
+    #[default]
+    Any,
+    /// Only the `secure` key-bound flow; `quick` invites are refused.
+    SecureOnly,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -187,6 +202,7 @@ mod tests {
             expel: ExpelPolicy::CreatorOnly,
             header_placement: HeaderPlacement::Random,
             exit_policy: ExitPolicy::Isolate,
+            join_floor: JoinFloor::Any,
         }
     }
 

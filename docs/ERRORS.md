@@ -13,6 +13,32 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-08-07** · v0.7.13 join-modes 라이브 검증 중, pinned 노드에 2번째 메쉬를 붙였더니
+  gossip이 안 퍼짐 → 원인: **advertise-port 고정(Oracle=41000)이 per-daemon으로 적용돼 모든 메쉬가
+  같은 UDP 포트에 바인드**를 시도 → 첫 메쉬(홈)가 41000을 점유하면 2번째 메쉬는
+  `data-plane UDP bind 0.0.0.0:41000 ... Address already in use → mesh data plane is DOWN` →
+  데이터플레인 없이 gossip(CTRL_QGRANT 포함) 불가. **pre-existing 제약**(포트선택 코드는 v0.7.13에서
+  안 건드림), join-modes 버그 아님. 진단이 헷갈렸던 이유: lablinux는 무핀이라 42002로 정상 바인드+가입
+  성공(`MeshCreated`) → "가입은 되는데 상대가 못 봄"이 NAT처럼 보였지만 실제는 서버측 포트충돌.
+  회피: 라이브 멀티-메쉬 gossip 검증은 **무핀 노드 쌍**에서 하거나, pinned 노드는 메쉬별 포트를
+  분리해야 함(미수정, 데이터플레인 트랩이라 스코프 밖). 검증은 quick 가입 e2e + 오프라인 merge
+  유닛테스트로 충분히 커버.
+
+- **2026-08-07** · lablinux silently dropped off the mesh (printer + overlay unreachable) → root
+  cause: a **rootless (user) meshd held the IPC socket**, so the systemd **root** meshd — the only
+  one that can create the TUN — hit the single-instance guard, logged *"another meshd already owns
+  the socket — deferring, exiting"*, and quit **after** already bringing up (then orphaning) its data
+  plane. Net: the surviving owner had no root → no TUN → no overlay. (Leftover from a swap that ran
+  `systemctl stop` then got interrupted, leaving a manual/user meshd.) TWO daemon bugs: (1) the guard
+  ran AFTER data-plane bringup (start→bringup→defer→orphan→flap); (2) it deferred to ANY owner,
+  including a rootless one that can never serve. Fix: `should_defer_to_socket_owner()` runs BEFORE
+  bringup and a **root `DATA_PLANE` daemon takes the socket over from a non-root owner** (owner uid !=
+  0 ⇒ data-plane-less ⇒ supersede) instead of deferring. Immediate repair: kill the stale meshd +
+  `rm` the socket + `systemctl start` → reflexion re-learned the public addr, direct paths to
+  Oracle+Mac re-formed. **Lesson: a single-instance guard must not let a daemon that CAN'T serve
+  block one that can; and check ownership before doing expensive/host-mutating setup.**
+
+
 - **2026-07-28** · on a Linux node, `default network` (turn split off) → **"internet doesn't work"**.
   Root cause: split/full-tunnel points `/etc/resolv.conf` at meshd's `127.0.0.1:53` proxy and backs
   up the original to ONE file (`/tmp/lattice-saved-resolv`); when it turned off, `restore_dns` found

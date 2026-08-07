@@ -439,6 +439,10 @@ pub enum LoopEvent {
     /// The supervisor merges them (newest-per-(member, proto) wins, soft-state) so the
     /// service registry converges across the mesh (docs/EXTENSIONS.md §6).
     Registry(Vec<u8>),
+    /// A peer gossiped quick-invite membership records (`CTRL_QGRANT`): `bincode(Vec<GrantCert>)`.
+    /// The supervisor merges new ones so members that self-registered under a `Grant` converge
+    /// across the mesh — a SEPARATE channel from the classic roster (docs/JOIN_MODES.md).
+    Quick(Vec<u8>),
 }
 
 /// meshd→loop command channel (re-cipher, attack signals).
@@ -464,6 +468,10 @@ pub const CTRL_FLOWS: u8 = 0x07;
 /// Service-registry gossip: `json(Vec<ServiceRecord>)`. Soft state, newest-per-(member,
 /// proto) wins; the supervisor merges it for connector discovery (docs/EXTENSIONS.md §6).
 pub const CTRL_REGISTRY: u8 = 0x08;
+/// Quick-invite membership gossip: `bincode(Vec<GrantCert>)` — members that self-registered under a
+/// signed `Grant`. A SEPARATE channel so the classic `CTRL_ROSTER` cert format is never touched; old
+/// nodes ignore this tag (docs/JOIN_MODES.md).
+pub const CTRL_QGRANT: u8 = 0x09;
 
 /// **RISK 🔴 HIGH** (ON-WIRE FORMAT — this byte layout is also the meshd→loop command; append-only).
 /// Encode a re-cipher announce: `[epoch(8 BE)][cipher_len(1)][cipher][secret(32)]`.
@@ -703,6 +711,10 @@ pub async fn run<X: Transport + 'static>(
                         // supervisor to merge (soft state, newest-per-(member, proto) wins).
                         Some(CTRL_REGISTRY) => {
                             let _ = loop_event.send(LoopEvent::Registry(payload[1..].to_vec()));
+                        }
+                        // Quick-invite membership gossip — self-registered members under a Grant.
+                        Some(CTRL_QGRANT) => {
+                            let _ = loop_event.send(LoopEvent::Quick(payload[1..].to_vec()));
                         }
                         _ => {}
                     },
