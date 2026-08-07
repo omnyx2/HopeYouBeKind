@@ -328,6 +328,11 @@ struct State {
     /// The network-change re-route + shutdown restore key off THIS, not `current.is_some()`, so a
     /// split selection never accidentally diverts the default route.
     full_tunnel: bool,
+    /// The node's preferred "default" mesh (docs-only UX): the mesh the GUI/CLI pre-selects and
+    /// shows first on startup. PERSISTED (survives restart) and purely a view/selection hint — it
+    /// does NOT change routing (unlike `current`), so it can safely persist without any DNS/route
+    /// side effects. `None` = no default set.
+    default_mesh: Option<MeshId>,
     /// Whether to spawn data-plane loops (`DATA_PLANE=1`).
     data_plane: bool,
     /// Freshly minted identities (member + enc keypair) awaiting an invite, keyed
@@ -730,6 +735,30 @@ fn load_split_active(dir: &std::path::Path) -> Option<MeshId> {
         .flatten()
 }
 
+/// Persist the node's preferred default mesh (a view/selection hint; no routing). `None` removes it.
+fn persist_default_mesh(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    let f = dir.join("default-mesh.json");
+    match st.default_mesh {
+        None => {
+            let _ = std::fs::remove_file(&f);
+        }
+        Some(_) => {
+            if let Ok(json) = serde_json::to_vec(&st.default_mesh) {
+                let _ = std::fs::write(&f, &json);
+            }
+        }
+    }
+}
+
+/// The node's preferred default mesh at startup (`None` = unset). Loaded once; safe (no routing).
+fn load_default_mesh(dir: &std::path::Path) -> Option<MeshId> {
+    std::fs::read(dir.join("default-mesh.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Option<MeshId>>(&b).ok())
+        .flatten()
+}
+
 /// Load the extension grants at startup (id → grant). Missing/corrupt file ⇒ empty.
 fn load_extensions(dir: &std::path::Path) -> HashMap<String, ExtensionGrant> {
     let f = extensions_file(dir);
@@ -1012,6 +1041,7 @@ async fn main() -> anyhow::Result<()> {
                     st.split_rules.len()
                 );
             }
+            st.default_mesh = load_default_mesh(dir);
             st.extensions = load_extensions(dir);
             if !st.extensions.is_empty() {
                 elog!("meshd: loaded {} extension grant(s)", st.extensions.len());
@@ -2859,6 +2889,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
         }
         Request::ListMeshes => {
             let cur = st.current;
+            let def = st.default_mesh;
             let now = now_ms();
             let mut meshes: Vec<MeshSummary> = st
                 .meshes
@@ -2875,6 +2906,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                         ATTACK_GRACE_SECS.saturating_sub(now.saturating_sub(armed) / 1000)
                     }),
                     is_creator: ms.master.is_some(),
+                    is_default: def == Some(ms.mesh.id),
                 })
                 .collect();
             meshes.sort_by_key(|s| s.id);
@@ -2983,6 +3015,18 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     (Response::Ok, None)
                 }
                 None => (no_mesh(mesh), None),
+            }
+        }
+
+        Request::SetDefaultMesh { mesh } => {
+            // A persisted view/selection hint only — does NOT change routing (unlike SetCurrent).
+            match mesh {
+                Some(id) if !st.meshes.contains_key(&id) => (no_mesh(id), None),
+                _ => {
+                    st.default_mesh = mesh;
+                    persist_default_mesh(st);
+                    (Response::Ok, None)
+                }
             }
         }
 

@@ -111,6 +111,10 @@ pub enum Request {
     /// Select the current mesh for egress (its exit must be set), or `None` for
     /// idle / untouched (the §1 default).
     SetCurrent { mesh: Option<MeshId> },
+    /// Set the node's preferred DEFAULT mesh — the one the GUI/CLI pre-selects and shows first on
+    /// startup. Persisted, and purely a view/selection hint: it does NOT change routing (unlike
+    /// `SetCurrent`), so it never touches DNS/routes. `None` clears it.
+    SetDefaultMesh { mesh: Option<MeshId> },
     /// Expel (revoke) a member from a mesh under its `ExpelPolicy` (who may sign is set
     /// at genesis). Records + gossips a signed revocation; the member leaves the roster
     /// once the revocation is authorized (immediately for creator/inviter, at `k`
@@ -503,6 +507,10 @@ pub struct MeshSummary {
     /// True if this node created the mesh (shows the banner's `All clear` button).
     #[serde(default)]
     pub is_creator: bool,
+    /// The node's preferred DEFAULT mesh — the GUI/CLI pre-selects it on startup. A view hint only
+    /// (no routing). `#[serde(default)]` so older meshd loads as false.
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 /// One member in a mesh's roster.

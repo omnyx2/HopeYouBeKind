@@ -617,15 +617,17 @@ async function renderMeshes() {
       ? `<span class="pill on" title="only matched domains route via this mesh; general traffic stays direct">split</span>`
       : (m.is_current ? `<span class="pill on">egress</span>` : "");
     const exit = m.exit != null ? `exit #${m.exit}` : "no exit";
+    const defBadge = m.is_default ? `<span class="pill on" title="default mesh — the app opens here on start">★ default</span>` : "";
     return `<li>
       <div class="peer-left">
         <span class="dot ${m.is_current ? "connected" : "known"}"></span>
         <b>${esc(m.name)}</b>
         <span class="muted small">#${m.id} · ${m.members} members · epoch ${m.epoch} · ${exit}</span>
-        ${egress}
+        ${defBadge}${egress}
       </div>
       <div>
         <button class="small-btn" data-manage="${m.id}">manage ›</button>
+        <button class="small-btn ${m.is_default ? "on" : ""}" data-default="${m.id}" title="Open this mesh by default on start (view only — no routing change)">${m.is_default ? "default ★" : "set default"}</button>
         <button class="small-btn" data-egress="${m.id}">make egress</button>
         <button class="small-btn ${m.exitable ? "on" : ""}" data-exitable="${m.id}" title="Let this mesh's members use MY internet as their exit">${m.exitable ? "exitable ✓" : "exitable"}</button>
       </div>
@@ -650,6 +652,16 @@ el("mesh-list").addEventListener("click", async (e) => {
     try { await meshd({ SetCurrent: { mesh: id } }); toast("egress set"); }
     catch (x) { toast(String(x)); }
     CURRENT_MESH = id;
+    return refreshMode();
+  }
+  const setDefault = e.target.closest("[data-default]");
+  if (setDefault) {
+    const id = parseInt(setDefault.dataset.default, 10);
+    const on = setDefault.classList.contains("on");
+    try {
+      await meshd({ SetDefaultMesh: { mesh: on ? null : id } }); // toggle
+      toast(on ? "default mesh cleared" : "default mesh set — opens here on start");
+    } catch (x) { toast(String(x)); }
     return refreshMode();
   }
   const exitable = e.target.closest("[data-exitable]");
@@ -1250,7 +1262,16 @@ async function showAppVersion() {
 }
 showAppVersion();
 
-setMode("user");
+// Boot: if the user set a preferred DEFAULT mesh, open straight to it (view only — no routing
+// change); otherwise land on the User/Meshes page.
+(async () => {
+  try {
+    const meshes = (await meshd("ListMeshes")).Meshes || [];
+    const def = meshes.find((m) => m.is_default);
+    if (def) { CURRENT_MESH = def.id; return setMode("mesh"); }
+  } catch {}
+  setMode("user");
+})();
 setInterval(refreshTopbar, 3000);
 // Live poll: keep the Peers/Topology/Traffic views fresh while viewing them.
 // Is the user currently typing into an input on the Peers tab (the invite fields or an

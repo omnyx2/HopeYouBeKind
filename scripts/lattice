@@ -170,7 +170,9 @@ def cmd_ls(sock, a):
             egress = "direct"
         exit_s = f"#{m['exit']}" if m.get("exit") is not None else "—"
         flag = " ⚠ATTACK" if m.get("attack_armed_secs_left") is not None else ""
-        print(f"{m['id']:>2}  {m['name']:<16} {m['members']:>7} {m['epoch']:>5}  "
+        star = "★" if m.get("is_default") else " "
+        name = f"{star}{m['name']}"
+        print(f"{m['id']:>2}  {name:<16} {m['members']:>7} {m['epoch']:>5}  "
               f"{exit_s:>5}  {egress}{flag}")
     if am is not None:
         nm = next((m["name"] for m in meshes if m["id"] == am), str(am))
@@ -293,6 +295,22 @@ def cmd_join(sock, a):
     r = call(sock, req)
     mid = r.get("MeshCreated", {}).get("mesh")
     print(f"joined mesh #{mid}. `lattice info {mid}` to see peers.")
+
+
+def cmd_default(sock, a):
+    # Set / show / clear the node's preferred DEFAULT mesh (a view hint; does NOT change routing).
+    if a.mesh is None:
+        meshes = call(sock, "ListMeshes").get("Meshes", [])
+        cur = next((m for m in meshes if m.get("is_default")), None)
+        print(f"default mesh: {('#%d %s' % (cur['id'], cur['name'])) if cur else 'none set'}")
+        return
+    if a.mesh in ("none", "off", "clear"):
+        call(sock, {"SetDefaultMesh": {"mesh": None}})
+        print("default mesh cleared.")
+        return
+    mid = resolve_mesh(sock, a.mesh)
+    call(sock, {"SetDefaultMesh": {"mesh": mid}})
+    print(f"default mesh set to #{mid} — the GUI/CLI will pre-select it. (View only; routing unchanged.)")
 
 
 def cmd_exit(sock, a):
@@ -973,6 +991,11 @@ def build_parser():
     s.add_argument("--algo", default=None, help="invite-wrap algorithm the host used")
     s.add_argument("--name", default=None, help="your in-mesh name (quick invites only; default node-<id>)")
     s.set_defaults(fn=cmd_join)
+
+    s = sub.add_parser("default", help="set the preferred default mesh (GUI/CLI pre-selects it; view only, no routing)")
+    s.add_argument("mesh", nargs="?", default=None,
+                   help="mesh id or name to make default; 'none' to clear; omit to show current")
+    s.set_defaults(fn=cmd_default)
 
     s = sub.add_parser("exit", help="pick which member is the internet exit")
     s.add_argument("mesh", help="mesh id or name")
