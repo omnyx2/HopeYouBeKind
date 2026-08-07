@@ -13,6 +13,14 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 
 ## [0.7.13] — 2026-07-28
 
+### Fixed
+- **A rootless meshd could wedge a node off the mesh (single-instance guard).** If a non-root meshd
+  (e.g. a leftover/manual instance) held the IPC socket, the systemd root daemon — the only one that
+  can create the TUN — deferred to it and exited, *after* orphaning a half-built data plane, so the
+  surviving owner had no overlay (took a Linux node silently offline). The guard now runs BEFORE any
+  data-plane bringup, and a root `DATA_PLANE` daemon takes the socket over from a non-root
+  (data-plane-less) owner instead of deferring.
+
 ### Added
 - **Selectable mesh join modes — `secure` (default) + `quick` (bearer)** (docs/JOIN_MODES.md). The
   strong key-bound flow (`lattice id` → `invite` → `join`) stays the default; `quick` adds a

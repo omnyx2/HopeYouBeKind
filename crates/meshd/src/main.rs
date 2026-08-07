@@ -987,6 +987,14 @@ async fn main() -> anyhow::Result<()> {
     // env-through-elevation quoting that left meshd not starting at all).
     let data_plane = matches!(std::env::var("DATA_PLANE").as_deref(), Ok("1"))
         || std::env::args().any(|a| a == "--data-plane");
+    // Single-instance guard, run BEFORE any data-plane bringup: if a healthy meshd already owns the
+    // socket, exit now (a deferring start must never create — then orphan — a TUN). A root
+    // data-plane daemon takes the socket over from a rootless (data-plane-less) owner instead.
+    #[cfg(unix)]
+    if should_defer_to_socket_owner(&socket, data_plane) {
+        elog!("meshd: another meshd already owns {socket} — deferring to it, exiting (no second instance)");
+        return Ok(());
+    }
     let pdir = persist_dir();
     {
         let mut st = state.lock().unwrap();
@@ -1161,23 +1169,42 @@ async fn main() -> anyhow::Result<()> {
     accept_loop(&socket, state).await
 }
 
+/// Should a starting meshd DEFER to whoever already owns the IPC `socket` (and exit), or TAKE IT
+/// OVER? Deferring is right when a healthy peer is serving — stealing its socket would orphan its
+/// TUN + leave its data-plane UDP ports bound (`Address already in use`). BUT a **rootless** owner
+/// can't create a TUN at all, so it has NO data plane and would block a real (root, `DATA_PLANE`)
+/// daemon forever — the exact wedge that took lablinux off the mesh (docs/ERRORS.md). So: defer to a
+/// live owner UNLESS we are a root data-plane daemon and the owner is a non-root (data-plane-less)
+/// instance, in which case we take the socket over. Returns `true` = defer + exit.
+#[cfg(unix)]
+fn should_defer_to_socket_owner(socket: &str, data_plane: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if std::os::unix::net::UnixStream::connect(socket).is_err() {
+        return false; // no live owner (missing/stale file) — take over
+    }
+    let we_can_serve = data_plane && unsafe { libc::geteuid() } == 0;
+    let owner_is_rootless = std::fs::metadata(socket).map(|m| m.uid()).unwrap_or(0) != 0;
+    !(we_can_serve && owner_is_rootless)
+}
+
 /// Accept IPC connections forever. The transport is platform-specific (unix socket
 /// vs named pipe) but the per-connection protocol ([`serve_conn`]) is shared.
 #[cfg(unix)]
 /// 🟡 IPC accept loop (unix socket): bind, then for each connection check [`peer_allowed`] and
 /// spawn [`serve_conn`]. Includes the single-instance / stale-socket handling.
 async fn accept_loop(socket: &str, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
-    // Single-instance guard. Blindly `remove_file` + re-`bind` would steal the socket
-    // from a meshd that is ALREADY running — but that old instance keeps its TUNs and
-    // its already-bound data-plane UDP ports, turning into a zombie that blocks the new
-    // instance's data plane (`Address already in use`) while the GUI unknowingly talks
-    // to whichever won the socket. So: if a live meshd answers on this path, defer to it
-    // and exit cleanly instead of orphaning it.
-    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+    // Single-instance guard (see `should_defer_to_socket_owner`). Blindly `remove_file` + re-`bind`
+    // would steal the socket from a HEALTHY meshd — orphaning its TUN and leaving its data-plane UDP
+    // ports bound (`Address already in use`). So defer to a live owner — UNLESS we're a root
+    // data-plane daemon and the owner is a rootless (data-plane-less) instance that would block us
+    // forever, in which case we take it over. (main() already ran this check before bringup; repeated
+    // here to close the start↔bind race and for the macOS/no-data-plane path.)
+    let data_plane = state.lock().unwrap().data_plane;
+    if should_defer_to_socket_owner(socket, data_plane) {
         elog!("meshd: another meshd already owns {socket} — deferring to it, exiting (no second instance)");
         return Ok(());
     }
-    // No live owner: a leftover socket file is stale — safe to remove and take over.
+    // Either no live owner (stale file) or a rootless owner we're superseding — remove + take over.
     let _ = std::fs::remove_file(socket);
     let listener = tokio::net::UnixListener::bind(socket)?;
     // meshd runs as root (for the TUN) but the desktop app connects as the logged-in

@@ -13,6 +13,21 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-08-07** · lablinux silently dropped off the mesh (printer + overlay unreachable) → root
+  cause: a **rootless (user) meshd held the IPC socket**, so the systemd **root** meshd — the only
+  one that can create the TUN — hit the single-instance guard, logged *"another meshd already owns
+  the socket — deferring, exiting"*, and quit **after** already bringing up (then orphaning) its data
+  plane. Net: the surviving owner had no root → no TUN → no overlay. (Leftover from a swap that ran
+  `systemctl stop` then got interrupted, leaving a manual/user meshd.) TWO daemon bugs: (1) the guard
+  ran AFTER data-plane bringup (start→bringup→defer→orphan→flap); (2) it deferred to ANY owner,
+  including a rootless one that can never serve. Fix: `should_defer_to_socket_owner()` runs BEFORE
+  bringup and a **root `DATA_PLANE` daemon takes the socket over from a non-root owner** (owner uid !=
+  0 ⇒ data-plane-less ⇒ supersede) instead of deferring. Immediate repair: kill the stale meshd +
+  `rm` the socket + `systemctl start` → reflexion re-learned the public addr, direct paths to
+  Oracle+Mac re-formed. **Lesson: a single-instance guard must not let a daemon that CAN'T serve
+  block one that can; and check ownership before doing expensive/host-mutating setup.**
+
+
 - **2026-07-28** · on a Linux node, `default network` (turn split off) → **"internet doesn't work"**.
   Root cause: split/full-tunnel points `/etc/resolv.conf` at meshd's `127.0.0.1:53` proxy and backs
   up the original to ONE file (`/tmp/lattice-saved-resolv`); when it turned off, `restore_dns` found
