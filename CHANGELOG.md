@@ -13,6 +13,12 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 
 ## [0.7.13] — 2026-07-28
 
+### Added
+- **Default mesh** — pick a preferred mesh (`lattice default <mesh>`, or the GUI "set default"
+  button) and the GUI opens straight to it on start (★ in `lattice ls`). Persisted across restarts.
+  A view/selection hint only — it does NOT change routing (internet stays direct), matching the
+  "Default network = off" model.
+
 ### Fixed
 - **A rootless meshd could wedge a node off the mesh (single-instance guard).** If a non-root meshd
   (e.g. a leftover/manual instance) held the IPC socket, the systemd root daemon — the only one that
