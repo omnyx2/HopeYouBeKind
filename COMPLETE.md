@@ -5,6 +5,29 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## v0.7.14 — full-tunnel egress + exit 지정 sticky (재시작에도 유지) (2026-08-07)
+
+증상: GUI에서 "왜 자꾸 Default network로 감?" — 라우팅이 재시작마다 디폴트로 리셋.
+원인(코드, NAT 아님): **두 개의 persistence 갭**.
+- `current`+`full_tunnel`(full-tunnel egress 선택)이 persist 안 됨 — split만 `split-active.json`으로
+  유지되던 비대칭 → meshd 재시작(세션 중 수십 회)마다 `current=None, full_tunnel=false` → Default network.
+- `SetExit`(mesh.exit, 어느 멤버가 인터넷 exit인지)가 `persist()` 호출을 안 함 → exit 지정도 재시작에
+  유실(#4→null) → full-tunnel 복원이 exit을 못 찾음(반쪽 버그).
+고침(commits `dd4be32` egress + `3a46391` exit):
+- `persist_egress`/`load_egress`(`egress.json` 0600, `current.filter(|_| full_tunnel)`), SetCurrent/
+  RemoveMesh/self-destruct에서 호출. 부팅 복원 블록 = intent(current+full_tunnel) 즉시 세팅 +
+  `restore_full_tunnel`이 **exit 도달 가능해질 때까지 대기 후** divert(부팅 시 dead-exit 블랙홀/kill-switch
+  방지) + kill-switch 재무장. exit 끝내 안 뜨면 intent 유지 → 네트워크변경/수동 재선택 때 적용.
+- `SetExit`에 `persist(st)` 추가(+ exit 삭제 시 `persist_egress`).
+- 사용자 선택(AskUserQuestion): "자동 복원(완전 sticky) + preflight 가드".
+검증: 빌드(1.79) + 단위테스트 7/7(egress 게이팅 round-trip 신규) + fmt + clippy(기존 needless_borrow와
+동일 패턴) + startup 스모크. **라이브 Mac clean-swap 2회**(off→shutdown→quit→ditto→relaunch once,
+utun-safe): 최종 `v0.7.14 build 3a46391`==HEAD, 홈 메쉬 재연결(Oracle direct/lablinux relay).
+**exit-persist 라이브 검증**: SetExit(home→oracle) → `mesh-1.json` `"exit":1` 디스크 저장 확인.
+egress-persist는 단위테스트로 검증(라이브 full-tunnel divert는 사용자 인터넷 방해라 미실행).
+NOTE: 검증 중 home.exit=oracle(#1) 지정해둠(inert — full-tunnel 켤 때만 사용, `lattice exit home none`로 해제).
+버전 0.7.14 범프(Cargo/tauri.conf). 브랜치 feat/extensions-meshd, **main 미머지 + fleet 미배포**.
+
 ## v0.7.13 정식 롤아웃 (fleet 전부 dab561f) + join-modes 라이브 검증 (2026-08-07)
 
 v0.7.13 = extensions + per-mesh `exitable` + exit-fixes + **join-modes(secure/quick)** +
