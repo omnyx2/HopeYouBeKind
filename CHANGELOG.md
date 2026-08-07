@@ -22,6 +22,10 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
   until the exit is actually reachable, so a boot with a not-yet-connected exit never black-holes
   the default route (which the kill-switch would then rip down). If the exit never comes up this
   boot the selection is still remembered — a network change or a manual re-select applies it.
+- **The exit designation now persists too.** `SetExit` (which member of a mesh serves as its
+  internet exit) never wrote to disk, so the exit was silently lost on every restart — which also
+  meant the full-tunnel egress above could not be restored (there was no exit to route through).
+  Now persisted with the rest of the mesh state.
 
 ## [0.7.13] — 2026-07-28
 

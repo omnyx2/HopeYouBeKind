@@ -3117,7 +3117,13 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 st.current = None;
                 exit::restore_routes();
                 exit::restore_dns();
+                persist_egress(st); // egress went away with the exit — forget it too
             }
+            // The exit designation must survive a restart: without it, a persisted full-tunnel
+            // egress can't be re-applied at boot (`restore_full_tunnel` needs `mesh.exit`), so the
+            // node would still fall back to the default network. (Was unpersisted — sibling of the
+            // egress-persistence bug.)
+            persist(st);
             (Response::Ok, None)
         }
 
