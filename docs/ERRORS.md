@@ -13,6 +13,18 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-08-07** · GUI에서 "왜 자꾸 Default network로 감?" → 원인: **full-tunnel egress(`current` +
+  `full_tunnel`)가 재시작에 persist 안 됨.** split-tunnel은 `split-active.json`으로 유지되는데
+  full-tunnel만 비대칭으로 안 됨 → meshd 재시작(=이번 세션에 수십 번)마다 `full_tunnel=false`,
+  `current=None`으로 리셋 → Default network. 진단: persist 파일을 직접 까서 `egress.json` 부재 +
+  `persist_full_tunnel` 함수 부재 확인 → **코드가 원인**(NAT/네트워크 아님). 고침:
+  `persist_egress`/`load_egress`(`egress.json` 0600, `current.filter(|_| full_tunnel)`) +
+  SetCurrent/RemoveMesh/self-destruct에서 호출 + 부팅 복원 블록. **함정 회피**: 부팅 때 무작정
+  divert하면 exit 미연결 시 default route 블랙홀→kill-switch가 인터넷 끊음 → `restore_full_tunnel`이
+  **exit 도달 가능해질 때까지 대기 후** 적용(intent는 즉시 세팅, 실제 라우팅은 preflight 통과 후).
+  offline 검증: 단위테스트(게이팅 round-trip)+빌드+fmt+startup 스모크. **교훈: 라우팅 상태를
+  하나 persist하면 형제 상태(split↔full)도 대칭으로 persist하라 — 비대칭이 "몰래 리셋" 버그.**
+
 - **2026-08-07** · v0.7.13 join-modes 라이브 검증 중, pinned 노드에 2번째 메쉬를 붙였더니
   gossip이 안 퍼짐 → 원인: **advertise-port 고정(Oracle=41000)이 per-daemon으로 적용돼 모든 메쉬가
   같은 UDP 포트에 바인드**를 시도 → 첫 메쉬(홈)가 41000을 점유하면 2번째 메쉬는

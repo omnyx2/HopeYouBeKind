@@ -759,6 +759,42 @@ fn load_default_mesh(dir: &std::path::Path) -> Option<MeshId> {
         .flatten()
 }
 
+/// Persist the FULL-tunnel egress selection so it survives a daemon restart (mirrors
+/// `persist_split_active` for split). Only a full tunnel is sticky here — a split selection has its
+/// own `split-active.json`, and "default network" (`full_tunnel=false`) removes the file. Call after
+/// any mutation of `current`/`full_tunnel`; it always reflects the live full-tunnel mesh (or none).
+fn persist_egress(st: &State) {
+    let Some(dir) = &st.persist_dir else { return };
+    let f = dir.join("egress.json");
+    let active: Option<MeshId> = st.current.filter(|_| st.full_tunnel);
+    match active {
+        None => {
+            let _ = std::fs::remove_file(&f);
+        }
+        Some(_) => {
+            if let Ok(json) = serde_json::to_vec(&active) {
+                if std::fs::write(&f, &json).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The mesh that was the full-tunnel egress at last persist (`None` = default network). Re-applied at
+/// startup — but only once the exit is reachable (see [`restore_full_tunnel`]), never blindly at boot.
+fn load_egress(dir: &std::path::Path) -> Option<MeshId> {
+    std::fs::read(dir.join("egress.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Option<MeshId>>(&b).ok())
+        .flatten()
+}
+
 /// Load the extension grants at startup (id → grant). Missing/corrupt file ⇒ empty.
 fn load_extensions(dir: &std::path::Path) -> HashMap<String, ExtensionGrant> {
     let f = extensions_file(dir);
@@ -1121,6 +1157,22 @@ async fn main() -> anyhow::Result<()> {
             if state.lock().unwrap().meshes.contains_key(&m) {
                 split_enable(m, Arc::clone(&state)).await;
                 elog!("meshd: re-enabled split-tunnel for mesh {m} (persisted on/off state)");
+            }
+        }
+        // Re-apply a persisted FULL-tunnel egress so "route everything through this mesh" survives a
+        // restart (was the "keeps falling back to Default network" bug — only split was sticky). Set
+        // the intent now (so the GUI/CLI show it and the network-change loop re-asserts it), but let
+        // `restore_full_tunnel` do the actual divert only once the exit is reachable — never black-hole
+        // the default route at boot to a not-yet-connected exit.
+        if let Some(m) = load_egress(dir) {
+            if state.lock().unwrap().meshes.contains_key(&m) {
+                {
+                    let mut st = state.lock().unwrap();
+                    st.current = Some(m);
+                    st.full_tunnel = true;
+                }
+                elog!("meshd: full-tunnel egress mesh {m} remembered; applying once its exit is reachable");
+                restore_full_tunnel(m, Arc::clone(&state));
             }
         }
     }
@@ -2518,6 +2570,7 @@ fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<State>>) {
                 }
             }
             persist(&st); // P-S1: erase the on-disk copy too (keeps the ephemeral property)
+            persist_egress(&st); // if the destroyed mesh was the full-tunnel egress, forget it
             return;
         }
     });
@@ -2731,6 +2784,86 @@ fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
                 return; // reverted (or someone else did) — stop probing
             }
         }
+    });
+}
+
+/// Re-apply a persisted full-tunnel egress after a restart, **safely**. The intent (`current` +
+/// `full_tunnel`) is already set by the caller; this waits (bounded) for the exit's endpoint to be
+/// learned before diverting the default route — a boot-time divert to an exit that isn't reachable
+/// yet would black-hole the default route and the kill-switch would rip it back down (internet
+/// flaps). So we hold until the exit is live, then apply DNS + route exactly like the interactive
+/// `SetCurrent` path and arm the kill-switch. Bails if the user changed egress meanwhile.
+fn restore_full_tunnel(mesh: MeshId, state: Arc<Mutex<State>>) {
+    tokio::spawn(async move {
+        // ~40 * 3s ≈ 2 min for the exit link to be learned (handshake + gossip). If it never
+        // comes up we keep the *intent* (a network change or manual toggle still applies it).
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let plan = {
+                let st = state.lock().unwrap();
+                // User picked another egress / went to default network, or the mesh is gone.
+                if st.current != Some(mesh) || !st.full_tunnel {
+                    return;
+                }
+                let Some(ms) = st.meshes.get(&mesh) else {
+                    return;
+                };
+                let Some(exit_id) = ms.mesh.exit else { return };
+                let tun = ms.tun_name.clone();
+                let ip = ms
+                    .links
+                    .lock()
+                    .unwrap()
+                    .get(&exit_id)
+                    .map(|l| l.endpoint.ip());
+                (tun, ip)
+            };
+            // Exit endpoint not learned yet → keep waiting (do NOT divert to a dead exit).
+            let (Some(tun), Some(ip)) = plan else {
+                continue;
+            };
+            let errs = tokio::task::spawn_blocking(move || {
+                let mut errs: Vec<String> = Vec::new();
+                // DNS first, then route — same order as SetCurrent (see its comment).
+                if let Ok(dns) = FULL_TUNNEL_DNS.parse() {
+                    if let Err(e) = exit::set_dns(&[dns]) {
+                        errs.push(format!("DNS: {e}"));
+                    }
+                }
+                if let Err(e) = exit::route_through(&tun, ip) {
+                    errs.push(format!("route: {e}"));
+                }
+                errs
+            })
+            .await
+            .unwrap_or_else(|_| vec!["route task join error".into()]);
+            {
+                let mut st = state.lock().unwrap();
+                if let Some(ms) = st.meshes.get_mut(&mesh) {
+                    ms.dp_error = if errs.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "full-tunnel restore not fully applied — {}",
+                            errs.join("; ")
+                        ))
+                    };
+                }
+            }
+            elog!(
+                "meshd: restored full-tunnel egress for mesh {mesh} (persisted across restart){}",
+                if errs.is_empty() {
+                    ""
+                } else {
+                    " — with errors"
+                }
+            );
+            arm_kill_switch(mesh, state); // same watchdog as the interactive path
+            return;
+        }
+        elog!(
+            "meshd: full-tunnel egress for mesh {mesh} still remembered but its exit never became reachable this boot — a network change or manual re-select will apply it"
+        );
     });
 }
 
@@ -3034,8 +3167,9 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
             None => {
                 st.current = None;
                 st.full_tunnel = false;
-                // Back to the default network means NOTHING routes through a mesh: also drop
-                // split-tunnel (its DNS hijack + injected /32s) so "default" is truly direct.
+                persist_egress(st); // forget the full-tunnel egress across restarts
+                                    // Back to the default network means NOTHING routes through a mesh: also drop
+                                    // split-tunnel (its DNS hijack + injected /32s) so "default" is truly direct.
                 if st.split.is_some() {
                     return (Response::Ok, Some(PostAction::SplitOff));
                 }
@@ -3070,6 +3204,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                 };
                 st.current = Some(id);
                 st.full_tunnel = true;
+                persist_egress(st); // remember this full-tunnel egress across restarts
                 let action = match plan {
                     (Some(tun), Some(ip)) => {
                         // Point DNS through the tunnel BEFORE diverting the default
@@ -3124,6 +3259,7 @@ fn handle(req: Request, st: &mut State) -> (Response, Option<PostAction>) {
                     st.current = None;
                     exit::restore_routes();
                     exit::restore_dns();
+                    persist_egress(st); // removed mesh was the egress — forget it across restarts
                 }
                 emit(
                     st,
@@ -4685,7 +4821,7 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
-    use super::quorum_threshold;
+    use super::{load_egress, persist_egress, quorum_threshold, State};
 
     #[test]
     fn quorum_threshold_is_ceil_60pct() {
@@ -4696,5 +4832,52 @@ mod tests {
         assert_eq!(quorum_threshold(4), 3); // ceil(2.4)
         assert_eq!(quorum_threshold(5), 3); // ceil(3.0)
         assert_eq!(quorum_threshold(10), 6);
+    }
+
+    // The "keeps falling back to Default network" fix: a FULL-tunnel egress must survive a restart,
+    // a split selection must NOT be mistaken for one, and going to the default network forgets it.
+    #[test]
+    fn egress_persists_only_for_full_tunnel_and_survives_reload() {
+        let dir = std::env::temp_dir().join(format!("lattice-egress-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut st = State::default();
+        st.persist_dir = Some(dir.clone());
+
+        // No egress yet → file absent.
+        persist_egress(&st);
+        assert_eq!(load_egress(&dir), None);
+
+        // Split selection (current set, full_tunnel = false) must NOT persist as full-tunnel egress.
+        st.current = Some(7);
+        st.full_tunnel = false;
+        persist_egress(&st);
+        assert_eq!(
+            load_egress(&dir),
+            None,
+            "split selection must not be a sticky egress"
+        );
+
+        // Full tunnel → remembered across a (simulated) restart.
+        st.full_tunnel = true;
+        persist_egress(&st);
+        assert_eq!(
+            load_egress(&dir),
+            Some(7),
+            "full-tunnel egress should survive restart"
+        );
+
+        // Default network (SetCurrent None) → forgotten.
+        st.current = None;
+        st.full_tunnel = false;
+        persist_egress(&st);
+        assert_eq!(
+            load_egress(&dir),
+            None,
+            "default network clears the persisted egress"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,6 +11,18 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.14] — 2026-08-07
+
+### Fixed
+- **Full-tunnel egress now survives a daemon restart.** Selecting a mesh as your full tunnel
+  (route *everything* through its exit) was not persisted — only split-tunnel was — so every
+  `meshd` restart (or reboot, or a `systemctl restart`) silently dropped you back to the
+  **Default network**. The egress selection is now saved (`egress.json`, 0600) and re-applied at
+  startup, mirroring how split-tunnel already persisted. **Safe restore:** the divert is held
+  until the exit is actually reachable, so a boot with a not-yet-connected exit never black-holes
+  the default route (which the kill-switch would then rip down). If the exit never comes up this
+  boot the selection is still remembered — a network change or a manual re-select applies it.
+
 ## [0.7.13] — 2026-07-28
 
 ### Added
