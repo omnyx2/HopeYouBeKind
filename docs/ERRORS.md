@@ -13,6 +13,16 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-08-22** · `scripts/build-app.sh`(= `npm run tauri build`) 돌렸더니 **라이브 VPN이 마운트된
+  DMG에서 도는 새 앱으로 바뀜** → 원인: tauri의 dmg 번들 단계가 `bundle_dmg.sh`로 `/Volumes/Lattice`를
+  auto-mount하고 그 볼륨의 새 `Lattice.app`이 실행됨 → single-instance guard로 새 meshd가 라이브
+  소켓을 넘겨받음. 실행 경로가 `/Volumes/Lattice/...`(DMG)라 볼륨 언마운트 시 VPN 사망하는 취약 상태.
+  진단: `ps`의 meshd 경로가 `/Applications`가 아니라 `/Volumes`. 고침: clean teardown(off→shutdown→
+  quit) → 빌드 산출물 `.app`을 `/Applications`에 `ditto` 설치 → `hdiutil detach /Volumes/Lattice` →
+  `/Applications`에서 재실행 → 실행 경로 재확인. **교훈: 라이브 VPN 중 GUI 번들 빌드는 데몬을 몰래
+  스왑할 수 있다(dmg 단계가 볼륨 마운트+앱 실행). 빌드 후 반드시 실행 경로(/Volumes vs /Applications)를
+  확인하고, 가능하면 라이브 VPN과 무관한 시점/머신에서 번들을 빌드하라.**
+
 - **2026-08-07** · GUI에서 "왜 자꾸 Default network로 감?" → 원인: **full-tunnel egress(`current` +
   `full_tunnel`)가 재시작에 persist 안 됨.** split-tunnel은 `split-active.json`으로 유지되는데
   full-tunnel만 비대칭으로 안 됨 → meshd 재시작(=이번 세션에 수십 번)마다 `full_tunnel=false`,

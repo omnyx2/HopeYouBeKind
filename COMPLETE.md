@@ -5,6 +5,32 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## v0.7.15 — egress 3모드 명시화 (Off / Split / Full) + None exit 제거 (2026-08-22)
+
+사용자 지적: "config에서 None 없애야 + full-tunnel이 기본인데 자기 네트워크 쓰면 그건 메쉬 egress
+꺼진 상태지 full-tunnel이 아님." 진단: 라우팅 버그 아님(실증: exit=1 8초 유지+persist, 인터넷 직결
+정상). **개념/UI 결함** — "exit/egress"가 3군데서 다른 뜻(mesh.exit 관문 / SetCurrent egress /
+Default network)으로 뒤섞여 topbar가 Default network를 full-tunnel의 peer 선택지처럼 노출.
+사용자 선택(AskUserQuestion): **명시적 3모드 Off/Split/Full**.
+- Config "Egress & routing": `— none —` 제거(관문은 남 멤버만, 자기 제외; 라우팅하는 메쉬는 항상
+  관문 있음, 내부 메쉬는 Off 유지). 3모드 세그먼트(Off/Split/Full) = `setEgressMode`. 전환은 항상
+  `SetCurrent{None}`(routes/DNS 복원+split off) baseline 경유 → idempotent, split↔full 안 겹침.
+  Full→SetCurrent{Some}, Split→SplitOn, 둘 다 관문 SetExit 선반영.
+- 모드 판별(IPC 추가 없이): SplitList.active_mesh==mesh→Split, 아니고 is_current→Full, 아니면 Off.
+- topbar 리라벨: "Default network"→"직접 인터넷 (off)", 상태= `Full tunnel · <mesh>` /
+  `Split tunnel · <mesh>` / `직접 인터넷 (메쉬 egress off)`. Overview는 읽기전용 `egress: Off/Split/Full`
+  뱃지 + "make egress" 버튼 제거.
+- **데몬 라우팅 코드 무변경** (GUI-only, 기존 SetCurrent/SplitOn/SetExit 조합). commit `0ba7f44`.
+검증: node --check(구문) + vite frontend 번들 OK + `scripts/build-app.sh`(stale-SHA & anti-mix 게이트
+통과: bundled meshd==0ba7f44, app v0.7.15). **라이브 반영**: frontend가 앱 바이너리에 임베드 →
+전체 Tauri 번들 재빌드 필요. 빌드 중 dmg 단계가 /Volumes/Lattice auto-mount→새 앱이 그 볼륨에서
+떠 라이브 meshd를 넘겨받는 부작용 발생 → **clean teardown 후 빌드 산출물 .app을 /Applications에
+ditto 설치 + DMG 언마운트 + 재실행**으로 정리. 최종 `/Applications`에서 v0.7.15 0ba7f44 실행,
+oracle direct, EXIT #1 유지. 버전 0.7.15 범프(Cargo/gui Cargo/tauri.conf/package.json).
+브랜치 feat/extensions-meshd, **main 미머지**. 백업 /Applications/Lattice.app.prev.
+LESSON: `npm run tauri build`의 dmg 단계는 볼륨을 마운트하고 새 앱이 거기서 실행될 수 있다 —
+라이브 VPN 중엔 빌드 자체가 데몬을 스왑할 수 있으니 빌드 후 실행 경로(/Volumes vs /Applications) 확인.
+
 ## v0.7.14 — full-tunnel egress + exit 지정 sticky (재시작에도 유지) (2026-08-07)
 
 증상: GUI에서 "왜 자꾸 Default network로 감?" — 라우팅이 재시작마다 디폴트로 리셋.
