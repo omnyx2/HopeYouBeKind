@@ -11,6 +11,26 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.15] — 2026-08-22
+
+### Changed
+- **Egress is now 3 explicit modes: Off / Split / Full** (was a muddle of "exit", "make egress",
+  "Default network"). A mesh's Config → Egress & routing shows a clear **Off · Split · Full**
+  control:
+  - **Off** — your own internet, direct (this mesh isn't your egress). This is the mesh egress
+    being *off* — not a peer/network you route "through".
+  - **Split** — only the domains you list go out through this mesh's exit; everything else direct.
+  - **Full** — all traffic goes out through this mesh's exit (the VPN, fully on).
+- **Removed the `— none —` exit choice.** A mesh you route through always has an internet
+  **gateway** (exit member); you pick one (other members only — routing through yourself is
+  meaningless). An internal-only mesh simply stays on **Off**. The gateway is set automatically
+  from your pick when you switch to Split/Full.
+- **Relabelled "Default network" → "직접 인터넷 (off)"** in the top bar, and the status now reads
+  `Full tunnel · <mesh>` / `Split tunnel · <mesh>` / `직접 인터넷 (메쉬 egress off)` so the current
+  mode is unambiguous. The Overview page shows a read-only `egress: Off/Split/Full` badge.
+- Mode switches always tear down to a clean baseline first, so changing mode never stacks a split
+  proxy on top of a full tunnel. No daemon routing change — built from the existing IPC.
+
 ## [0.7.14] — 2026-08-07
 
 ### Fixed

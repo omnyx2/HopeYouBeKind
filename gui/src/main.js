@@ -85,8 +85,8 @@ async function refreshMode() {
 // Mesh mode with no mesh selected (you're on the default network) — a plain page.
 function renderMeshPlain() {
   el("mesh-detail").innerHTML = `<div class="empty" style="padding:48px 24px;text-align:center">
-      On the default network — no mesh selected.
-      <div class="muted small" style="margin-top:8px">Pick a mesh as egress above, or open one from the Meshes page.</div>
+      직접 인터넷 사용 중 — 메쉬 egress off (선택된 메쉬 없음).
+      <div class="muted small" style="margin-top:8px">위에서 메쉬를 egress로 고르거나, Meshes 페이지에서 메쉬를 열어 Off/Split/Full을 선택하세요.</div>
     </div>`;
 }
 
@@ -709,10 +709,15 @@ async function renderOverview(id) {
     `<tr><td>${mb.id}</td><td>${esc(mb.name)}${mb.is_me ? ' <span class="muted small">(me)</span>' : ""}</td><td class="mono small">${mb.pubkey_fp}</td></tr>`
   ).join("");
   const warn = meshWarnings(d);
+  // Current egress mode for this mesh (read-only badge; change it in Configs' Off/Split/Full).
+  let splitActive = null, isCurrent = false;
+  try { splitActive = (await meshd("SplitList")).Split?.active_mesh ?? null; } catch {}
+  try { isCurrent = ((await meshd("ListMeshes")).Meshes || []).some((m) => m.id === id && m.is_current); } catch {}
+  const egMode = splitActive === id ? "Split" : (isCurrent ? "Full" : "Off");
   el("mesh-detail").innerHTML = `
     <div class="card-head">
       <h2 class="card-title">⬢ ${esc(d.name)} <span class="muted small">#${d.id}</span></h2>
-      <div><button class="small-btn" id="ov-egress">make egress</button></div>
+      <div><span class="pill ${egMode === "Off" ? "warn" : "on"}" title="Configs 탭에서 Off/Split/Full 변경">egress: ${egMode}</span></div>
     </div>
     ${warn.length ? `<div class="kv"><span>warnings</span><b><a href="#" id="ov-goto-warn" style="color:#ff6477">⚠ ${warn.length} active — open Warnings</a></b></div>` : ""}
     <div class="kv"><span>charter</span><b class="small">${d.invite} · ${esc(d.trigger)} · max ${d.max_members} · ${d.self_destruct ? "ephemeral (self-destruct)" : "persistent"}</b></div>
@@ -724,14 +729,10 @@ async function renderOverview(id) {
     <div class="kv"><span>epoch</span><b>${d.epoch}</b></div>
     <div class="kv"><span>health</span><b>${d.live}/${d.members.length} live · floor ${d.threshold}${d.attack_armed_secs_left != null ? ` · <span style="color:#e44">⚠ ARMED ${d.attack_armed_secs_left}s</span>` : ""}</b></div>
     ${d.dp_error ? `<div class="kv"><span>data plane</span><b style="color:#ff6477">⛔ DOWN — ${esc(d.dp_error)}</b></div>` : ""}
-    <div class="kv"><span>my exit</span><b>${d.exit != null ? "#" + d.exit : "none"}</b></div>
+    <div class="kv"><span>인터넷 관문 (exit)</span><b>${d.exit != null ? "#" + d.exit : "미설정"}</b></div>
     <h3 class="topo-h">Roster <span class="muted small">(${d.members.length})</span></h3>
     <table class="topo-table"><thead><tr><th>id</th><th>name</th><th>pubkey</th></tr></thead><tbody>${rows}</tbody></table>
-    <p class="muted small" style="margin-top:10px">Manage exit, peers, invites and key rotation in <b>Configs</b>; see alerts in <b>Warnings</b>.</p>`;
-  el("ov-egress").onclick = async () => {
-    try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); }
-    refreshMode();
-  };
+    <p class="muted small" style="margin-top:10px">관문(exit)과 egress 모드(Off/Split/Full), 피어·초대·키 회전은 <b>Configs</b>에서; 알림은 <b>Warnings</b>에서.</p>`;
   el("ov-goto-warn")?.addEventListener("click", (e) => { e.preventDefault(); activateTab("mesh-warnings"); renderWarnings(id); });
 }
 
@@ -845,13 +846,53 @@ function wireDangerCard(id, d) {
   };
 }
 
+// Apply one of the 3 egress modes (Off / Split / Full) for a mesh, built from the daemon's
+// existing requests — no routing-logic change in meshd. Always tear down to a clean baseline first
+// (`SetCurrent None` restores routes+DNS and turns split off) so every transition is idempotent and
+// never stacks a split proxy on top of a full tunnel. Full/Split need the mesh's exit gateway, so
+// we set it from the picker before diverting.
+async function setEgressMode(id, mode, gatewayVal) {
+  try {
+    await meshd({ SetCurrent: { mesh: null } }); // baseline: direct internet, split off, routes/DNS restored
+    if (mode === "off") {
+      toast("Off — 직접 인터넷");
+    } else {
+      const gw = gatewayVal === "" || gatewayVal == null ? null : parseInt(gatewayVal, 10);
+      if (gw == null) {
+        toast("먼저 이 메쉬의 인터넷 관문(exit)을 골라주세요");
+      } else {
+        await meshd({ SetExit: { mesh: id, exit: gw } });
+        if (mode === "full") { await meshd({ SetCurrent: { mesh: id } }); toast("Full — 전부 이 메쉬 관문으로"); }
+        else { await meshd({ SplitOn: { mesh: id } }); toast("Split — 도메인 규칙만 이 메쉬 관문으로"); }
+      }
+    }
+  } catch (e) { toast(String(e)); }
+  renderConfigs(id);
+  refreshTopbar();
+}
+
 async function renderConfigs(id) {
   let d;
   try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
   catch (e) { toast(String(e)); return setMode("user"); }
-  const exitOpts = [`<option value="">— none —</option>`].concat(
-    d.members.map((mb) => `<option value="${mb.id}" ${d.exit === mb.id ? "selected" : ""}>#${mb.id} ${esc(mb.name)}</option>`)
-  ).join("");
+  // The mesh's internet GATEWAY (exit) — other members only; routing through yourself is
+  // meaningless. No "— none —": a mesh you actually route through always has a gateway, so you
+  // pick one. An internal-only mesh simply never turns egress on (leaves the mode Off). Defaults
+  // to the current pick, else the browser selects the first candidate.
+  const exitCandidates = d.members.filter((mb) => !mb.is_me);
+  const exitOpts = exitCandidates
+    .map((mb) => `<option value="${mb.id}" ${d.exit === mb.id ? "selected" : ""}>#${mb.id} ${esc(mb.name)}</option>`)
+    .join("");
+  // Current egress mode for THIS mesh — the 3 explicit modes. The split proxy selects its own
+  // mesh (SplitList.active_mesh); a full tunnel sets is_current WITHOUT split. So: split-active →
+  // Split, else current → Full, else Off.
+  let splitActive = null, isCurrent = false;
+  try { splitActive = (await meshd("SplitList")).Split?.active_mesh ?? null; } catch {}
+  try { isCurrent = ((await meshd("ListMeshes")).Meshes || []).some((m) => m.id === id && m.is_current); } catch {}
+  const egMode = splitActive === id ? "split" : (isCurrent ? "full" : "off");
+  const hasExitCand = exitCandidates.length > 0;
+  const exitName = d.exit != null && exitCandidates.find((m) => m.id === d.exit)
+    ? " " + esc(exitCandidates.find((m) => m.id === d.exit).name) : "";
   const peerOpts = d.members.filter((mb) => !mb.is_me)
     .map((mb) => `<option value="${mb.id}">#${mb.id} ${esc(mb.name)}</option>`).join("");
   // Split-tunnel exit choices: other members only (routing to yourself makes no sense).
@@ -862,12 +903,23 @@ async function renderConfigs(id) {
   el("mesh-config-body").innerHTML = `
     <div class="card">
       <div class="card-head"><h2 class="card-title">Egress &amp; routing</h2></div>
-      <div class="kv"><span>my exit</span><b>${d.exit != null ? "#" + d.exit : "none"}</b></div>
-      <div class="add-row">
-        <select id="ov-exit" class="select">${exitOpts}</select>
-        <button class="small-btn" id="ov-exit-set">set exit</button>
-        <button class="small-btn" id="ov-egress">make egress</button>
+      <div class="kv"><span>이 메쉬의 인터넷 관문 (exit)</span><b>${d.exit != null ? "#" + d.exit + exitName : "미설정"}</b></div>
+      ${hasExitCand
+        ? `<div class="add-row">
+             <select id="ov-exit" class="select">${exitOpts}</select>
+             <button class="small-btn" id="ov-exit-set">관문 지정</button>
+           </div>`
+        : `<p class="muted small">다른 멤버가 없어 exit 관문을 둘 수 없습니다 — 멤버를 초대하면 egress를 켤 수 있어요.</p>`}
+      <div class="kv" style="margin-top:12px"><span>내 egress 모드</span><b>${egMode === "full" ? "Full — 전부 이 메쉬로" : egMode === "split" ? "Split — 특정 도메인만" : "Off — 직접 인터넷"}</b></div>
+      <div id="ov-mode" class="add-row" style="margin-top:4px">
+        <button class="seg-btn ${egMode === "off" ? "active" : ""}" data-egmode="off">Off</button>
+        <button class="seg-btn ${egMode === "split" ? "active" : ""}" data-egmode="split" ${hasExitCand ? "" : "disabled"}>Split</button>
+        <button class="seg-btn ${egMode === "full" ? "active" : ""}" data-egmode="full" ${hasExitCand ? "" : "disabled"}>Full</button>
       </div>
+      <p class="muted small" style="margin-top:6px">
+        <b>Off</b> — 내 인터넷 직결(이 메쉬로 안 나감) · <b>Split</b> — 아래 도메인만 이 메쉬 관문으로 ·
+        <b>Full</b> — 모든 트래픽을 이 메쉬 관문으로. 이 컴퓨터의 egress는 한 번에 하나의 메쉬만 사용합니다.
+      </p>
     </div>
     <div class="card">
       <div class="card-head"><h2 class="card-title">Peer address <span class="muted small">(manual)</span></h2></div>
@@ -914,12 +966,13 @@ async function renderConfigs(id) {
     <p class="muted small" style="margin-top:6px">Invite a member is on the <b>Peers</b> tab; Report attack / Wipe are on the <b>Warnings</b> tab.</p>`;
   renderFlows(id);
   renderSplit(id);
-  el("ov-egress").onclick = async () => { try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); } refreshMode(); };
-  el("ov-exit-set").onclick = async () => {
+  if (el("ov-exit-set")) el("ov-exit-set").onclick = async () => {
     const v = el("ov-exit").value;
-    try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("exit set"); } catch (e) { toast(String(e)); }
+    try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("관문 지정됨"); } catch (e) { toast(String(e)); }
     renderConfigs(id);
   };
+  document.querySelectorAll("#ov-mode [data-egmode]").forEach((b) => b.onclick = () =>
+    setEgressMode(id, b.dataset.egmode, el("ov-exit") ? el("ov-exit").value : ""));
   el("ov-peer-set").onclick = async () => {
     const m = parseInt(el("ov-peer-id").value, 10);
     const ep = el("ov-peer-ep").value.trim();
@@ -1107,17 +1160,25 @@ async function refreshTopbar() {
   }
   sel.disabled = false;
   const egress = meshes.find((m) => m.is_current);
-  // egress dropdown: Origin + meshes; the selected one is the current egress.
-  sel.innerHTML = [`<option value="origin" ${!egress ? "selected" : ""}>Default network</option>`]
-    .concat(meshes.map((m) => `<option value="${m.id}" ${m.is_current ? "selected" : ""}>⬢ ${esc(m.name)} #${m.id}</option>`))
+  // Which mode is the current egress in? Split proxy selects its mesh; a full tunnel is `current`
+  // without split. So current + split-active(this mesh) = Split, current + no-split = Full.
+  let splitActive = null;
+  try { splitActive = (await meshd("SplitList")).Split?.active_mesh ?? null; } catch {}
+  const egMode = egress ? (splitActive === egress.id ? "Split" : "Full") : "Off";
+  // Egress selector: OFF (my own internet) or a mesh as FULL tunnel. "Off" is the egress being
+  // off — not a peer/network choice — so it's labelled as such (Split is picked per-mesh in Config).
+  sel.innerHTML = [`<option value="origin" ${!egress ? "selected" : ""}>직접 인터넷 (off)</option>`]
+    .concat(meshes.map((m) => `<option value="${m.id}" ${m.is_current ? "selected" : ""}>⬢ ${esc(m.name)} #${m.id}${m.is_current && egMode === "Split" ? " (split)" : ""}</option>`))
     .join("");
-  // far-left status mirrors the current egress.
+  // far-left status mirrors the current egress + its mode.
   if (egress) {
     dot.className = "conn-dot on";
-    sum.textContent = `Routing via ${egress.name}${egress.exit != null ? " · exit #" + egress.exit : ""}`;
+    sum.textContent = egMode === "Split"
+      ? `Split tunnel · ${egress.name}`
+      : `Full tunnel · ${egress.name}${egress.exit != null ? " → #" + egress.exit : ""}`;
   } else {
     dot.className = "conn-dot warn";
-    sum.textContent = "Using default network";
+    sum.textContent = "직접 인터넷 (메쉬 egress off)";
   }
 }
 
@@ -1125,15 +1186,17 @@ async function refreshTopbar() {
 document.querySelectorAll("#mode-toggle .seg-btn").forEach((b) =>
   b.addEventListener("click", () => setMode(b.dataset.mode))
 );
-// dropdown = egress selector (Origin or a mesh); independent of the view.
+// dropdown = quick egress switch: OFF (my own internet) or a mesh as a FULL tunnel. Split is a
+// per-mesh choice in Config (it needs domains). Tear down to the clean baseline first so switching
+// never stacks a full tunnel on top of a running split proxy.
 el("tb-egress").addEventListener("change", async (e) => {
   const v = e.target.value;
   try {
-    await meshd({ SetCurrent: { mesh: v === "origin" ? null : parseInt(v, 10) } });
-    toast(v === "origin" ? "Using default network" : "egress set");
+    await meshd({ SetCurrent: { mesh: null } }); // baseline: routes/DNS restored, split off
+    if (v === "origin") { toast("직접 인터넷 (off)"); }
+    else { await meshd({ SetCurrent: { mesh: parseInt(v, 10) } }); toast("Full tunnel"); }
   } catch (err) { toast(String(err)); }
-  // The selected egress is also the mesh shown in Mesh mode — Default network ⇒
-  // no mesh ⇒ plain Mesh page.
+  // The selected egress is also the mesh shown in Mesh mode — Off ⇒ no mesh ⇒ plain Mesh page.
   CURRENT_MESH = v === "origin" ? null : parseInt(v, 10);
   refreshMode();
 });
