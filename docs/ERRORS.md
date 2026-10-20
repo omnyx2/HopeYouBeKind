@@ -13,6 +13,16 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-09-19** · lablinux에서 누군가(콘솔 세션) GitHub 릴리스의 구버전 `meshd-Linux-X64`를
+  `sudo ./meshd-Linux-X64`로 여러 번 직접 실행 + 0.7.13 AppImage GUI 실행 → **`/root/.lattice/meshd/`의
+  `mesh-*.json`(멤버십+identity) 전부 소실**, systemd 유닛은 9/8부터 inactive였고 rogue 데몬이 소켓만
+  잡은 채 TUN 없음 → Oracle/Mac 모두 lablinux unreachable. 백업(ExportState) 없어 identity 복구 불가 →
+  quick bearer invite로 **#8(node-8)로 재가입** + `serve-exit` + `lattice exit home 8`로 exit 재지정.
+  팬텀 #4(구 lablinux)와 #2(구 mac)는 roster에 잔존(expel=creator-only, 미처리) → health floor만 올림.
+  **교훈: (1) 릴리스 바이너리를 라이브 노드에서 loose 실행하면 state를 먹거나 지운다 — 데몬 교체는
+  systemd 스왑 절차로만; (2) mesh state는 identity라 백업이 없으면 재가입뿐 — ExportState 백업을
+  노드마다 남겨라; (3) "A↔B 안 됨" 신고여도 먼저 제3노드 시점(`lattice info`)으로 누가 죽었는지 보라.**
+
 - **2026-08-22** · `scripts/build-app.sh`(= `npm run tauri build`) 돌렸더니 **라이브 VPN이 마운트된
   DMG에서 도는 새 앱으로 바뀜** → 원인: tauri의 dmg 번들 단계가 `bundle_dmg.sh`로 `/Volumes/Lattice`를
   auto-mount하고 그 볼륨의 새 `Lattice.app`이 실행됨 → single-instance guard로 새 meshd가 라이브

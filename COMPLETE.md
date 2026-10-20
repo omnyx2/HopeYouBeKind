@@ -5,6 +5,37 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## 리팩토링 Phase 0 — 안전망(테스트/린트/fuzz) + 소규모 버그 4건 (2026-10-20)
+
+4-영역 코드 감사(meshd / mesh+proto / net·tun·meshrun / GUI+CLI)에서 나온 첫 PR. 전부
+오프라인 검증(라이브 데몬 불가침); 커밋 4개, 모두 feat/extensions-meshd.
+
+1. ✅ **버그: `request_mutates`에 AdmitMember 누락** — admit이 `ms.certs`에 push해도 persist가
+   안 불려 재시작 시 cert 유실. + `persist_default_mesh`만 0600 chmod 빠진 비대칭(형제 파일은
+   전부 0600) 수정. persist 4종(split/split-active/default-mesh/extensions) 라운드트립 테스트 +
+   request_mutates 완전성 테이블 테스트(이 버그를 잡았을 테스트) 추가. commit `f2c93d6`.
+2. ✅ **테스트: mesh/ipc.rs 와이어 계약 동결** — Request 39 + Response 18 variant 전수 JSON
+   라운드트립 + golden wire-token(exhaustive match = 컴파일타임 완전성 가드) + 구버전 최소 JSON
+   파싱 테스트. variant rename이 이제 런타임 version-skew 대신 CI에서 터짐. commit `65c6df4`.
+3. ✅ **fuzz: meshrun 네트워크 파서 4종** — decode_gossip/decode_recipher/beacon_parse/parse_flow
+   타깃 추가(기존엔 legacy stun/wire만). 파서는 `#[doc(hidden)] pub`(fuzz 전용), 동작 무변경.
+   fuzz/는 자체 워크스페이스라 1.79로 안 풀림(기존과 동일) — stable check 통과,
+   `cargo +nightly fuzz run <target>`로 실행(cargo-fuzz 미설치 상태). commit `18c2d11`.
+4. ✅ **버그: CLI→GUI base64 불일치** — CLI는 urlsafe(`-_`), GUI `atob`는 표준(`+/`)만 → `-`/`_`
+   포함 초대/identity 코드가 GUI에서 "invalid". b64decode가 디코드 전 정규화; node+python
+   크로스체크로 양방향 검증. **버그: `esc()`가 `'` 미이스케이프** — 싱글쿼트 속성
+   (`data-scopes='…'`)에서 커넥터발 scope 문자열로 속성 탈출 가능 → `'`→`&#39;` 추가 + 누락
+   esc() 보강(state/pubkey_fp/charter invite/flow proto). 죽은 randHex64 + CLI `if False` 잔재
+   삭제. **ESLint**(no-undef/no-unused-vars) + `npm run lint` + CI eslint job 신설(vite 빌드는
+   JS를 전혀 검사 안 했음). commit `c9086f8`. ⚠️ GUI 변경은 커밋만 — 라이브 앱 스왑 안 함
+   (frontend는 앱 바이너리 임베드, 반영은 다음 번들 빌드 때).
+
+검증 게이트: `cargo test --workspace`(1.79) 전부 green(+신규 10개), clippy exit 0(신규 경고 0,
+struct-init으로 정리), plain `cargo fmt --all`, eslint 0건, vite 번들 OK, opsec-scan은 기존
+COMPLETE.md IP만 플래그(이번 변경엔 신규 IP 없음).
+
+---
+
 ## v0.7.15 — egress 3모드 명시화 (Off / Split / Full) + None exit 제거 (2026-08-22)
 
 사용자 지적: "config에서 None 없애야 + full-tunnel이 기본인데 자기 네트워크 쓰면 그건 메쉬 egress
