@@ -673,3 +673,408 @@ pub struct PolicyView {
     pub default: String,
     pub current_mesh: Option<MeshId>,
 }
+
+// --- WIRE CONTRACT tests ---------------------------------------------------------------
+//
+// There is NO `#[serde(tag = …)]` on `Request`/`Response`: serde's external tagging makes
+// the **Rust variant name itself the wire token** (`"ListMeshes"` for a unit variant,
+// `{"CreateMesh":{…}}` for a struct variant). The fleet runs mixed versions, so the
+// contract is: **additive evolution only** — never rename/remove/reorder a variant, new
+// fields take `#[serde(default)]` (docs/ERRORS.md: "unknown variant" = version skew).
+// These tests freeze that contract: the exhaustive `match` below is a compile-time
+// completeness guard (a new variant won't build until it's added here — add a sample too),
+// and the serialize assertions catch a rename or a stray `#[serde(rename)]` before it
+// breaks every older GUI/CLI/connector.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lattice_proto::flow::{FlowAction, FlowMatch, FlowRule};
+
+    /// The on-wire token of an externally tagged enum value: a bare string for unit
+    /// variants, the single object key for struct/tuple variants.
+    fn wire_tag(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Object(m) => {
+                assert_eq!(m.len(), 1, "externally tagged = exactly one key: {v}");
+                m.keys().next().unwrap().clone()
+            }
+            other => panic!("unexpected wire shape: {other}"),
+        }
+    }
+
+    /// FROZEN golden tokens. Changing a string here = a breaking protocol change.
+    fn request_tag(r: &Request) -> &'static str {
+        match r {
+            Request::CreateMesh { .. } => "CreateMesh",
+            Request::Ciphers => "Ciphers",
+            Request::Recipher { .. } => "Recipher",
+            Request::ExportState { .. } => "ExportState",
+            Request::ListMeshes => "ListMeshes",
+            Request::MeshInfo { .. } => "MeshInfo",
+            Request::TrafficStats { .. } => "TrafficStats",
+            Request::AdmitMember { .. } => "AdmitMember",
+            Request::SetExit { .. } => "SetExit",
+            Request::SetPeer { .. } => "SetPeer",
+            Request::SetCurrent { .. } => "SetCurrent",
+            Request::SetDefaultMesh { .. } => "SetDefaultMesh",
+            Request::ExpelMember { .. } => "ExpelMember",
+            Request::RemoveMesh { .. } => "RemoveMesh",
+            Request::Shutdown => "Shutdown",
+            Request::GetPolicy => "GetPolicy",
+            Request::GetFlows { .. } => "GetFlows",
+            Request::SetFlows { .. } => "SetFlows",
+            Request::NewIdentity => "NewIdentity",
+            Request::CreateInvite { .. } => "CreateInvite",
+            Request::CreateQuickInvite { .. } => "CreateQuickInvite",
+            Request::InviteAlgorithms => "InviteAlgorithms",
+            Request::ReportAttack { .. } => "ReportAttack",
+            Request::AllClear { .. } => "AllClear",
+            Request::JoinMesh { .. } => "JoinMesh",
+            Request::Hello { .. } => "Hello",
+            Request::Subscribe { .. } => "Subscribe",
+            Request::EnableExtension { .. } => "EnableExtension",
+            Request::DisableExtension { .. } => "DisableExtension",
+            Request::ListExtensions => "ListExtensions",
+            Request::Advertise { .. } => "Advertise",
+            Request::Unadvertise { .. } => "Unadvertise",
+            Request::ListServices { .. } => "ListServices",
+            Request::SplitAdd { .. } => "SplitAdd",
+            Request::SplitDel { .. } => "SplitDel",
+            Request::SplitList => "SplitList",
+            Request::SplitOn { .. } => "SplitOn",
+            Request::SplitOff => "SplitOff",
+            Request::SetExitable { .. } => "SetExitable",
+        }
+    }
+
+    /// FROZEN golden tokens (see [`request_tag`]).
+    fn response_tag(r: &Response) -> &'static str {
+        match r {
+            Response::MeshCreated { .. } => "MeshCreated",
+            Response::Meshes(_) => "Meshes",
+            Response::Mesh(_) => "Mesh",
+            Response::Traffic(_) => "Traffic",
+            Response::Policy(_) => "Policy",
+            Response::FlowRules(_) => "FlowRules",
+            Response::Identity { .. } => "Identity",
+            Response::Invite(_) => "Invite",
+            Response::Ciphers(_) => "Ciphers",
+            Response::Ok => "Ok",
+            Response::Info { .. } => "Info",
+            Response::Error { .. } => "Error",
+            Response::HelloOk { .. } => "HelloOk",
+            Response::Extension(_) => "Extension",
+            Response::Extensions(_) => "Extensions",
+            Response::Services(_) => "Services",
+            Response::Split(_) => "Split",
+            Response::Event { .. } => "Event",
+        }
+    }
+
+    /// One sample per `Request` variant (all 39) — keep in sync with [`request_tag`].
+    fn request_samples() -> Vec<Request> {
+        vec![
+            Request::CreateMesh {
+                name: "m".into(),
+                my_name: "me".into(),
+                max_members: 8,
+                cipher: Some("chachapoly-epoch".into()),
+                self_destruct: Some(false),
+                master_gated: Some(true),
+                expel: Some("creator".into()),
+                header: Some("random".into()),
+                exit_policy: Some("isolate".into()),
+                join: Some("any".into()),
+            },
+            Request::Ciphers,
+            Request::Recipher {
+                mesh: 1,
+                cipher: None,
+            },
+            Request::ExportState {
+                path: Some("/tmp/x.json".into()),
+            },
+            Request::ListMeshes,
+            Request::MeshInfo { mesh: 1 },
+            Request::TrafficStats { mesh: Some(1) },
+            Request::AdmitMember {
+                mesh: 1,
+                name: "a".into(),
+                pubkey_hex: "00".repeat(32),
+            },
+            Request::SetExit {
+                mesh: 1,
+                exit: Some(2),
+            },
+            Request::SetPeer {
+                mesh: 1,
+                member: 2,
+                endpoint: "203.0.113.1:41000".into(),
+            },
+            Request::SetCurrent { mesh: Some(1) },
+            Request::SetDefaultMesh { mesh: None },
+            Request::ExpelMember { mesh: 1, member: 2 },
+            Request::RemoveMesh { mesh: 1 },
+            Request::Shutdown,
+            Request::GetPolicy,
+            Request::GetFlows { mesh: 1 },
+            Request::SetFlows {
+                mesh: 1,
+                flows: vec![FlowRule {
+                    priority: 100,
+                    match_: FlowMatch::default(),
+                    action: FlowAction::Drop,
+                }],
+            },
+            Request::NewIdentity,
+            Request::CreateInvite {
+                mesh: 1,
+                name: "a".into(),
+                member_pubkey_hex: "11".repeat(32),
+                enc_pubkey_hex: "22".repeat(32),
+                issued_at: 1,
+                algo: None,
+            },
+            Request::CreateQuickInvite {
+                mesh: 1,
+                name: Some("a".into()),
+                max_uses: 2,
+                ttl_secs: 600,
+                algo: None,
+            },
+            Request::InviteAlgorithms,
+            Request::ReportAttack { mesh: 1 },
+            Request::AllClear { mesh: 1 },
+            Request::JoinMesh {
+                invite: WrappedInvite {
+                    salt: [7; 32],
+                    n: 9,
+                    ct: vec![1, 2, 3],
+                },
+                algo: Some("algo".into()),
+                name: Some("n".into()),
+            },
+            Request::Hello {
+                id: "minisync".into(),
+                version: "0.1".into(),
+                token: "tok".into(),
+            },
+            Request::Subscribe {
+                topics: vec!["peer".into()],
+            },
+            Request::EnableExtension {
+                id: "minisync".into(),
+                scopes: vec!["events:peer".into()],
+                all_meshes: false,
+                meshes: vec![1],
+            },
+            Request::DisableExtension {
+                id: "minisync".into(),
+            },
+            Request::ListExtensions,
+            Request::Advertise {
+                mesh: 1,
+                proto: "sync".into(),
+                port: 7070,
+                name: "svc".into(),
+                meta: serde_json::json!({"k": "v"}),
+            },
+            Request::Unadvertise {
+                mesh: 1,
+                proto: "sync".into(),
+            },
+            Request::ListServices {
+                mesh: 1,
+                proto: Some("sync".into()),
+            },
+            Request::SplitAdd {
+                domain: "example.com".into(),
+                mesh: 1,
+                exit: 0,
+            },
+            Request::SplitDel {
+                domain: "example.com".into(),
+            },
+            Request::SplitList,
+            Request::SplitOn { mesh: 1 },
+            Request::SplitOff,
+            Request::SetExitable {
+                mesh: 1,
+                enabled: true,
+            },
+        ]
+    }
+
+    /// One sample per `Response` variant (all 18) — keep in sync with [`response_tag`].
+    fn response_samples() -> Vec<Response> {
+        vec![
+            Response::MeshCreated { mesh: 1 },
+            Response::Meshes(vec![MeshSummary {
+                id: 1,
+                name: "m".into(),
+                members: 2,
+                epoch: 3,
+                exit: Some(2),
+                is_current: true,
+                exitable: false,
+                attack_armed_secs_left: None,
+                is_creator: true,
+                is_default: false,
+            }]),
+            Response::Mesh(MeshDetail {
+                id: 1,
+                name: "m".into(),
+                epoch: 3,
+                me: 1,
+                exit: None,
+                exitable: false,
+                invite: "OpenChain".into(),
+                trigger: "off".into(),
+                max_members: 8,
+                cipher: "chachapoly-epoch".into(),
+                members: vec![MemberView {
+                    id: 1,
+                    name: "me".into(),
+                    pubkey_fp: "abcd".into(),
+                    overlay_ip: "100.80.1.1".into(),
+                    is_me: true,
+                    endpoint: None,
+                    state: "me".into(),
+                    reason: None,
+                    path: "me".into(),
+                    last_seen_secs: None,
+                }],
+                live: 1,
+                threshold: 1,
+                attack_armed_secs_left: None,
+                is_creator: true,
+                self_destruct: false,
+                dp_error: None,
+                warnings: vec![],
+                network_fp: "ffff".into(),
+                expel: "creator-only".into(),
+                header_placement: "random".into(),
+                exit_policy: "isolate".into(),
+            }),
+            Response::Traffic(TrafficView::default()),
+            Response::Policy(PolicyView {
+                default: "direct".into(),
+                current_mesh: None,
+            }),
+            Response::FlowRules(vec![FlowRule {
+                priority: 1,
+                match_: FlowMatch::default(),
+                action: FlowAction::ToOverlayOwner,
+            }]),
+            Response::Identity {
+                member_pubkey_hex: "11".repeat(32),
+                enc_pubkey_hex: "22".repeat(32),
+                issued_at: 1,
+            },
+            Response::Invite(WrappedInvite {
+                salt: [1; 32],
+                n: 2,
+                ct: vec![3],
+            }),
+            Response::Ciphers(vec!["chachapoly-epoch".into()]),
+            Response::Ok,
+            Response::Info {
+                message: "hi".into(),
+            },
+            Response::Error {
+                message: "no".into(),
+            },
+            Response::HelloOk {
+                scopes: vec!["events:peer".into()],
+            },
+            Response::Extension(ExtensionView {
+                id: "minisync".into(),
+                scopes: vec![],
+                enabled: true,
+                token: "tok".into(),
+                all_meshes: true,
+                meshes: vec![],
+            }),
+            Response::Extensions(vec![]),
+            Response::Services(vec![ServiceView {
+                mesh: 1,
+                member: 2,
+                member_name: "a".into(),
+                overlay_ip: "100.80.1.2".into(),
+                proto: "sync".into(),
+                port: 7070,
+                name: "svc".into(),
+                meta: serde_json::json!(null),
+                online: true,
+            }]),
+            Response::Split(SplitView {
+                rules: vec![SplitRuleView {
+                    domain: "example.com".into(),
+                    mesh: 1,
+                    exit: 0,
+                }],
+                active_mesh: Some(1),
+            }),
+            Response::Event {
+                topic: "peer".into(),
+                seq: 1,
+                ts_ms: 2,
+                data: serde_json::json!({"member": 2}),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_request_roundtrips_and_keeps_its_wire_token() {
+        let samples = request_samples();
+        let mut seen = std::collections::HashSet::new();
+        for r in &samples {
+            let json = serde_json::to_value(r).unwrap();
+            assert_eq!(wire_tag(&json), request_tag(r), "wire token drifted");
+            let back: Request = serde_json::from_value(json.clone())
+                .unwrap_or_else(|e| panic!("{} does not round-trip: {e}", request_tag(r)));
+            let rejson = serde_json::to_value(&back).unwrap();
+            assert_eq!(json, rejson, "{} round-trip unstable", request_tag(r));
+            assert!(seen.insert(request_tag(r)), "duplicate sample");
+        }
+    }
+
+    #[test]
+    fn every_response_roundtrips_and_keeps_its_wire_token() {
+        let samples = response_samples();
+        let mut seen = std::collections::HashSet::new();
+        for r in &samples {
+            let json = serde_json::to_value(r).unwrap();
+            assert_eq!(wire_tag(&json), response_tag(r), "wire token drifted");
+            let back: Response = serde_json::from_value(json.clone())
+                .unwrap_or_else(|e| panic!("{} does not round-trip: {e}", response_tag(r)));
+            let rejson = serde_json::to_value(&back).unwrap();
+            assert_eq!(json, rejson, "{} round-trip unstable", response_tag(r));
+            assert!(seen.insert(response_tag(r)), "duplicate sample");
+        }
+    }
+
+    // An OLD client's minimal JSON (before the `#[serde(default)]` fields were added) must
+    // keep parsing — field evolution is additive, exactly like variant evolution.
+    #[test]
+    fn older_clients_minimal_json_still_parses() {
+        let r: Request =
+            serde_json::from_str(r#"{"CreateMesh":{"name":"m","my_name":"a","max_members":8}}"#)
+                .expect("pre-cipher CreateMesh still parses");
+        match r {
+            Request::CreateMesh { cipher, .. } => assert_eq!(cipher, None),
+            _ => unreachable!(),
+        }
+        let _: Request = serde_json::from_str(r#""ListMeshes""#).unwrap();
+        let _: Request =
+            serde_json::from_str(r#"{"Hello":{"id":"x","token":"t"}}"#).expect("no-version Hello");
+        let _: Response = serde_json::from_str(r#""Ok""#).unwrap();
+        // A MeshSummary from an older daemon (none of the `#[serde(default)]` fields).
+        let s: MeshSummary = serde_json::from_str(
+            r#"{"id":1,"name":"m","members":1,"epoch":0,"exit":null,"is_current":false}"#,
+        )
+        .expect("older MeshSummary still parses");
+        assert!(!s.exitable);
+    }
+}
