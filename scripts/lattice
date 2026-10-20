@@ -93,6 +93,10 @@ def _refused_hint(what):
 
 # ----------------------------- helpers -----------------------------
 def b64(obj):
+    # URL-safe alphabet (`-`/`_`). The GUI emits the STANDARD alphabet (`+`/`/`);
+    # `unb64` accepts both (urlsafe_b64decode passes `+`/`/` through untouched), and the
+    # GUI's decoder normalizes ours — keep both decoders alphabet-tolerant or CLI↔GUI
+    # code exchange silently breaks (it did, GUI-side, until 2026-10-20).
     return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
 
 
@@ -426,7 +430,7 @@ def cmd_allclear(sock, a):
 def _fmt_bytes(n):
     for u in ("B", "KB", "MB", "GB"):
         if n < 1024 or u == "GB":
-            return f"{n:.0f}{u}" if u == "B" else f"{n/1:.0f}{u}" if False else f"{n:.1f}{u}"
+            return f"{n:.0f}{u}" if u == "B" else f"{n:.1f}{u}"
         n /= 1024
 
 

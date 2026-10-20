@@ -9,12 +9,8 @@ const el = (id) => document.getElementById(id);
 
 // ---- helpers ----
 function esc(s) {
-  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-}
-function randHex64() {
-  let s = "";
-  for (let i = 0; i < 64; i++) s += "0123456789abcdef"[Math.floor(Math.random() * 16)];
-  return s;
+  // `'` included: some call sites interpolate into single-quoted attributes (data-scopes etc.).
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 let toastTimer;
 function toast(msg) {
@@ -27,7 +23,15 @@ function toast(msg) {
 
 // ---- join-flow codes (§2b): base64(JSON) so each is one copy-pasteable string ----
 function b64encode(obj) { return btoa(unescape(encodeURIComponent(JSON.stringify(obj)))); }
-function b64decode(s) { try { return JSON.parse(decodeURIComponent(escape(atob((s || "").trim())))); } catch { return null; } }
+// The CLI (scripts/lattice) emits URL-SAFE base64 (`-`/`_`); `atob` only takes the standard
+// alphabet (`+`/`/`), so normalize before decoding or every CLI→GUI code fails as "invalid".
+// (CLI→GUI needed this; GUI→CLI already worked — Python's decoder takes both alphabets.)
+function b64decode(s) {
+  try {
+    const t = (s || "").trim().replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.parse(decodeURIComponent(escape(atob(t))));
+  } catch { return null; }
+}
 function encodeIdentity(id) { return b64encode({ m: id.member_pubkey_hex, e: id.enc_pubkey_hex, t: id.issued_at || 0 }); }
 function decodeIdentity(code) {
   const o = b64decode(code);
@@ -229,7 +233,7 @@ async function renderPeersFor(id) {
   catch (e) { toast(String(e)); return; }
   const rows = d.members.map((m) => {
     const role = m.is_me ? "this node" : d.exit === m.id ? "exit" : "member";
-    const st = m.state || "unknown";
+    const st = esc(m.state || "unknown");
     const badge = `<span class="state-badge state-${st}">${st}</span>`;
     const ep = m.endpoint ? `<span class="muted small mono"> ${esc(m.endpoint)}</span>` : "";
     // Unreachable peer (not me, not live / no endpoint) → offer an inline "set address" right
@@ -251,7 +255,7 @@ async function renderPeersFor(id) {
     // (e.g. ssh user@100.80.1.1) — far more useful day-to-day than the physical endpoint.
     const ov = m.overlay_ip ? `<span class="mono small">${esc(m.overlay_ip)}</span>` : "";
     return `<tr><td>${m.id}</td><td>${esc(m.name)}${m.is_me ? ' <span class="muted small">(me)</span>' : ""}</td>` +
-      `<td>${ov}</td><td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}${why}${action}${expelBtn}</td></tr>`;
+      `<td>${ov}</td><td class="mono small">${esc(m.pubkey_fp)}</td><td>${role}</td><td>${badge}${ep}${why}${action}${expelBtn}</td></tr>`;
   }).join("");
   const tbl = el("peers-table");
   tbl.querySelector("tbody").innerHTML = rows;
@@ -706,7 +710,7 @@ async function renderOverview(id) {
   try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
   catch (e) { toast(String(e)); return setMode("user"); }
   const rows = d.members.map((mb) =>
-    `<tr><td>${mb.id}</td><td>${esc(mb.name)}${mb.is_me ? ' <span class="muted small">(me)</span>' : ""}</td><td class="mono small">${mb.pubkey_fp}</td></tr>`
+    `<tr><td>${mb.id}</td><td>${esc(mb.name)}${mb.is_me ? ' <span class="muted small">(me)</span>' : ""}</td><td class="mono small">${esc(mb.pubkey_fp)}</td></tr>`
   ).join("");
   const warn = meshWarnings(d);
   // Current egress mode for this mesh (read-only badge; change it in Configs' Off/Split/Full).
@@ -720,7 +724,7 @@ async function renderOverview(id) {
       <div><span class="pill ${egMode === "Off" ? "warn" : "on"}" title="Configs 탭에서 Off/Split/Full 변경">egress: ${egMode}</span></div>
     </div>
     ${warn.length ? `<div class="kv"><span>warnings</span><b><a href="#" id="ov-goto-warn" style="color:#ff6477">⚠ ${warn.length} active — open Warnings</a></b></div>` : ""}
-    <div class="kv"><span>charter</span><b class="small">${d.invite} · ${esc(d.trigger)} · max ${d.max_members} · ${d.self_destruct ? "ephemeral (self-destruct)" : "persistent"}</b></div>
+    <div class="kv"><span>charter</span><b class="small">${esc(d.invite)} · ${esc(d.trigger)} · max ${d.max_members} · ${d.self_destruct ? "ephemeral (self-destruct)" : "persistent"}</b></div>
     <div class="kv"><span>network</span><b class="mono small">${esc(d.network_fp || "?")}</b></div>
     <div class="kv"><span>expel</span><b class="small">${esc(d.expel || "?")}</b></div>
     <div class="kv"><span>header (P-C5)</span><b class="small">${esc(d.header_placement || "?")}</b></div>
@@ -1044,7 +1048,7 @@ function fmtFlowMatch(m) {
   const p = [];
   if (m.scope != null) p.push(m.scope.toLowerCase());
   if (m.dst_cidr != null) p.push(`dst ${m.dst_cidr[0]}/${m.dst_cidr[1]}`);
-  if (m.proto != null) p.push({ 1: "icmp", 6: "tcp", 17: "udp" }[m.proto] || `proto ${m.proto}`);
+  if (m.proto != null) p.push({ 1: "icmp", 6: "tcp", 17: "udp" }[m.proto] || `proto ${esc(m.proto)}`);
   if (m.dport != null) p.push(`dport ${m.dport}`);
   return p.length ? p.join(", ") : "any";
 }
