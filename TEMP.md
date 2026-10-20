@@ -28,6 +28,7 @@ fleet: Mac v0.7.15(0ba7f44) + lablinux v0.7.15(e38ce57) + oracle v0.7.13(dab561f
   스왑 → 오버레이 검증. 백업 meshd.v0713.bak.
 
 열린 이슈:
-- ⚠️ opsec: COMPLETE.md/ERRORS.md 등에 실제 인프라 IP 커밋됨(기존부터, 일부 main에 push).
-  스크럽 필요 여부 사용자 확인.
-- feat/extensions-meshd → main 머지 (v0.7.14/0.7.15 + Phase 0) 대기.
+- opsec (2026-10-21 처리): 팁의 COMPLETE.md 실 IP 11건 → 플레이스홀더 스크럽, opsec-scan 0 =
+  CI 게이트 green. 미push 트리 전수 스캔 결과 **새 식별자 0** — 플래그된 값 전부 이미 origin에
+  공개돼 있던 것(main COMPLETE.md 8건 + origin/feat 7건). 히스토리 rewrite는 이미 공개된 값이라
+  실익 없음 — 필요해지면(인프라 교체 등) 그때 사용자 결정.

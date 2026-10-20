@@ -197,7 +197,7 @@ v0.7.13 = extensions + per-mesh `exitable` + exit-fixes + **join-modes(secure/qu
 split-persist + meshd single-instance fix + default-mesh. Cert 와이어 byte-identical +
 `CTRL_QGRANT`(0x09) append-only → 혼합버전 배포 안전.
 - **Fleet 전부 v0.7.13 build dab561f + 연결**: Oracle(systemctl restart, direct
-  138.2.14.219:41000), lablinux(LAN SSH 172.28.7.32 바이너리 스왑, relay), Mac(CI dmg
+  <ORACLE_PUB>:41000), lablinux(LAN SSH 172.28.7.32 바이너리 스왑, relay), Mac(CI dmg
   clean-swap: backup→shutdown→quit→ditto→relaunch once; `version v0.7.13 build dab561f`,
   `default` 명령 동작). 홈 메쉬 3노드 정상.
 - **join-modes 라이브 검증**: Oracle이 quick 초대(`invite --quick --max 3 --expire 1h`,
@@ -245,10 +245,10 @@ mesh exitable. Expresses the "all meshes / selected only / never" policy as per-
 Verified per-domain split-tunnel where the exit is ANOTHER member (incl. this computer acting as
 an exit for someone else): updated lablinux to a07da4d (built on Oracle, scp'd; **gave lablinux a
 systemd unit** since setsid launches over ssh didn't persist). On lablinux, rule `ifconfig.me →
-member #7 (Mac)`, split on → `curl ifconfig.me` returned **203.247.167.58 (the Mac's egress)**,
-not lablinux's own 210.107.188.8 — so lablinux's traffic exited through the Mac (path: lablinux →
+member #7 (Mac)`, split on → `curl ifconfig.me` returned **<CAMPUS_NAT> (the Mac's egress)**,
+not lablinux's own <LAB_PUB> — so lablinux's traffic exited through the Mac (path: lablinux →
 Oracle relay → Mac NAT → internet), even though Mac↔lablinux can't reach directly (campus
-isolation, relayed). off reverted to 210.107.188.8. Mac forwards+NATs as a client (forwarding=1,
+isolation, relayed). off reverted to <LAB_PUB>. Mac forwards+NATs as a client (forwarding=1,
 pf nat 100.64/10) so it works as an exit without being a pinned exit node.
 
 ## Per-domain split-tunnel exit — BUILT + LIVE-verified (2026-07-23)
@@ -272,9 +272,9 @@ Tagged v0.7.5 @ 975d26c (F1 split-tunnel + F2 conns); CI built all-platform inst
 Fresh-installed on every reachable node, GUI + daemon, all verified `v0.7.5 build 975d26c`:
 - **Mac**: removed old /Applications app, installed official 0.7.5 dmg fresh, relaunched — LIVE.
 - **Oracle** (ubuntu systemd): swapped meshd-Linux-X64 into ~/myVpn/target/release/meshd, restart — LIVE direct exit.
-- **lablinux** (hyunseok): `dpkg -i` the 0.7.5 deb (GUI /usr/bin/lattice + meshd both updated),
+- **lablinux** (<LAB_USER>): `dpkg -i` the 0.7.5 deb (GUI /usr/bin/lattice + meshd both updated),
   relaunched via /tmp/lab-start.sh — LIVE, now DIRECT to Mac (path re-converged on fresh install).
-- **Windows**: offline (192.168.0.6 + 10.32.86.243 down) — skipped.
+- **Windows**: offline (192.168.0.6 + <CAMPUS_LAN> down) — skipped.
 Connection book confirms oracle+lablinux both `direct`. Gotcha: the poisoned `grep` shell wrapper
 masked dpkg success output — use `command grep` when reading remote command output.
 
@@ -285,7 +285,7 @@ key→value." Auto-discovery/connect/endpoint-persistence ALREADY existed (DHT +
 relay→direct + to_persisted.peers reloaded on start). New: surface the RESULT as a connection
 book. MemberView gained `path` (direct/relay/offline/me) + `last_seen_secs`, derived in detail()
 from the Link's last_seen_ms/last_direct_ms. `lattice conns <mesh>` renders per-member key→value.
-LIVE (build bc0aee3): oracle shown `direct` 11s-ago at 138.2.14.219, correctly classified. — bc0aee3
+LIVE (build bc0aee3): oracle shown `direct` 11s-ago at <ORACLE_PUB>, correctly classified. — bc0aee3
 Deferred: persist path-history for post-restart view; GUI conns card; F2 relay-case live shot
 (same last_direct_ms logic, shown in logs earlier).
 
@@ -343,7 +343,7 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
   rule. Found by the cross-node test. — `af13e63` / released `v0.7.8` (`40aa1f2`)
 - **Cross-node verified (Mac client ↔ lablinux #4 exit, v0.7.8 fresh install):**
   exitable OFF → curl ifconfig.me FAILS (dropped; route→utun6 + overlay healthy, so genuinely
-  dropped at exit); exitable ON → NAT scoped to `100.80.1.0/24` only, curl → 210.107.188.8
+  dropped at exit); exitable ON → NAT scoped to `100.80.1.0/24` only, curl → <LAB_PUB>
   (lablinux egress); ON→OFF live (no restart) → NAT purged, curl fails again. — verified
 
 ## 2026-07-25 — v0.7.9: pinned-exit isolate/own-IP regression (found by user's "diff the code" call)
@@ -354,15 +354,15 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
   999`; macOS `to ! 100.64.0.0/10`). Only forwarded INTERNET isolates. — `3a3646e` / `v0.7.9`
 - **Oracle deployed v0.7.9 + code-path verified**: cleared rules → restart → bringup AUTO-added
   999 bypass + 1000 isolate; `ip route get 100.80.1.7 from 100.80.1.1` → `dev tun0`; Mac→Oracle
-  overlay ssh `TUNNEL_OK`; Oracle-exit egress = 138.2.14.219 (isolate still works); NAT =
+  overlay ssh `TUNNEL_OK`; Oracle-exit egress = <ORACLE_PUB> (isolate still works); NAT =
   `100.80.1.0/24` only. Diagnosis method: diffed last-working baseline (NOT a guessed rekey/OS
   wedge) — logged in docs/ERRORS.md. — verified
 
 ## 2026-07-25 — full empirical cross-check (Mac on hotspot) + v0.7.10 hygiene fix
 - **Cross-check matrix ALL PASS** after Mac switched to an IPv6/CGNAT hotspot: self-healing
   re-learned the new endpoint and reconnected to both nodes (data-path TCP verified, not just
-  gossip); version uniformity; full connectivity matrix; exitable OFF→drop / ON→210.107.188.8 /
-  ON→OFF-live-purge / per-subnet NAT; Oracle isolate exit egress 138.2.14.219 + overlay
+  gossip); version uniformity; full connectivity matrix; exitable OFF→drop / ON→<LAB_PUB> /
+  ON→OFF-live-purge / per-subnet NAT; Oracle isolate exit egress <ORACLE_PUB> + overlay
   simultaneously; split-tunnel; 66+6 unit tests, fmt, clippy clean.
 - **Finding #1 (fixed, v0.7.10 `205495d`)**: the v0.7.8 legacy-`100.64/10` purge only ran in
   `disable_nat`, so a pinned exit (enable_nat-only) accumulated 130 leftover `FORWARD 100.64/10
