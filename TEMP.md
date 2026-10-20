@@ -5,18 +5,18 @@
 2026-10-20 4-영역 감사 기반. 라이브 데몬 불가침 원칙 유지.
 (보류 중: GUI 페이지 단위 분할(상태 설계 필요 — DOM-diff 재작업과 함께), 데몬 reason CODE.)
 
-0. [ ] **수명주기 개편 (docs/LIFECYCLE.md, 2026-10-21 시작)** — 데몬=OS 서비스 소유,
-   GUI=무권한 뷰어+트레이, 설치·삭제 통합(메쉬 state 질문→ExportState stash→자동 재로드):
-   (a) 트레이+창닫기숨김+2종 Quit (b) daemon/autostart Tauri 커맨드 (c) Settings 패널
-   (d) install/uninstall-mac.sh (e) 후속: NSIS cleanup, deb prerm, Win 네이티브 서비스,
-   버전 불일치 경고. 라이브 검증 체크리스트 = LIFECYCLE.md §8.
+0. [ ] **수명주기 개편 — 남은 후속** (구현분 (a)~(d)는 COMPLETE.md 2026-10-21 / db04076):
+   (e) Windows NSIS 커스텀 템플릿(설치 전 cleanup: 런카피/예약태스크 + 제거부) ·
+   deb postinst/prerm에 systemd 유닛 연결 · Win 네이티브 서비스화(windows-service) ·
+   GUI의 데몬↔앱 버전 불일치 경고 · 업데이트 배너와 state-질문 플로우 통합.
+   **다음 번들 설치 때 라이브 검증 = docs/LIFECYCLE.md §8 체크리스트** (feat/lifecycle 브랜치).
 1. [ ] Phase 4 — 라이브/멀티노드 검증 필요 묶음(각각 단독 커밋 + 라이브 재검증, 스왑 절차 준수):
    - handle 내 lock 쥔 동기 shell-out(route/pfctl/powershell)을 PostAction으로 — 라우팅 복원과
      IPC 응답 순서가 바뀌는 의미 변화(kill-switch/SetCurrent{None} 경로).
    - DHT 재발견의 endpoint 무조건 덮어쓰기(meshd dht reconnect) — apply_gossip_table 불변식
      (fresh direct는 안 덮음) 적용. docs/DHT_RENDEZVOUS.md 펴놓고.
-   - 창닫기=데몬사망 → 시스템 트레이(+명시적 "Quit & disconnect"). orphan-root-meshd 사고 이력
-     주의(single-instance guard 테스트 필수).
+   - ~~창닫기=데몬사망 → 트레이~~ **구현됨**(db04076, feat/lifecycle) — 라이브 검증만 남음
+     (LIFECYCLE.md §8; orphan 모델이 서비스 소유로 바뀐 점 유의).
    - quick-admit HashMap 비결정성(membership.rs grant_members) — roster-merge 의미 변화,
      혼합버전 페어 테스트 필요.
    참고: 다음 플릿 롤아웃 때 Phase 2~4 변경 전체의 라이브 검증 겸사(버전업 + 클린스왑).
