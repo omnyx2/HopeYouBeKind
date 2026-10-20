@@ -98,17 +98,11 @@ impl MacTun {
         // 6. Assign the overlay address and route the overlay subnet here.
         configure_interface(&name, &config)?;
 
-        tracing_name(&name);
         Ok(Self {
             fd: AsyncFd::new(owned).map_err(|e| TunError::Io(e.to_string()))?,
             name,
         })
     }
-}
-
-fn tracing_name(_name: &str) {
-    // (Kept separate so the open() body stays readable; real logging is wired
-    // by the daemon's tracing subscriber.)
 }
 
 /// Bring the interface up with its overlay address and route the overlay subnet.
