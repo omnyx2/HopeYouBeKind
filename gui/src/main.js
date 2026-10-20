@@ -515,6 +515,7 @@ document.querySelectorAll(".nav-item").forEach((b) =>
     if (tab === "join-mesh") { return activateTab("join-mesh"); }
     if (tab === "traffic") { activateTab("traffic"); return renderTraffic("user"); }
     if (tab === "extensions") { activateTab("extensions"); return renderExtensions(); }
+    if (tab === "settings") { activateTab("settings"); return renderSettings(); }
     activateTab(tab);
     if (tab === "mesh-overview") return CURRENT_MESH != null ? renderOverview(CURRENT_MESH) : renderMeshPlain();
     if (CURRENT_MESH == null) return;
@@ -1082,6 +1083,58 @@ async function renderWarnings(id) {
   wireDangerCard(id, d);
 }
 
+// ---- Settings: app & daemon lifecycle (docs/LIFECYCLE.md §3) ----
+// The daemon is a background service the GUI merely observes: this panel shows its
+// state, starts it on demand (one elevation prompt), and owns the two autostart
+// toggles (daemon-at-boot = OS service, GUI-at-login = per-user, no elevation).
+async function renderSettings() {
+  const body = el("settings-body");
+  if (!body) return;
+  let st = { running: false, boot: false, gui_autostart: false };
+  try { const r = await invoke("daemon_status"); if (r) st = r; } catch {}
+  body.innerHTML = `
+    <div class="card">
+      <div class="card-head"><h2 class="card-title">VPN 데몬 (meshd)</h2></div>
+      <div class="kv"><span>상태</span><b>${st.running
+        ? '<i class="tdot live"></i> 실행 중 — 백그라운드 서비스'
+        : '<i class="tdot peer"></i> 꺼짐'}</b></div>
+      ${st.running ? "" : `<div class="add-row" style="margin-top:6px">
+        <button class="small-btn" id="set-daemon-start">데몬 시작</button>
+        <span class="muted small">관리자 권한을 한 번 요청합니다 (VPN 터널 생성)</span></div>`}
+      <label class="toggle-row" style="margin-top:10px">
+        <input type="checkbox" id="set-boot" ${st.boot ? "checked" : ""} />
+        <span>컴퓨터를 켤 때 VPN 자동 시작
+          <span class="muted small">(OS 서비스로 등록 — 켜고 끌 때 관리자 권한 1회)</span></span>
+      </label>
+      <label class="toggle-row" style="margin-top:4px">
+        <input type="checkbox" id="set-gui-auto" ${st.gui_autostart ? "checked" : ""} />
+        <span>로그인하면 Lattice 열기 <span class="muted small">(권한 불필요)</span></span>
+      </label>
+      <p class="muted small" style="margin-top:10px">창을 닫으면 트레이(메뉴바)로 숨고 VPN은
+        계속 돕니다. 완전히 끄려면 트레이 메뉴의 <b>종료 + VPN 중지</b>.</p>
+    </div>`;
+  el("set-daemon-start")?.addEventListener("click", async () => {
+    toast("데몬 시작 중 — 권한 창을 확인하세요");
+    try {
+      const ok = await invoke("daemon_start");
+      toast(ok ? "데몬 실행 중" : "시작 실패 — /tmp/lattice-meshd.log 확인");
+    } catch (e) { toast(String(e)); }
+    renderSettings();
+  });
+  el("set-boot")?.addEventListener("change", async (e) => {
+    const want = e.target.checked;
+    try {
+      await invoke("set_daemon_boot", { enabled: want });
+      toast(want ? "부팅 시 자동 시작 설정됨" : "부팅 자동 시작 해제됨");
+    } catch (err) { toast(String(err)); }
+    renderSettings(); // re-read the real state (the prompt may have been cancelled)
+  });
+  el("set-gui-auto")?.addEventListener("change", async (e) => {
+    try { await invoke("set_gui_autostart", { enabled: e.target.checked }); toast("저장됨"); }
+    catch (err) { toast(String(err)); e.target.checked = !e.target.checked; }
+  });
+}
+
 // ---- top widget bar (§1): status (left) + view toggle + egress dropdown ----
 async function refreshTopbar() {
   let meshes = null, splitActive = null;
@@ -1098,7 +1151,9 @@ function refreshTopbarWith(meshes, splitActive) {
   const dot = el("tb-dot"), sum = el("tb-summary"), sel = el("tb-egress");
   if (meshes == null) {
     dot.className = "conn-dot off"; sum.textContent = "meshd offline";
-    sel.innerHTML = `<option value="origin">Origin</option>`; sel.disabled = true; return;
+    sel.innerHTML = `<option value="origin">Origin</option>`; sel.disabled = true;
+    updateTray("VPN 꺼짐");
+    return;
   }
   sel.disabled = false;
   const egress = meshes.find((m) => m.is_current);
@@ -1118,6 +1173,14 @@ function refreshTopbarWith(meshes, splitActive) {
     dot.className = "conn-dot warn";
     sum.textContent = "직접 인터넷 (메쉬 egress off)";
   }
+  updateTray(sum.textContent);
+}
+
+// Mirror the topbar summary into the tray menu's status line (docs/LIFECYCLE.md §3) —
+// the tray is where "Lattice가 켜져 있나"를 창 없이 확인한다. No-op in the browser demo.
+function updateTray(summary) {
+  if (!window.__TAURI__) return;
+  invoke("tray_status", { summary }).catch(() => {});
 }
 
 // [User|Mesh] = view toggle (no daemon call).

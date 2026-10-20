@@ -11,6 +11,45 @@ bumps (`0.x.0`) may break compatibility, patch bumps (`0.0.x`) are additive/fixe
 > **Note:** the `[Unreleased]` / `[0.x.0]` sections below pre-date the v2 rewrite and
 > describe the **v1 engine** (Noise-IK, network CA). v2 release notes start here.
 
+## [0.7.16] — 2026-10-21
+
+### Added
+- **System tray on all three OSes** — Lattice now lives in the menu bar / tray: a live
+  status line (Full/Split tunnel · mesh, or off), *Open*, and **two explicit quits**:
+  **종료 (VPN 유지)** — the default; the daemon keeps running — and **종료 + VPN 중지**.
+- **Settings page**: daemon state + on-demand start (one admin prompt), **start the VPN
+  at boot** (macOS LaunchDaemon / Linux systemd / Windows scheduled task), and **open
+  Lattice at login** (per-user, no elevation).
+- **Clean macOS install/uninstall** (`scripts/install-mac.sh` rebuilt, new
+  `scripts/uninstall-mac.sh`): tears down every legacy remnant (manual daemons,
+  tauri-dev leftovers, DMG mounts, stale sockets — with a graceful Shutdown first so
+  routes/DNS are restored), and treats mesh state as an **identity**: kept by default
+  (ExportState snapshot + auto re-import), deleted only on a typed confirmation.
+- Relay/reflexion/re-cipher diagnostics now reach the daemon's log file on Windows
+  (previously lost to a hidden stderr).
+
+### Changed
+- **Closing the window no longer stops the VPN** — it hides to the tray. The daemon is
+  a background service the app merely observes (docs/LIFECYCLE.md).
+- Relay election is deterministic (freshest public peer, stable ties) — no more
+  relay flapping between equally-qualified peers.
+- The member list reports *direct/relay* with the same freshness window the data plane
+  routes with (the UI could previously claim "direct" while frames already relayed).
+
+### Fixed
+- A locally admitted member (`AdmitMember`) now persists across daemon restarts.
+- CLI-minted invite/identity codes containing `-`/`_` no longer fail in the GUI as
+  "invalid code" (base64 alphabet interop).
+- GUI escaping hardened (quote injection via connector-supplied scope strings closed).
+- Dropped frames no longer pay an AEAD seal / burn a nonce.
+
+### Internal
+- Refactor Phases 0-4: wire-contract golden tests for the whole IPC enum, persist-format
+  round-trip tests, fuzz targets for the gossip/beacon parsers, ESLint CI; dead code
+  purged (meshd builds no longer pull mdns-sd); meshd's 4.9k-line main.rs split into 7
+  modules; one MeshState constructor; meshrun's 13-argument run() → DataPlaneHandles
+  with named select-arm handlers; GUI leaf modules + a single poll scheduler.
+
 ## [0.7.15] — 2026-08-22
 
 ### Changed

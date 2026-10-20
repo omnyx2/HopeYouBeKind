@@ -51,6 +51,14 @@ socket + `MESHD_STATE_DIR`, no `DATA_PLANE`) or on a test mesh. Swap the live da
 explicitly agreed, via `lattice off` → `lattice shutdown` → quit app → relaunch once → re-auth.
 Diagnose reachability with `curl`/TCP, not `ping` (ICMP is blocked on campus). See BUILD.md §5.
 
+**Network-touching tests run as DETACHED scripts, never in the assistant's own shell.**
+Toggling VPN/routes/DNS/egress (or swapping the daemon) can cut the very connection the
+automation runs over — the test then half-completes with nobody watching. So: write a small
+self-contained script (each step + its own verification + restore), run it detached
+(`nohup … &`, osascript admin, `start_new_session`), have it log every step PASS/FAIL to a
+temp file (e.g. `/tmp/lattice-livecheck-<ts>.txt`), and read that file AFTER the network
+settles to judge the result.
+
 ## When something breaks — diff the last stable baseline FIRST
 
 Before hypothesizing a wedge, an OS quirk, infra, or a deep bug, **localize the change**: a

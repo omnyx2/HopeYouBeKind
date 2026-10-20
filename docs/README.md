@@ -26,6 +26,7 @@ Start here, then dive into the feature guide you need.
 | --- | --- |
 | [MEMBERSHIP.md](MEMBERSHIP.md) | Closed networks: network identity, the serverless CA, enrolling nodes (join tokens), and evicting them (revocation). |
 | [EXIT_NODE.md](EXIT_NODE.md) | Route a node's general internet traffic out through a chosen peer. |
+| [LIFECYCLE.md](LIFECYCLE.md) | Install / run / uninstall lifecycle: the daemon as an OS background service, the tray, autostart toggles, and clean install/uninstall with mesh-state preservation. |
 | [../legacy/docs/CRYPTO_SUITE.md](../legacy/docs/CRYPTO_SUITE.md) | _(v1 legacy)_ The pluggable tunnel-crypto seam — swap the handshake/cipher without touching the engine. |
 | [../legacy/docs/TRAFFIC_MONITOR.md](../legacy/docs/TRAFFIC_MONITOR.md) | _(v1 legacy)_ Live per-flow view of everything crossing the tunnel (`lattice flows`). |
 | [../legacy/docs/RELAY.md](../legacy/docs/RELAY.md) | _(v1 legacy)_ Forward encrypted traffic through a third node when two peers can't connect directly (CGNAT). |

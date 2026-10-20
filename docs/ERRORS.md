@@ -13,6 +13,14 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-10-21** · v0.7.16(lifecycle) 첫 라이브 설치 중 → 새 데몬이 소켓에 양보하고 종료, 포트
+  42002/42900 "already in use", 소켓은 root 소유 stale 파일로 잔존 → 원인: **예전 `tauri dev`가
+  띄운 `target/debug/resources/meshd` 좀비**가 포트+소켓을 쥐고 있었음(가드는 설계대로 양보).
+  fixed by 좀비 소멸 후 앱 재실행(데몬이 stale 소켓 자가 제거+바인드, state/egress 전부 자동
+  복귀) + install-mac.sh teardown에 dev-경로 데몬 pkill 명시 추가. **교훈: (1) dev 데몬도 잔재
+  인벤토리다; (2) 네트워크를 바꾸는 라이브 검증은 detached 스크립트→임시파일 기록→나중에 읽기
+  (API가 네트워크 전환에 끊김 — CLAUDE.md 명문화).**
+
 - **2026-10-21** · modified `fuzz/Cargo.toml` deps(Phase 1 feature 재배선) → fuzz 워크스페이스에서
   `lattice-meshrun` 컴파일 실패: `no method named set_reuse_port found for Socket`
   (meshrun/lan.rs:72) — 메인 워크스페이스에선 **tokio가 socket2의 `all` feature를 켜주는 feature

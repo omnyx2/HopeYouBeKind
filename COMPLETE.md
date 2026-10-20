@@ -5,6 +5,34 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## 수명주기 개편 1차 — 데몬 서비스화 + 트레이 + 설치/삭제 통합 (2026-10-21)
+
+사용자 요구: "배포가 너무 번잡 — 설치/삭제 깔끔히 통합, 데몬은 유저가 안 만지는 백그라운드,
+GUI는 뷰어, 트레이 표시(3 OS), 설치 시 레거시 정리 + 메쉬 state는 물어보고 보존/복귀."
+설계 = **docs/LIFECYCLE.md** (목표 모델/per-OS 서비스/설치·삭제 플로우/레거시 인벤토리/§8
+라이브 체크리스트). 구현 commit `db04076` (feat/lifecycle 브랜치, 오프라인 검증만):
+
+1. ✅ 트레이(3 OS) + 상태줄(폴 틱이 tray_status로 미러) + `열기` + **2종 Quit**("종료 VPN 유지"
+   기본 / "종료+VPN 중지"=Shutdown IPC). 창 닫기 → prevent_close+hide. ExitRequested의 무조건
+   Shutdown 제거 — GUI-소유 모델의 고아 방지책이었고, 서비스 모델에선 outliving daemon이 정상
+   (Phase 4의 "창닫기=데몬사망" 항목 해소, 라이브 검증 남음).
+2. ✅ Tauri 커맨드: daemon_status / daemon_start(온디맨드 승격 실행) / set_daemon_boot
+   (macOS LaunchDaemon — KeepAlive=크래시時만이라 clean Shutdown이 안 튕김; Linux pkexec로
+   CLI와 동일 systemd 유닛; Windows SYSTEM ONSTART 예약태스크+ProgramData 카피) /
+   set_gui_autostart(LaunchAgent / autostart .desktop / HKCU Run — 무권한). 부팅 토글 ON은
+   수동 데몬을 먼저 Shutdown시켜 서비스 인스턴스로 클린 핸드오버(가드와 플랩 방지).
+3. ✅ GUI Settings 패널: 데몬 상태+시작 버튼, 자동시작 토글 2종, 트레이/종료 설명.
+4. ✅ install-mac.sh 전면 개편 + uninstall-mac.sh 신설: state=identity 원칙(기본 보존, 데몬
+   살아있으면 ExportState 스냅샷→새 데몬 자동 재임포트, 삭제는 'delete' 타이핑 확인), pkill
+   전에 graceful Shutdown(routes/DNS 복원), 레거시 정리(DMG 마운트/.prev/소켓), LaunchDaemon
+   핸드오버, 설치 후 /Volumes 프로세스 sanity 체크.
+
+검증: stable cargo check(src-tauri, 경고 0) + eslint + vite build + bash -n + opsec clean.
+라이브 동작(트레이/서비스/스크립트)은 **다음 번들 설치에서 LIFECYCLE.md §8로 검증** — 이번
+세션은 라이브 앱/데몬 불가침 유지. 후속(NSIS/deb/Win 서비스/버전 경고)은 TEMP.md.
+
+---
+
 ## 리팩토링 Phase 4 (오프라인 묶음) — 진단 sink + 리포팅/라우팅 결함 3건 (2026-10-21)
 
 행동 변화지만 전부 오프라인(유닛테스트+빌드) 검증 가능한 묶음. 커밋 4개, 각각 단독.
