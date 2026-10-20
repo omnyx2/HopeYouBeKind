@@ -28,8 +28,11 @@ GUI는 뷰어, 트레이 표시(3 OS), 설치 시 레거시 정리 + 메쉬 stat
    핸드오버, 설치 후 /Volumes 프로세스 sanity 체크.
 
 검증: stable cargo check(src-tauri, 경고 0) + eslint + vite build + bash -n + opsec clean.
-라이브 동작(트레이/서비스/스크립트)은 **다음 번들 설치에서 LIFECYCLE.md §8로 검증** — 이번
-세션은 라이브 앱/데몬 불가침 유지. 후속(NSIS/deb/Win 서비스/버전 경고)은 TEMP.md.
+**라이브 검증 완료(2026-10-21, v0.7.16 build 6eb4c9a, detached 체커)**: 신규 install-mac.sh로
+설치(state 보존 플로우), 메쉬+sticky egress+full-tunnel 전부 자동 복귀(egress IP=oracle 확인),
+창닫기→트레이 생존(GUI/데몬/소켓 생존). 중간에 tauri-dev 좀비 meshd 사건 발견→teardown 보강
+(1399273, docs/ERRORS.md). **main 머지 2d2dd78 + push + CHANGELOG 0.7.16.** fleet: Mac=0.7.16,
+lablinux=0.7.15, oracle=0.7.13. 후속(NSIS/deb/Win 서비스/버전 경고/§8 잔여 육안)은 TEMP.md.
 
 ---
 
