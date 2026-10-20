@@ -90,10 +90,10 @@ where
     F: Fn() -> Vec<LanMesh>,
 {
     let Some(sock) = open_socket() else {
-        eprintln!("meshrun: LAN discovery disabled (couldn't bind udp/{LAN_PORT})");
+        rlog!("meshrun: LAN discovery disabled (couldn't bind udp/{LAN_PORT})");
         return;
     };
-    eprintln!("meshrun: LAN discovery live on {LAN_GROUP}:{LAN_PORT}");
+    rlog!("meshrun: LAN discovery live on {LAN_GROUP}:{LAN_PORT}");
     let dst = SocketAddr::V4(SocketAddrV4::new(LAN_GROUP, LAN_PORT));
     let mut beacon = tokio::time::interval(std::time::Duration::from_secs(LAN_BEACON_SECS));
     let mut buf = [0u8; 64];

@@ -30,6 +30,33 @@ use lattice_net::Transport;
 use lattice_proto::wire_v2::MemberId;
 use lattice_tun::TunDevice;
 
+// ---- diagnostics sink --------------------------------------------------------------
+// meshrun's messages (relay decisions, direct-path recovery, reflexion, re-cipher) are
+// the single most useful live diagnostics in the product — but bare `rlog!` goes to
+// a stderr NOBODY can read when the GUI runs meshd elevated+hidden on Windows (meshd
+// grew `diag_log`/`elog!` for exactly that). The daemon installs a sink at startup that
+// tees to its diagnostic file; standalone (tests, no sink) falls back to stderr.
+static LOG_SINK: std::sync::OnceLock<Box<dyn Fn(&str) + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Route this crate's diagnostics through `f` (meshd: eprintln + its diag file).
+/// First caller wins; unset = plain stderr.
+pub fn set_log_sink(f: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = LOG_SINK.set(Box::new(f));
+}
+
+#[doc(hidden)]
+pub fn log_line(s: &str) {
+    match LOG_SINK.get() {
+        Some(f) => f(s),
+        None => eprintln!("{s}"),
+    }
+}
+
+/// `rlog!`-shaped logging that honours [`set_log_sink`].
+macro_rules! rlog {
+    ($($a:tt)*) => { crate::log_line(&format!($($a)*)) };
+}
+
 pub mod lan;
 pub use lan::{run_lan_discovery, LanMesh};
 
@@ -584,7 +611,7 @@ impl LoopCtx {
                     let last = self.relay_log_at.get(&to).copied().unwrap_or(0);
                     if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
                         self.relay_log_at.insert(to, now);
-                        eprintln!(
+                        rlog!(
                             "meshrun: relaying overlay → member {to} via relay member {member} ({via}) — no direct path"
                         );
                     }
@@ -593,7 +620,7 @@ impl LoopCtx {
                     let last = self.relay_log_at.get(&to).copied().unwrap_or(0);
                     if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
                         self.relay_log_at.insert(to, now);
-                        eprintln!(
+                        rlog!(
                             "meshrun: dropping overlay frame for member {to} — not directly reachable and no relay available"
                         );
                     }
@@ -658,7 +685,7 @@ impl LoopCtx {
                 e.endpoint = from;
                 e.last_direct_ms = now;
                 if recovered {
-                    eprintln!("meshrun: direct path to member {src} established ({from})");
+                    rlog!("meshrun: direct path to member {src} established ({from})");
                 }
             }
         }
@@ -687,7 +714,7 @@ impl LoopCtx {
                         if let Some(observed) = reflect {
                             let mut me = self.my_endpoint.lock().unwrap();
                             if *me != Some(observed) {
-                                eprintln!(
+                                rlog!(
                                     "meshrun: learned public address {observed} (reflected by {from}) — re-advertising"
                                 );
                                 *me = Some(observed);
@@ -700,7 +727,7 @@ impl LoopCtx {
                 // in place and report it up to the supervisor.
                 Some(CTRL_RECIPHER) => {
                     if let Some(r) = decode_recipher(&payload[1..]) {
-                        eprintln!("meshrun: re-cipher → epoch {} cipher {}", r.epoch, r.cipher);
+                        rlog!("meshrun: re-cipher → epoch {} cipher {}", r.epoch, r.cipher);
                         self.dp.recipher(
                             lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
                             &r.secret,
@@ -766,7 +793,7 @@ impl LoopCtx {
                         let now = now_ms();
                         if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
                             self.relay_log_at.insert(to, now);
-                            eprintln!(
+                            rlog!(
                                 "meshrun: relay asked to forward to member {to} but its endpoint is unknown — dropping"
                             );
                         }
@@ -840,9 +867,10 @@ impl LoopCtx {
                             .await;
                     }
                 }
-                eprintln!(
+                rlog!(
                     "meshrun: re-ciphered (initiator) → epoch {} cipher {}",
-                    r.epoch, r.cipher
+                    r.epoch,
+                    r.cipher
                 );
                 self.dp.recipher(
                     lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
@@ -928,6 +956,21 @@ pub async fn run<X: Transport + 'static>(handles: DataPlaneHandles<X>) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // The diagnostics sink: once installed, every rlog! line reaches it (meshd tees
+    // these into its diag file so Windows' hidden-stderr daemon stays debuggable).
+    #[test]
+    fn log_sink_receives_lines() {
+        let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let g2 = Arc::clone(&got);
+        set_log_sink(move |s| g2.lock().unwrap().push(s.to_string()));
+        log_line("meshrun: sink smoke");
+        assert!(got
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == "meshrun: sink smoke"));
+    }
 
     use lattice_mesh::crypto::suite;
     use lattice_net::memory::duplex;

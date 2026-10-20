@@ -286,6 +286,14 @@ fn split_list(st: &State) -> Response {
 /// load persisted meshes (and bring up their data planes if `DATA_PLANE`), then serve the IPC
 /// socket/pipe. The single-instance behaviour + restore-from-disk live here.
 async fn main() -> anyhow::Result<()> {
+    // Route meshrun's diagnostics (relay decisions, direct-path recovery, reflexion,
+    // re-cipher) through elog!'s sinks — stderr + the diag file. On Windows the GUI
+    // runs meshd elevated+hidden, so the file is the ONLY place those lines were
+    // previously lost (they went to an unreadable stderr).
+    lattice_meshrun::set_log_sink(|s| {
+        eprintln!("{s}");
+        diag_log(s);
+    });
     // First line in the log: proves meshd actually launched (vs the GUI's launcher
     // failing before this point), and records the args we got.
     let argv: Vec<String> = std::env::args().collect();
