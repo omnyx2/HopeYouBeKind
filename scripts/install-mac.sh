@@ -59,6 +59,8 @@ ipc '"Shutdown"' >/dev/null          # graceful: restores routes + DNS before ex
 sleep 2
 pkill -f "Lattice.app/Contents/Resources/resources/meshd" 2>/dev/null || true
 pkill -f "resources/meshd $SOCK" 2>/dev/null || true
+pkill -f "target/debug/resources/meshd" 2>/dev/null || true    # tauri-dev leftovers
+pkill -f "target/release/resources/meshd" 2>/dev/null || true
 rm -f "$SOCK"
 
 echo "3/6  레거시 잔재 제거…"

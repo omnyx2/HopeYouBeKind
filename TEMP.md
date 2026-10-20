@@ -9,7 +9,10 @@
    (e) Windows NSIS 커스텀 템플릿(설치 전 cleanup: 런카피/예약태스크 + 제거부) ·
    deb postinst/prerm에 systemd 유닛 연결 · Win 네이티브 서비스화(windows-service) ·
    GUI의 데몬↔앱 버전 불일치 경고 · 업데이트 배너와 state-질문 플로우 통합.
-   **다음 번들 설치 때 라이브 검증 = docs/LIFECYCLE.md §8 체크리스트** (feat/lifecycle 브랜치).
+   라이브 검증(2026-10-21, v0.7.16 설치): ✅창닫기→트레이 생존+VPN 유지 ✅데몬 v0.7.16 기동
+   ✅state/egress/full-tunnel 자동 복귀 ✅설치 스크립트(보존 플로우). 남은 §8: 트레이 메뉴
+   육안(상태줄·열기·종료 2종), "종료+VPN 중지", 부팅 토글 재부팅 검증, GUI 자동시작,
+   uninstall-mac.sh 실전. fleet: Mac=0.7.16, lablinux=0.7.15, oracle=0.7.13.
 1. [ ] Phase 4 — 라이브/멀티노드 검증 필요 묶음(각각 단독 커밋 + 라이브 재검증, 스왑 절차 준수):
    - handle 내 lock 쥔 동기 shell-out(route/pfctl/powershell)을 PostAction으로 — 라우팅 복원과
      IPC 응답 순서가 바뀌는 의미 변화(kill-switch/SetCurrent{None} 경로).
