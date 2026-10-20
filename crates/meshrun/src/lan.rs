@@ -52,7 +52,8 @@ fn beacon_encode(tag: &[u8; 8], member: MemberId, port: u16) -> [u8; BEACON_LEN]
 }
 
 /// Parse a beacon → (tag, member, data-plane port). `None` if it isn't one of ours.
-fn beacon_parse(b: &[u8]) -> Option<([u8; 8], MemberId, u16)> {
+#[doc(hidden)] // pub ONLY for fuzz/ harnesses — not API
+pub fn beacon_parse(b: &[u8]) -> Option<([u8; 8], MemberId, u16)> {
     if b.len() != BEACON_LEN || &b[0..4] != BEACON_MAGIC {
         return None;
     }
@@ -89,10 +90,10 @@ where
     F: Fn() -> Vec<LanMesh>,
 {
     let Some(sock) = open_socket() else {
-        eprintln!("meshrun: LAN discovery disabled (couldn't bind udp/{LAN_PORT})");
+        rlog!("meshrun: LAN discovery disabled (couldn't bind udp/{LAN_PORT})");
         return;
     };
-    eprintln!("meshrun: LAN discovery live on {LAN_GROUP}:{LAN_PORT}");
+    rlog!("meshrun: LAN discovery live on {LAN_GROUP}:{LAN_PORT}");
     let dst = SocketAddr::V4(SocketAddrV4::new(LAN_GROUP, LAN_PORT));
     let mut beacon = tokio::time::interval(std::time::Duration::from_secs(LAN_BEACON_SECS));
     let mut buf = [0u8; 64];

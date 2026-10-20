@@ -1,21 +1,16 @@
 // Lattice GUI (v2) — talks ONLY to meshd via the `meshd` proxy command.
 // Two view modes (widget-bar toggle): User (manage the set of meshes) and Mesh
 // (operate one mesh). See docs/GUI.md and docs/GUI_PAGES.md.
-
-const invoke = window.__TAURI__?.invoke ?? mockInvoke;
-if (!window.__TAURI__) console.warn("Lattice: Tauri API not found — meshd unreachable (browser demo).");
+import { invoke, meshd } from "./bridge.js";
+import {
+  esc, encodeIdentity, decodeIdentity, encodeInvite, decodeInvite,
+  fmtBytes, parseDur, optList,
+  fmtFlowAction, fmtFlowMatch, parseCidr, defaultFlowTable,
+  egressModeOf, EGRESS_LABEL,
+} from "./util.js";
 
 const el = (id) => document.getElementById(id);
 
-// ---- helpers ----
-function esc(s) {
-  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-}
-function randHex64() {
-  let s = "";
-  for (let i = 0; i < 64; i++) s += "0123456789abcdef"[Math.floor(Math.random() * 16)];
-  return s;
-}
 let toastTimer;
 function toast(msg) {
   const t = el("toast");
@@ -23,31 +18,6 @@ function toast(msg) {
   t.classList.remove("hidden");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.add("hidden"), 2600);
-}
-
-// ---- join-flow codes (§2b): base64(JSON) so each is one copy-pasteable string ----
-function b64encode(obj) { return btoa(unescape(encodeURIComponent(JSON.stringify(obj)))); }
-function b64decode(s) { try { return JSON.parse(decodeURIComponent(escape(atob((s || "").trim())))); } catch { return null; } }
-function encodeIdentity(id) { return b64encode({ m: id.member_pubkey_hex, e: id.enc_pubkey_hex, t: id.issued_at || 0 }); }
-function decodeIdentity(code) {
-  const o = b64decode(code);
-  if (!o) return null;
-  // Accept BOTH the GUI short form {m,e,t} AND the CLI/daemon form
-  // {member_pubkey_hex, enc_pubkey_hex, issued_at} so CLI ↔ GUI invites interoperate.
-  const m = o.m || o.member_pubkey_hex, e = o.e || o.enc_pubkey_hex, t = o.t ?? o.issued_at ?? 0;
-  return m && e ? { m, e, t } : null;
-}
-function encodeInvite(w) { return b64encode(w); }
-// P-C6: the invite is now a WrappedInvite {salt, n, ct}.
-function decodeInvite(code) { const o = b64decode(code); return o && o.ct != null && o.salt != null ? o : null; }
-
-// ---- meshd bridge (the only daemon channel) ----
-async function meshd(req) {
-  const s = await invoke("meshd", { request: JSON.stringify(req) });
-  let r;
-  try { r = JSON.parse(s); } catch { throw new Error("bad meshd response"); }
-  if (r && r.Error) throw new Error(r.Error.message);
-  return r;
 }
 
 // ---- view mode (§1 toggle) ----
@@ -85,8 +55,8 @@ async function refreshMode() {
 // Mesh mode with no mesh selected (you're on the default network) — a plain page.
 function renderMeshPlain() {
   el("mesh-detail").innerHTML = `<div class="empty" style="padding:48px 24px;text-align:center">
-      On the default network — no mesh selected.
-      <div class="muted small" style="margin-top:8px">Pick a mesh as egress above, or open one from the Meshes page.</div>
+      직접 인터넷 사용 중 — 메쉬 egress off (선택된 메쉬 없음).
+      <div class="muted small" style="margin-top:8px">위에서 메쉬를 egress로 고르거나, Meshes 페이지에서 메쉬를 열어 Off/Split/Full을 선택하세요.</div>
     </div>`;
 }
 
@@ -229,7 +199,7 @@ async function renderPeersFor(id) {
   catch (e) { toast(String(e)); return; }
   const rows = d.members.map((m) => {
     const role = m.is_me ? "this node" : d.exit === m.id ? "exit" : "member";
-    const st = m.state || "unknown";
+    const st = esc(m.state || "unknown");
     const badge = `<span class="state-badge state-${st}">${st}</span>`;
     const ep = m.endpoint ? `<span class="muted small mono"> ${esc(m.endpoint)}</span>` : "";
     // Unreachable peer (not me, not live / no endpoint) → offer an inline "set address" right
@@ -251,7 +221,7 @@ async function renderPeersFor(id) {
     // (e.g. ssh user@100.80.1.1) — far more useful day-to-day than the physical endpoint.
     const ov = m.overlay_ip ? `<span class="mono small">${esc(m.overlay_ip)}</span>` : "";
     return `<tr><td>${m.id}</td><td>${esc(m.name)}${m.is_me ? ' <span class="muted small">(me)</span>' : ""}</td>` +
-      `<td>${ov}</td><td class="mono small">${m.pubkey_fp}</td><td>${role}</td><td>${badge}${ep}${why}${action}${expelBtn}</td></tr>`;
+      `<td>${ov}</td><td class="mono small">${esc(m.pubkey_fp)}</td><td>${role}</td><td>${badge}${ep}${why}${action}${expelBtn}</td></tr>`;
   }).join("");
   const tbl = el("peers-table");
   tbl.querySelector("tbody").innerHTML = rows;
@@ -294,11 +264,6 @@ async function renderPeersFor(id) {
 // A = per-peer bytes/packets summary; press "Detail ▸" → B = recent packet flows.
 let TRAFFIC_DETAIL = { user: false, mesh: false };
 const TRAFFIC_LAST = {}; // scope:mesh → {at, rx, tx} for throughput between polls
-function fmtBytes(n) {
-  const u = ["B", "KB", "MB", "GB"]; let i = 0;
-  while (n >= 1024 && i < 3) { n /= 1024; i++; }
-  return (i ? n.toFixed(1) : n.toFixed(0)) + u[i];
-}
 async function renderTraffic(scope) {
   const body = el(scope === "user" ? "user-traffic-body" : "mesh-traffic-body");
   if (!body) return;
@@ -602,7 +567,7 @@ async function renderMeshes() {
   try { splitMesh = ((await meshd("SplitList")).Split || {}).active_mesh ?? null; } catch {}
   // General traffic is on the default network unless a mesh is a FULL egress; a split selection
   // leaves general traffic direct, so it doesn't count here (it gets its own "split" pill below).
-  const noEgress = !meshes.some((m) => m.is_current && m.id !== splitMesh);
+  const noEgress = !meshes.some((m) => egressModeOf(m.id, m.is_current, splitMesh) === "full");
   const originRow = `<li>
       <div class="peer-left">
         <span class="dot ${noEgress ? "connected" : "known"}"></span>
@@ -613,9 +578,10 @@ async function renderMeshes() {
       <div><button class="small-btn" data-origin ${noEgress ? "disabled" : ""}>use this</button></div>
     </li>`;
   const rows = meshes.length ? meshes.map((m) => {
-    const egress = m.id === splitMesh
+    const mode = egressModeOf(m.id, m.is_current, splitMesh);
+    const egress = mode === "split"
       ? `<span class="pill on" title="only matched domains route via this mesh; general traffic stays direct">split</span>`
-      : (m.is_current ? `<span class="pill on">egress</span>` : "");
+      : (mode === "full" ? `<span class="pill on">egress</span>` : "");
     const exit = m.exit != null ? `exit #${m.exit}` : "no exit";
     const defBadge = m.is_default ? `<span class="pill on" title="default mesh — the app opens here on start">★ default</span>` : "";
     return `<li>
@@ -706,16 +672,21 @@ async function renderOverview(id) {
   try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
   catch (e) { toast(String(e)); return setMode("user"); }
   const rows = d.members.map((mb) =>
-    `<tr><td>${mb.id}</td><td>${esc(mb.name)}${mb.is_me ? ' <span class="muted small">(me)</span>' : ""}</td><td class="mono small">${mb.pubkey_fp}</td></tr>`
+    `<tr><td>${mb.id}</td><td>${esc(mb.name)}${mb.is_me ? ' <span class="muted small">(me)</span>' : ""}</td><td class="mono small">${esc(mb.pubkey_fp)}</td></tr>`
   ).join("");
   const warn = meshWarnings(d);
+  // Current egress mode for this mesh (read-only badge; change it in Configs' Off/Split/Full).
+  let splitActive = null, isCurrent = false;
+  try { splitActive = (await meshd("SplitList")).Split?.active_mesh ?? null; } catch {}
+  try { isCurrent = ((await meshd("ListMeshes")).Meshes || []).some((m) => m.id === id && m.is_current); } catch {}
+  const egMode = EGRESS_LABEL[egressModeOf(id, isCurrent, splitActive)];
   el("mesh-detail").innerHTML = `
     <div class="card-head">
       <h2 class="card-title">⬢ ${esc(d.name)} <span class="muted small">#${d.id}</span></h2>
-      <div><button class="small-btn" id="ov-egress">make egress</button></div>
+      <div><span class="pill ${egMode === "Off" ? "warn" : "on"}" title="Configs 탭에서 Off/Split/Full 변경">egress: ${egMode}</span></div>
     </div>
     ${warn.length ? `<div class="kv"><span>warnings</span><b><a href="#" id="ov-goto-warn" style="color:#ff6477">⚠ ${warn.length} active — open Warnings</a></b></div>` : ""}
-    <div class="kv"><span>charter</span><b class="small">${d.invite} · ${esc(d.trigger)} · max ${d.max_members} · ${d.self_destruct ? "ephemeral (self-destruct)" : "persistent"}</b></div>
+    <div class="kv"><span>charter</span><b class="small">${esc(d.invite)} · ${esc(d.trigger)} · max ${d.max_members} · ${d.self_destruct ? "ephemeral (self-destruct)" : "persistent"}</b></div>
     <div class="kv"><span>network</span><b class="mono small">${esc(d.network_fp || "?")}</b></div>
     <div class="kv"><span>expel</span><b class="small">${esc(d.expel || "?")}</b></div>
     <div class="kv"><span>header (P-C5)</span><b class="small">${esc(d.header_placement || "?")}</b></div>
@@ -724,14 +695,10 @@ async function renderOverview(id) {
     <div class="kv"><span>epoch</span><b>${d.epoch}</b></div>
     <div class="kv"><span>health</span><b>${d.live}/${d.members.length} live · floor ${d.threshold}${d.attack_armed_secs_left != null ? ` · <span style="color:#e44">⚠ ARMED ${d.attack_armed_secs_left}s</span>` : ""}</b></div>
     ${d.dp_error ? `<div class="kv"><span>data plane</span><b style="color:#ff6477">⛔ DOWN — ${esc(d.dp_error)}</b></div>` : ""}
-    <div class="kv"><span>my exit</span><b>${d.exit != null ? "#" + d.exit : "none"}</b></div>
+    <div class="kv"><span>인터넷 관문 (exit)</span><b>${d.exit != null ? "#" + d.exit : "미설정"}</b></div>
     <h3 class="topo-h">Roster <span class="muted small">(${d.members.length})</span></h3>
     <table class="topo-table"><thead><tr><th>id</th><th>name</th><th>pubkey</th></tr></thead><tbody>${rows}</tbody></table>
-    <p class="muted small" style="margin-top:10px">Manage exit, peers, invites and key rotation in <b>Configs</b>; see alerts in <b>Warnings</b>.</p>`;
-  el("ov-egress").onclick = async () => {
-    try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); }
-    refreshMode();
-  };
+    <p class="muted small" style="margin-top:10px">관문(exit)과 egress 모드(Off/Split/Full), 피어·초대·키 회전은 <b>Configs</b>에서; 알림은 <b>Warnings</b>에서.</p>`;
   el("ov-goto-warn")?.addEventListener("click", (e) => { e.preventDefault(); activateTab("mesh-warnings"); renderWarnings(id); });
 }
 
@@ -767,13 +734,6 @@ function inviteCardHtml() {
       <p class="small" style="color:#e0a020;margin-top:8px">Tell them the algorithm <b id="ov-inv-algo-out" class="mono"></b> — over a <i>different</i> channel than the code.</p>
     </div>
   </div>`;
-}
-// Duration string → seconds ('600' | '10m' | '2h' | '1d').
-function parseDur(s) {
-  s = String(s || "").trim().toLowerCase();
-  const m = { s: 1, m: 60, h: 3600, d: 86400 };
-  const last = s.slice(-1);
-  return last in m ? Math.round(parseFloat(s) * m[last]) : parseInt(s, 10);
 }
 function wireInviteCard(id) {
   const mode = () => el("ov-inv-mode").value;
@@ -845,13 +805,53 @@ function wireDangerCard(id, d) {
   };
 }
 
+// Apply one of the 3 egress modes (Off / Split / Full) for a mesh, built from the daemon's
+// existing requests — no routing-logic change in meshd. Always tear down to a clean baseline first
+// (`SetCurrent None` restores routes+DNS and turns split off) so every transition is idempotent and
+// never stacks a split proxy on top of a full tunnel. Full/Split need the mesh's exit gateway, so
+// we set it from the picker before diverting.
+async function setEgressMode(id, mode, gatewayVal) {
+  try {
+    await meshd({ SetCurrent: { mesh: null } }); // baseline: direct internet, split off, routes/DNS restored
+    if (mode === "off") {
+      toast("Off — 직접 인터넷");
+    } else {
+      const gw = gatewayVal === "" || gatewayVal == null ? null : parseInt(gatewayVal, 10);
+      if (gw == null) {
+        toast("먼저 이 메쉬의 인터넷 관문(exit)을 골라주세요");
+      } else {
+        await meshd({ SetExit: { mesh: id, exit: gw } });
+        if (mode === "full") { await meshd({ SetCurrent: { mesh: id } }); toast("Full — 전부 이 메쉬 관문으로"); }
+        else { await meshd({ SplitOn: { mesh: id } }); toast("Split — 도메인 규칙만 이 메쉬 관문으로"); }
+      }
+    }
+  } catch (e) { toast(String(e)); }
+  renderConfigs(id);
+  refreshTopbar();
+}
+
 async function renderConfigs(id) {
   let d;
   try { d = (await meshd({ MeshInfo: { mesh: id } })).Mesh; }
   catch (e) { toast(String(e)); return setMode("user"); }
-  const exitOpts = [`<option value="">— none —</option>`].concat(
-    d.members.map((mb) => `<option value="${mb.id}" ${d.exit === mb.id ? "selected" : ""}>#${mb.id} ${esc(mb.name)}</option>`)
-  ).join("");
+  // The mesh's internet GATEWAY (exit) — other members only; routing through yourself is
+  // meaningless. No "— none —": a mesh you actually route through always has a gateway, so you
+  // pick one. An internal-only mesh simply never turns egress on (leaves the mode Off). Defaults
+  // to the current pick, else the browser selects the first candidate.
+  const exitCandidates = d.members.filter((mb) => !mb.is_me);
+  const exitOpts = exitCandidates
+    .map((mb) => `<option value="${mb.id}" ${d.exit === mb.id ? "selected" : ""}>#${mb.id} ${esc(mb.name)}</option>`)
+    .join("");
+  // Current egress mode for THIS mesh — the 3 explicit modes. The split proxy selects its own
+  // mesh (SplitList.active_mesh); a full tunnel sets is_current WITHOUT split. So: split-active →
+  // Split, else current → Full, else Off.
+  let splitActive = null, isCurrent = false;
+  try { splitActive = (await meshd("SplitList")).Split?.active_mesh ?? null; } catch {}
+  try { isCurrent = ((await meshd("ListMeshes")).Meshes || []).some((m) => m.id === id && m.is_current); } catch {}
+  const egMode = egressModeOf(id, isCurrent, splitActive);
+  const hasExitCand = exitCandidates.length > 0;
+  const exitName = d.exit != null && exitCandidates.find((m) => m.id === d.exit)
+    ? " " + esc(exitCandidates.find((m) => m.id === d.exit).name) : "";
   const peerOpts = d.members.filter((mb) => !mb.is_me)
     .map((mb) => `<option value="${mb.id}">#${mb.id} ${esc(mb.name)}</option>`).join("");
   // Split-tunnel exit choices: other members only (routing to yourself makes no sense).
@@ -862,12 +862,23 @@ async function renderConfigs(id) {
   el("mesh-config-body").innerHTML = `
     <div class="card">
       <div class="card-head"><h2 class="card-title">Egress &amp; routing</h2></div>
-      <div class="kv"><span>my exit</span><b>${d.exit != null ? "#" + d.exit : "none"}</b></div>
-      <div class="add-row">
-        <select id="ov-exit" class="select">${exitOpts}</select>
-        <button class="small-btn" id="ov-exit-set">set exit</button>
-        <button class="small-btn" id="ov-egress">make egress</button>
+      <div class="kv"><span>이 메쉬의 인터넷 관문 (exit)</span><b>${d.exit != null ? "#" + d.exit + exitName : "미설정"}</b></div>
+      ${hasExitCand
+        ? `<div class="add-row">
+             <select id="ov-exit" class="select">${exitOpts}</select>
+             <button class="small-btn" id="ov-exit-set">관문 지정</button>
+           </div>`
+        : `<p class="muted small">다른 멤버가 없어 exit 관문을 둘 수 없습니다 — 멤버를 초대하면 egress를 켤 수 있어요.</p>`}
+      <div class="kv" style="margin-top:12px"><span>내 egress 모드</span><b>${egMode === "full" ? "Full — 전부 이 메쉬로" : egMode === "split" ? "Split — 특정 도메인만" : "Off — 직접 인터넷"}</b></div>
+      <div id="ov-mode" class="add-row" style="margin-top:4px">
+        <button class="seg-btn ${egMode === "off" ? "active" : ""}" data-egmode="off">Off</button>
+        <button class="seg-btn ${egMode === "split" ? "active" : ""}" data-egmode="split" ${hasExitCand ? "" : "disabled"}>Split</button>
+        <button class="seg-btn ${egMode === "full" ? "active" : ""}" data-egmode="full" ${hasExitCand ? "" : "disabled"}>Full</button>
       </div>
+      <p class="muted small" style="margin-top:6px">
+        <b>Off</b> — 내 인터넷 직결(이 메쉬로 안 나감) · <b>Split</b> — 아래 도메인만 이 메쉬 관문으로 ·
+        <b>Full</b> — 모든 트래픽을 이 메쉬 관문으로. 이 컴퓨터의 egress는 한 번에 하나의 메쉬만 사용합니다.
+      </p>
     </div>
     <div class="card">
       <div class="card-head"><h2 class="card-title">Peer address <span class="muted small">(manual)</span></h2></div>
@@ -914,12 +925,13 @@ async function renderConfigs(id) {
     <p class="muted small" style="margin-top:6px">Invite a member is on the <b>Peers</b> tab; Report attack / Wipe are on the <b>Warnings</b> tab.</p>`;
   renderFlows(id);
   renderSplit(id);
-  el("ov-egress").onclick = async () => { try { await meshd({ SetCurrent: { mesh: id } }); toast("set as egress"); } catch (e) { toast(String(e)); } refreshMode(); };
-  el("ov-exit-set").onclick = async () => {
+  if (el("ov-exit-set")) el("ov-exit-set").onclick = async () => {
     const v = el("ov-exit").value;
-    try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("exit set"); } catch (e) { toast(String(e)); }
+    try { await meshd({ SetExit: { mesh: id, exit: v === "" ? null : parseInt(v, 10) } }); toast("관문 지정됨"); } catch (e) { toast(String(e)); }
     renderConfigs(id);
   };
+  document.querySelectorAll("#ov-mode [data-egmode]").forEach((b) => b.onclick = () =>
+    setEgressMode(id, b.dataset.egmode, el("ov-exit") ? el("ov-exit").value : ""));
   el("ov-peer-set").onclick = async () => {
     const m = parseInt(el("ov-peer-id").value, 10);
     const ep = el("ov-peer-ep").value.trim();
@@ -980,32 +992,6 @@ async function renderSplit(id) {
 }
 
 // ---- SDN flow table editor (Phase 2: unsigned, gossiped) ----
-function fmtFlowAction(act) {
-  if (typeof act === "string") return act;          // ToOverlayOwner / Local / Drop
-  const k = Object.keys(act)[0], v = act[k];
-  if (k === "ToExit") return v == null ? "→ exit" : `→ exit node ${v}`;
-  if (k === "ToPeer") return `→ peer ${v}`;
-  return `${k}(${v})`;
-}
-function fmtFlowMatch(m) {
-  const p = [];
-  if (m.scope != null) p.push(m.scope.toLowerCase());
-  if (m.dst_cidr != null) p.push(`dst ${m.dst_cidr[0]}/${m.dst_cidr[1]}`);
-  if (m.proto != null) p.push({ 1: "icmp", 6: "tcp", 17: "udp" }[m.proto] || `proto ${m.proto}`);
-  if (m.dport != null) p.push(`dport ${m.dport}`);
-  return p.length ? p.join(", ") : "any";
-}
-function parseCidr(s) {
-  s = s.trim();
-  if (s.includes("/")) { const [n, l] = s.split("/"); return [n, parseInt(l, 10)]; }
-  return [s, 32];
-}
-function defaultFlowTable() {
-  return [
-    { priority: 0, match_: { scope: "Overlay", dst_cidr: null, proto: null, dport: null }, action: "ToOverlayOwner" },
-    { priority: 0, match_: { scope: "Internet", dst_cidr: null, proto: null, dport: null }, action: { ToExit: null } },
-  ];
-}
 async function renderFlows(id) {
   let rules = [];
   try { rules = (await meshd({ GetFlows: { mesh: id } })).FlowRules || []; }
@@ -1098,26 +1084,39 @@ async function renderWarnings(id) {
 
 // ---- top widget bar (§1): status (left) + view toggle + egress dropdown ----
 async function refreshTopbar() {
+  let meshes = null, splitActive = null;
+  try {
+    meshes = (await meshd("ListMeshes")).Meshes || [];
+    try { splitActive = (await meshd("SplitList")).Split?.active_mesh ?? null; } catch {}
+  } catch { /* meshes stays null → offline rendering */ }
+  refreshTopbarWith(meshes, splitActive);
+}
+
+// Render the topbar from already-fetched data (the poll scheduler fetches
+// ListMeshes/SplitList ONCE per tick and shares them). `meshes == null` = meshd offline.
+function refreshTopbarWith(meshes, splitActive) {
   const dot = el("tb-dot"), sum = el("tb-summary"), sel = el("tb-egress");
-  let meshes = [];
-  try { meshes = (await meshd("ListMeshes")).Meshes || []; }
-  catch {
+  if (meshes == null) {
     dot.className = "conn-dot off"; sum.textContent = "meshd offline";
     sel.innerHTML = `<option value="origin">Origin</option>`; sel.disabled = true; return;
   }
   sel.disabled = false;
   const egress = meshes.find((m) => m.is_current);
-  // egress dropdown: Origin + meshes; the selected one is the current egress.
-  sel.innerHTML = [`<option value="origin" ${!egress ? "selected" : ""}>Default network</option>`]
-    .concat(meshes.map((m) => `<option value="${m.id}" ${m.is_current ? "selected" : ""}>⬢ ${esc(m.name)} #${m.id}</option>`))
+  const egMode = egress ? EGRESS_LABEL[egressModeOf(egress.id, true, splitActive)] : "Off";
+  // Egress selector: OFF (my own internet) or a mesh as FULL tunnel. "Off" is the egress being
+  // off — not a peer/network choice — so it's labelled as such (Split is picked per-mesh in Config).
+  sel.innerHTML = [`<option value="origin" ${!egress ? "selected" : ""}>직접 인터넷 (off)</option>`]
+    .concat(meshes.map((m) => `<option value="${m.id}" ${m.is_current ? "selected" : ""}>⬢ ${esc(m.name)} #${m.id}${m.is_current && egMode === "Split" ? " (split)" : ""}</option>`))
     .join("");
-  // far-left status mirrors the current egress.
+  // far-left status mirrors the current egress + its mode.
   if (egress) {
     dot.className = "conn-dot on";
-    sum.textContent = `Routing via ${egress.name}${egress.exit != null ? " · exit #" + egress.exit : ""}`;
+    sum.textContent = egMode === "Split"
+      ? `Split tunnel · ${egress.name}`
+      : `Full tunnel · ${egress.name}${egress.exit != null ? " → #" + egress.exit : ""}`;
   } else {
     dot.className = "conn-dot warn";
-    sum.textContent = "Using default network";
+    sum.textContent = "직접 인터넷 (메쉬 egress off)";
   }
 }
 
@@ -1125,15 +1124,17 @@ async function refreshTopbar() {
 document.querySelectorAll("#mode-toggle .seg-btn").forEach((b) =>
   b.addEventListener("click", () => setMode(b.dataset.mode))
 );
-// dropdown = egress selector (Origin or a mesh); independent of the view.
+// dropdown = quick egress switch: OFF (my own internet) or a mesh as a FULL tunnel. Split is a
+// per-mesh choice in Config (it needs domains). Tear down to the clean baseline first so switching
+// never stacks a full tunnel on top of a running split proxy.
 el("tb-egress").addEventListener("change", async (e) => {
   const v = e.target.value;
   try {
-    await meshd({ SetCurrent: { mesh: v === "origin" ? null : parseInt(v, 10) } });
-    toast(v === "origin" ? "Using default network" : "egress set");
+    await meshd({ SetCurrent: { mesh: null } }); // baseline: routes/DNS restored, split off
+    if (v === "origin") { toast("직접 인터넷 (off)"); }
+    else { await meshd({ SetCurrent: { mesh: parseInt(v, 10) } }); toast("Full tunnel"); }
   } catch (err) { toast(String(err)); }
-  // The selected egress is also the mesh shown in Mesh mode — Default network ⇒
-  // no mesh ⇒ plain Mesh page.
+  // The selected egress is also the mesh shown in Mesh mode — Off ⇒ no mesh ⇒ plain Mesh page.
   CURRENT_MESH = v === "origin" ? null : parseInt(v, 10);
   refreshMode();
 });
@@ -1182,14 +1183,17 @@ async function loadLists() {
     await new Promise((r) => setTimeout(r, 1000));
   }
 })();
-const optList = (list, sel) => list.map((x) => `<option${x === sel ? " selected" : ""}>${esc(x)}</option>`).join("");
-
 // ---- P-C7 attack banner (G-3): poll for any armed mesh; show countdown + all-clear ----
 async function refreshAttackBanner() {
+  let meshes = null;
+  try { meshes = (await meshd("ListMeshes")).Meshes || []; } catch (_) { /* null → hidden */ }
+  refreshAttackBannerWith(meshes);
+}
+
+function refreshAttackBannerWith(meshes) {
   const banner = el("attack-banner");
   if (!banner) return;
-  let meshes = [];
-  try { meshes = (await meshd("ListMeshes")).Meshes || []; } catch (_) { banner.classList.add("hidden"); return; }
+  if (meshes == null) { banner.classList.add("hidden"); return; }
   const armed = meshes.find((m) => m.attack_armed_secs_left != null);
   if (!armed) { banner.classList.add("hidden"); return; }
   banner.classList.remove("hidden");
@@ -1203,7 +1207,6 @@ async function refreshAttackBanner() {
     refreshAttackBanner();
   };
 }
-setInterval(refreshAttackBanner, 3000);
 
 // ---- Mesh-mode Warnings: red badge count + desktop notification on attack ----
 let ATTACK_NOTIFIED = {}; // mesh id → notified-this-episode, so we alert once
@@ -1227,7 +1230,6 @@ async function updateMeshWarnings() {
   if (!attacked) ATTACK_NOTIFIED[d.id] = false;
   if (ACTIVE_TAB === "mesh-warnings") renderWarnings(CURRENT_MESH);
 }
-setInterval(updateMeshWarnings, 3000);
 
 // ---- Update check (Feature 1): on launch, ask GitHub Releases for a newer build.
 // If one exists, show a banner. "Update" backs up mesh state (Feature 2) then opens
@@ -1272,7 +1274,6 @@ showAppVersion();
   } catch {}
   setMode("user");
 })();
-setInterval(refreshTopbar, 3000);
 // Live poll: keep the Peers/Topology/Traffic views fresh while viewing them.
 // Is the user currently typing into an input on the Peers tab (the invite fields or an
 // inline peer-address box)? If so, the live poll must NOT re-render the panel out from
@@ -1283,17 +1284,45 @@ function typingInPeers() {
   const t = el("peers-table"), x = el("peers-extra");
   return (t && t.contains(a)) || (x && x.contains(a));
 }
-setInterval(() => {
+// ---- the ONE live-poll scheduler ----
+// A single tick drives every live view: ListMeshes (+SplitList) are fetched ONCE
+// and shared by the topbar + attack banner (they used to each poll on their own
+// 3s timer — 5-7 socket connects per 3s at steady state). The tick pauses while
+// the window is hidden and backs off to 30s while meshd is unreachable, snapping
+// back to 3s on the first success (or when the window becomes visible again).
+const POLL_BASE_MS = 3000, POLL_MAX_MS = 30000;
+let pollDelay = POLL_BASE_MS;
+let pollTimer = null;
+
+async function pollTick() {
+  let meshes = null, splitActive = null;
+  try {
+    meshes = (await meshd("ListMeshes")).Meshes || [];
+    try { splitActive = (await meshd("SplitList")).Split?.active_mesh ?? null; } catch {}
+    pollDelay = POLL_BASE_MS;
+  } catch {
+    pollDelay = Math.min(pollDelay * 2, POLL_MAX_MS); // meshd unreachable — back off
+  }
+  refreshTopbarWith(meshes, splitActive);
+  refreshAttackBannerWith(meshes);
+  await updateMeshWarnings();
+  // The active tab's live view (these fetch their own detail, e.g. MeshInfo).
+  if (meshes == null) return; // offline: skip detail renders, they'd each error
   if (ACTIVE_TAB === "traffic") return renderTraffic("user"); // this computer (user mode)
   if (ACTIVE_TAB === "extensions") return renderExtServices(); // refresh only the services card
   if (MODE !== "mesh" || CURRENT_MESH == null) return;
-  if (ACTIVE_TAB === "mesh-peers") { if (!typingInPeers()) renderPeersFor(CURRENT_MESH); }
-  else if (ACTIVE_TAB === "mesh-topology") renderTopologyFor(CURRENT_MESH);
-  else if (ACTIVE_TAB === "mesh-traffic") renderTraffic("mesh");
-}, 3000);
-
-// ---- browser demo (no Tauri): meshd is unreachable ----
-function mockInvoke(cmd) {
-  if (cmd === "meshd") return Promise.reject("meshd not running (browser demo)");
-  return Promise.resolve(null);
+  if (ACTIVE_TAB === "mesh-peers") { if (!typingInPeers()) await renderPeersFor(CURRENT_MESH); }
+  else if (ACTIVE_TAB === "mesh-topology") await renderTopologyFor(CURRENT_MESH);
+  else if (ACTIVE_TAB === "mesh-traffic") await renderTraffic("mesh");
 }
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    if (!document.hidden) { try { await pollTick(); } catch { /* never kill the loop */ } }
+    schedulePoll();
+  }, pollDelay);
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { pollDelay = POLL_BASE_MS; schedulePoll(); }
+});
+schedulePoll();

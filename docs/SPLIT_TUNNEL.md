@@ -57,8 +57,17 @@ lattice split rm pornhub.com        # drop a rule
 ```
 
 Rules persist to `split.json` (0600) in the state dir — **this computer only**, reloaded on
-start, never gossiped. Turning split on/off is *not* persisted; re-issue `split on` after a
-restart (or when you add a rule while it's already on — the proxy snapshots rules at `on` time).
+start, never gossiped. The split on/off state also persists (`split-active.json`): if split was
+on for a mesh, it is re-enabled at startup once that mesh's data plane is up (add a rule while
+it's already on and the proxy snapshots rules at `on` time, so re-issue `split on` to pick up a
+newly-added rule).
+
+The **full-tunnel egress** selection (route *everything* through a mesh's exit, via
+`SetCurrent`) persists the same way in `egress.json` (0600) and is re-applied at startup — but
+the actual default-route divert is **held until the exit is reachable** so a boot to a not-yet-
+connected exit never black-holes the default route (the kill-switch would otherwise rip it down).
+Before this both were lost on restart for full tunnel, silently reverting you to the default
+network on every `meshd` restart.
 
 ## What `on` / `off` actually change (🔴 host state)
 

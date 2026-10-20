@@ -8,7 +8,10 @@
 [workspace]
 resolver = "2"
 members = [
-    # --- shared base (used by both the v2 product and the archived v1 stack) ---
+    # --- shared base ---
+    # proto: wire/flow types (v2 uses wire_v2+flow; the v1 ipc/wire halves serve legacy/).
+    # tun: the per-OS TUN devices. net: v2 uses ONLY Transport/udp/memory — the v1
+    # discovery/nat/relay compile solely behind its `v1` feature (legacy/ + fuzz/).
     "crates/proto",
     "crates/tun",
     "crates/net",
@@ -35,7 +38,7 @@ members = [
 exclude = ["gui", "legacy/gui-admin", "fuzz"]
 
 [workspace.package]
-version = "0.7.13"
+version = "0.7.15"
 edition = "2021"
 rust-version = "1.79"
 # Source-available & noncommercial. Commercial use OR academic publication →
@@ -76,7 +79,10 @@ x25519-dalek = { version = "2", features = ["static_secrets"] } # ECDH for seali
 # we don't pull `pkcs8`→`base64ct` (latter needs edition2024, unsupported on 1.79).
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
 # --- networking building blocks ---
-socket2 = "0.5"
+# "all" is load-bearing: meshrun/lan.rs uses set_reuse_port, which socket2 gates
+# behind it. Declared here so we never lean on tokio's feature unification
+# (a standalone resolve — e.g. the fuzz workspace — otherwise loses the method).
+socket2 = { version = "0.5", features = ["all"] }
 mdns-sd = "0.11"        # serverless LAN peer discovery
 # --- CLI ---
 # Upper-bounded: clap 4.5's deps (clap_lex 1.x) require edition2024, which our

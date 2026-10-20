@@ -4,7 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "UDP transport, NAT traversal, and serverless peer discovery for Lattice."
+description = "UDP transport for Lattice; the legacy (v1) mDNS discovery / STUN / relay compile only behind the `v1` feature."
+
+[features]
+# STUN reflexive-address + UDP hole-punch. Separate from `v1` because the DHT
+# rendezvous (legacy/crates/dht, which meshd's MESHD_DHT reuses) needs ONLY this —
+# keeping mdns-sd out of every daemon build. Also what fuzz/stun_parse targets.
+nat = ["dep:rand"]
+# The full v1 (legacy/) networking stack: `nat` + mDNS LAN discovery + the NodeId
+# relay. Off by default; enabled by legacy/daemon and legacy/engine only.
+v1 = ["nat", "dep:mdns-sd"]
 
 [dependencies]
 lattice-proto.workspace = true
@@ -13,5 +22,5 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 socket2.workspace = true
-mdns-sd.workspace = true
-rand.workspace = true
+mdns-sd = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }

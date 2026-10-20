@@ -7,7 +7,7 @@ license.workspace = true
 description = "Kademlia DHT for serverless peer rendezvous (publish/lookup candidate addresses)."
 
 [dependencies]
-lattice-net.workspace = true
+lattice-net = { workspace = true, features = ["nat"] }
 serde.workspace = true
 bincode.workspace = true
 tokio = { workspace = true }

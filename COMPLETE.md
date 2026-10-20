@@ -5,13 +5,199 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## 리팩토링 Phase 4 (오프라인 묶음) — 진단 sink + 리포팅/라우팅 결함 3건 (2026-10-21)
+
+행동 변화지만 전부 오프라인(유닛테스트+빌드) 검증 가능한 묶음. 커밋 4개, 각각 단독.
+
+1. ✅ **meshrun 진단 sink** (commit `05a6fce`)¹: relay 결정/direct 복구/reflexion/재암호 로그가
+   bare eprintln → Windows(상승+숨김 실행)에선 아무도 못 읽었음. `set_log_sink()`(OnceLock) +
+   rlog! 매크로로 전 지점 교체, meshd가 main() 첫 줄에서 elog!과 동일한 tee(stderr+diag 파일)
+   설치. sink 미설치(테스트/단독)면 기존 stderr 그대로 — 무sink 동작 byte-identical. 신규 dep 0.
+2. ✅ **direct/relay 25s/30s skew 통일** (commit `13eabbb`): meshd view가 LIVE_WINDOW_MS(30s)로 "direct"를 재유도
+   → 데이터플레인은 DIRECT_OK_MS(25s)에서 relay로 전환 — 25~30s 구간 UI가 "direct" 거짓말.
+   `meshrun::directly_reachable` pub 승격 + view가 그걸 호출(정의 한 곳). 리포팅만 변화.
+3. ✅ **결정론적 relay 선출** (commit `e9caf3b`): pick_relay 폴백이 HashMap `.find()`(랜덤 순회) → 동급 후보 2개면
+   gossip tick마다 relay가 이유 없이 바뀜. freshest(last_direct_ms 최대, 동률→낮은 id)로 고정
+   + 유닛테스트. 로컬 정책만, 와이어 무관.
+4. ✅ **Route::None인데 AEAD seal** (commit `bd1142f`): seal_to가 라우팅 match 앞에 있어 드랍될 프레임에도 풀 seal
+   + send_seq 소모. seal을 Direct/Relay arm 안으로 — 전송 프레임 바이트 동일, 드랍 프레임은
+   CPU/논스 안 태움.
+
+검증: workspace **171 passed/0 failed**(sink + relay 결정론 테스트 추가), clippy 0 error, fmt.
+¹ 교훈(사소): skew 커밋을 검증 전에 떠서 &Link 타입 에러가 커밋에 들어갔다 — 즉시 수정 후
+amend. 검증 게이트는 커밋 **앞**에.
+
+---
+
+## 리팩토링 Phase 3 — 함수화/중복제거 (meshd handle·persist, meshrun run, GUI, CLI) (2026-10-21)
+
+전부 행동 보존(기계적) 리팩토링. 커밋 3개.
+
+1. ✅ **meshd handle() 날씬화** (commit `6d098d8`): 뚱뚱한 arm 7개(Recipher/ExportState/
+   AdmitMember/SetCurrent🔴/SetFlows/CreateInvite/CreateQuickInvite)를 이름 있는 함수로 verbatim
+   추출 → handle()은 순수 디스패치 테이블. 두 invite의 복붙 "초대 권한 게이트"(~25줄×2)와
+   bootstrap-endpoint 수집을 `invite_gate()`/`bootstrap_endpoints()`로 — secure↔quick 경로가
+   더는 서로 어긋날 수 없음. **IPC enum/와이어 토큰 무변경**(Phase-0 golden 테스트 무변경 통과).
+   + persist.rs: "serialize+write+chmod 0600" 7벌과 "read→parse→default" 6벌을
+   `write_json_secure`/`read_json_or_default`/`persist_marker`로 — 파일별 frozen serializer
+   (pretty vs compact) 유지, Phase-0 라운드트립 테스트가 그대로 증명.
+2. ✅ **meshrun run() 재구성** (commit `17155d6`): 13-포지셔널 파라미터(clippy allow로 침묵) →
+   `pub DataPlaneHandles` 구조체(호출부 15곳 field-by-name); select! arm 4개를 `LoopCtx` 메서드
+   (outbound/inbound/gossip_tick/command)로 verbatim 이동(self.-한정, `continue`→`return` 1곳).
+   폴링 소스(TUN/transport/loop_cmd/gossip 인터벌)는 Ctx 밖 — select! future가 Ctx를 빌리지
+   않는 구조. 와이어/타이머/라우팅 무변경; meshrun 테스트(relay fallback, gossip 승격, 재암호,
+   e2e 인메모리 페어) 전부 통과.
+3. ✅ **GUI + CLI** (commit `06758a9`): bridge.js(meshd 브리지)+util.js(순수 헬퍼) leaf 모듈 분리
+   — ESLint per-module no-undef가 교차 참조를 정적 전수검사(이 프론트 최초의 정적 체크).
+   egress Off/Split/Full 유도 4벌(철자 2가지로 이미 분화) → `egressModeOf()` 하나.
+   **단일 폴 스케줄러**: 독립 3초 setInterval 4개 → 틱 1개가 ListMeshes+SplitList를 한 번
+   fetch해 topbar/공격배너/경고배지와 공유 + 활성 탭 렌더; hidden 일시정지 + meshd 불통 시
+   30s까지 지수 backoff(성공/가시화 시 3s 복귀). 소켓 연결 ~5-7회/3s → ~2-4회.
+   CLI: cmd_doctor의 한국어 substring 결합을 REASON_* 상수로(view.rs 소스 라인 포인터 포함).
+   ⚠ GUI는 커밋만 — 라이브 앱 반영은 다음 번들 빌드.
+
+검증: workspace 169 passed/0 failed, clippy 경고 수 불변, fmt, eslint+vite build, CLI 구문+--help.
+보류: GUI 페이지 단위 분할(상태 설계 필요 — Phase 4 DOM-diff와 함께), 데몬 reason CODE.
+
+---
+
+## 리팩토링 Phase 2 — meshd/main.rs 모듈 분할 (2026-10-21)
+
+**main.rs 4,889 → 2,611줄.** 순수 코드 이동 — 로직/와이어/persist 포맷 무변경, 전부 오프라인 검증.
+
+1. ✅ **7개 모듈 분리** (commit `e43f91b`): state.rs(State/MeshState/Bringup/PostAction/grant·event
+   타입+emit) / persist.rs(온디스크 파일 전부+restore_mesh+request_mutates) / parse.rs(순수
+   파서·포매터) / view.rs(detail/traffic 프로젝션, 읽기전용) / watch.rs(백그라운드 루프 4종) /
+   ext.rs(커넥터 세션/scope gate/레지스트리) / ipcserve.rs(accept 루프/단일인스턴스 가드/serve_conn).
+   패턴: 이동 아이템은 pub(crate), 각 모듈은 `use crate::*`(루트 import+잔여 아이템이 자손에
+   가시), 루트는 `use <mod>::*` 역수입 → 콜사이트 텍스트 불변. main.rs에는 라이프사이클 코어만
+   (main/bringup/handle/join·create·expel/egress/shutdown).
+2. ✅ **NewMesh::build() 생성자 통합** (commit `3f6f372`): 4곳(create/join/join_quick/restore)의
+   ~60줄 MeshState+Bringup 복붙 리터럴 → 한 곳. Arc 핸들을 한 지점에서 생성해 양쪽에 배선 —
+   MeshState 필드 추가가 이제 1-site 변경(빠뜨린 곳이 조용히 디폴트 먹던 패턴 제거).
+3. ✅ **LoopEvent drain 추출** (동일 커밋): bringup_dataplane 속 200줄 gossip-merge/재암호/공격
+   이벤트 드레인 → watch::spawn_loop_event_drain (verbatim). 🔴 bringup 경로가 ~190줄로 축소.
+4. ✅ mod exit의 stale `#[allow(dead_code)]` 제거 — **3-OS 체크**(darwin 빌드 + linux-gnu/
+   windows-gnu cross `cargo check`)로 무경고 확인; 이 크로스체크가 분할 전체의 비-macOS 컴파일도
+   검증. 엉킨 dht/exit mod 주석 분리.
+
+검증: workspace 169 passed/0 failed(Phase 0 persist/와이어 테스트 포함 무변경 통과), clippy 경고
+세트 분할 전과 동일(기존 15), fmt. zsh가 커밋 메시지 백틱을 명령치환한 사고 1회 → `git commit -F
+<file>`로 작성(교훈: 백틱 든 메시지는 -m 금지).
+
+---
+
+## 리팩토링 Phase 1 — 죽은 코드 삭제 + net v1 feature 게이트 (2026-10-21)
+
+Phase 0 감사 후속. 삭제 전 전 영역(crates/legacy/gui/connectors/fuzz) grep으로 소비자 0 재검증.
+
+1. ✅ **mesh 죽은 스켈레톤 삭제** — policy.rs + roster.rs + MeshContainer + `Mesh.roster` 필드
+   (~350줄+테스트 9개): membership.rs + meshd MeshState가 대체한 pre-membership 설계. 이름충돌
+   (RouteDecision/FlowKey/FlowMatch 2벌)과 중복 cidr_contains도 함께 소멸. commit `7f5b7dc`.
+2. ✅ **net::tcp 삭제(188줄, 소비자 0) + v1 스택 feature 게이트 + meshrun 바이너리 삭제** —
+   `nat = ["dep:rand"]`(legacy-dht의 rendezvous가 필요 — meshd가 MESHD_DHT로 재사용 + fuzz
+   stun_parse), `v1 = ["nat", "dep:mdns-sd"]`(legacy daemon/engine만). **meshd 빌드에서 mdns-sd
+   완전 제거**(cargo tree 확인). meshrun dev-runner(main.rs)는 아무도 안 빌드 + exit NAT 3번째
+   복사본이라 삭제, anyhow dep도 제거. ⚠️ 발견한 함정: meshrun/lan.rs의 `set_reuse_port`가
+   tokio의 socket2 feature unification에 우연히 의존 → 루트에 `socket2 features=["all"]` 명시
+   (docs/ERRORS.md 2026-10-21). commit `f8f9b4f`.
+3. ✅ **GUI vestigial deps + tun 빈 함수** — gui/src-tauri에서 lattice-proto/lattice-ipc(미사용,
+   legacy로 가는 마지막 빌드 엣지) 제거, package.json에서 @tauri-apps/api(미import,
+   withGlobalTauri) 제거, tun/macos.rs 빈 tracing_name 삭제. commit `6124c4d`.
+
+검증: workspace build+test(1.79) 169 passed/0 failed, clippy 0 error, fmt, fuzz 워크스페이스
+stable check, gui/src-tauri stable check, vite build+eslint, meshd 단독 tree에 mdns 0건.
+legacy 62k줄의 워크스페이스 분리는 보류(여전히 CI에서 빌드됨 — 사용자 결정 필요시 Phase 2+).
+
+---
+
+## 리팩토링 Phase 0 — 안전망(테스트/린트/fuzz) + 소규모 버그 4건 (2026-10-20)
+
+4-영역 코드 감사(meshd / mesh+proto / net·tun·meshrun / GUI+CLI)에서 나온 첫 PR. 전부
+오프라인 검증(라이브 데몬 불가침); 커밋 4개, 모두 feat/extensions-meshd.
+
+1. ✅ **버그: `request_mutates`에 AdmitMember 누락** — admit이 `ms.certs`에 push해도 persist가
+   안 불려 재시작 시 cert 유실. + `persist_default_mesh`만 0600 chmod 빠진 비대칭(형제 파일은
+   전부 0600) 수정. persist 4종(split/split-active/default-mesh/extensions) 라운드트립 테스트 +
+   request_mutates 완전성 테이블 테스트(이 버그를 잡았을 테스트) 추가. commit `f2c93d6`.
+2. ✅ **테스트: mesh/ipc.rs 와이어 계약 동결** — Request 39 + Response 18 variant 전수 JSON
+   라운드트립 + golden wire-token(exhaustive match = 컴파일타임 완전성 가드) + 구버전 최소 JSON
+   파싱 테스트. variant rename이 이제 런타임 version-skew 대신 CI에서 터짐. commit `65c6df4`.
+3. ✅ **fuzz: meshrun 네트워크 파서 4종** — decode_gossip/decode_recipher/beacon_parse/parse_flow
+   타깃 추가(기존엔 legacy stun/wire만). 파서는 `#[doc(hidden)] pub`(fuzz 전용), 동작 무변경.
+   fuzz/는 자체 워크스페이스라 1.79로 안 풀림(기존과 동일) — stable check 통과,
+   `cargo +nightly fuzz run <target>`로 실행(cargo-fuzz 미설치 상태). commit `18c2d11`.
+4. ✅ **버그: CLI→GUI base64 불일치** — CLI는 urlsafe(`-_`), GUI `atob`는 표준(`+/`)만 → `-`/`_`
+   포함 초대/identity 코드가 GUI에서 "invalid". b64decode가 디코드 전 정규화; node+python
+   크로스체크로 양방향 검증. **버그: `esc()`가 `'` 미이스케이프** — 싱글쿼트 속성
+   (`data-scopes='…'`)에서 커넥터발 scope 문자열로 속성 탈출 가능 → `'`→`&#39;` 추가 + 누락
+   esc() 보강(state/pubkey_fp/charter invite/flow proto). 죽은 randHex64 + CLI `if False` 잔재
+   삭제. **ESLint**(no-undef/no-unused-vars) + `npm run lint` + CI eslint job 신설(vite 빌드는
+   JS를 전혀 검사 안 했음). commit `c9086f8`. ⚠️ GUI 변경은 커밋만 — 라이브 앱 스왑 안 함
+   (frontend는 앱 바이너리 임베드, 반영은 다음 번들 빌드 때).
+
+검증 게이트: `cargo test --workspace`(1.79) 전부 green(+신규 10개), clippy exit 0(신규 경고 0,
+struct-init으로 정리), plain `cargo fmt --all`, eslint 0건, vite 번들 OK, opsec-scan은 기존
+COMPLETE.md IP만 플래그(이번 변경엔 신규 IP 없음).
+
+---
+
+## v0.7.15 — egress 3모드 명시화 (Off / Split / Full) + None exit 제거 (2026-08-22)
+
+사용자 지적: "config에서 None 없애야 + full-tunnel이 기본인데 자기 네트워크 쓰면 그건 메쉬 egress
+꺼진 상태지 full-tunnel이 아님." 진단: 라우팅 버그 아님(실증: exit=1 8초 유지+persist, 인터넷 직결
+정상). **개념/UI 결함** — "exit/egress"가 3군데서 다른 뜻(mesh.exit 관문 / SetCurrent egress /
+Default network)으로 뒤섞여 topbar가 Default network를 full-tunnel의 peer 선택지처럼 노출.
+사용자 선택(AskUserQuestion): **명시적 3모드 Off/Split/Full**.
+- Config "Egress & routing": `— none —` 제거(관문은 남 멤버만, 자기 제외; 라우팅하는 메쉬는 항상
+  관문 있음, 내부 메쉬는 Off 유지). 3모드 세그먼트(Off/Split/Full) = `setEgressMode`. 전환은 항상
+  `SetCurrent{None}`(routes/DNS 복원+split off) baseline 경유 → idempotent, split↔full 안 겹침.
+  Full→SetCurrent{Some}, Split→SplitOn, 둘 다 관문 SetExit 선반영.
+- 모드 판별(IPC 추가 없이): SplitList.active_mesh==mesh→Split, 아니고 is_current→Full, 아니면 Off.
+- topbar 리라벨: "Default network"→"직접 인터넷 (off)", 상태= `Full tunnel · <mesh>` /
+  `Split tunnel · <mesh>` / `직접 인터넷 (메쉬 egress off)`. Overview는 읽기전용 `egress: Off/Split/Full`
+  뱃지 + "make egress" 버튼 제거.
+- **데몬 라우팅 코드 무변경** (GUI-only, 기존 SetCurrent/SplitOn/SetExit 조합). commit `0ba7f44`.
+검증: node --check(구문) + vite frontend 번들 OK + `scripts/build-app.sh`(stale-SHA & anti-mix 게이트
+통과: bundled meshd==0ba7f44, app v0.7.15). **라이브 반영**: frontend가 앱 바이너리에 임베드 →
+전체 Tauri 번들 재빌드 필요. 빌드 중 dmg 단계가 /Volumes/Lattice auto-mount→새 앱이 그 볼륨에서
+떠 라이브 meshd를 넘겨받는 부작용 발생 → **clean teardown 후 빌드 산출물 .app을 /Applications에
+ditto 설치 + DMG 언마운트 + 재실행**으로 정리. 최종 `/Applications`에서 v0.7.15 0ba7f44 실행,
+oracle direct, EXIT #1 유지. 버전 0.7.15 범프(Cargo/gui Cargo/tauri.conf/package.json).
+브랜치 feat/extensions-meshd, **main 미머지**. 백업 /Applications/Lattice.app.prev.
+LESSON: `npm run tauri build`의 dmg 단계는 볼륨을 마운트하고 새 앱이 거기서 실행될 수 있다 —
+라이브 VPN 중엔 빌드 자체가 데몬을 스왑할 수 있으니 빌드 후 실행 경로(/Volumes vs /Applications) 확인.
+
+## v0.7.14 — full-tunnel egress + exit 지정 sticky (재시작에도 유지) (2026-08-07)
+
+증상: GUI에서 "왜 자꾸 Default network로 감?" — 라우팅이 재시작마다 디폴트로 리셋.
+원인(코드, NAT 아님): **두 개의 persistence 갭**.
+- `current`+`full_tunnel`(full-tunnel egress 선택)이 persist 안 됨 — split만 `split-active.json`으로
+  유지되던 비대칭 → meshd 재시작(세션 중 수십 회)마다 `current=None, full_tunnel=false` → Default network.
+- `SetExit`(mesh.exit, 어느 멤버가 인터넷 exit인지)가 `persist()` 호출을 안 함 → exit 지정도 재시작에
+  유실(#4→null) → full-tunnel 복원이 exit을 못 찾음(반쪽 버그).
+고침(commits `dd4be32` egress + `3a46391` exit):
+- `persist_egress`/`load_egress`(`egress.json` 0600, `current.filter(|_| full_tunnel)`), SetCurrent/
+  RemoveMesh/self-destruct에서 호출. 부팅 복원 블록 = intent(current+full_tunnel) 즉시 세팅 +
+  `restore_full_tunnel`이 **exit 도달 가능해질 때까지 대기 후** divert(부팅 시 dead-exit 블랙홀/kill-switch
+  방지) + kill-switch 재무장. exit 끝내 안 뜨면 intent 유지 → 네트워크변경/수동 재선택 때 적용.
+- `SetExit`에 `persist(st)` 추가(+ exit 삭제 시 `persist_egress`).
+- 사용자 선택(AskUserQuestion): "자동 복원(완전 sticky) + preflight 가드".
+검증: 빌드(1.79) + 단위테스트 7/7(egress 게이팅 round-trip 신규) + fmt + clippy(기존 needless_borrow와
+동일 패턴) + startup 스모크. **라이브 Mac clean-swap 2회**(off→shutdown→quit→ditto→relaunch once,
+utun-safe): 최종 `v0.7.14 build 3a46391`==HEAD, 홈 메쉬 재연결(Oracle direct/lablinux relay).
+**exit-persist 라이브 검증**: SetExit(home→oracle) → `mesh-1.json` `"exit":1` 디스크 저장 확인.
+egress-persist는 단위테스트로 검증(라이브 full-tunnel divert는 사용자 인터넷 방해라 미실행).
+NOTE: 검증 중 home.exit=oracle(#1) 지정해둠(inert — full-tunnel 켤 때만 사용, `lattice exit home none`로 해제).
+버전 0.7.14 범프(Cargo/tauri.conf). 브랜치 feat/extensions-meshd, **main 미머지 + fleet 미배포**.
+
 ## v0.7.13 정식 롤아웃 (fleet 전부 dab561f) + join-modes 라이브 검증 (2026-08-07)
 
 v0.7.13 = extensions + per-mesh `exitable` + exit-fixes + **join-modes(secure/quick)** +
 split-persist + meshd single-instance fix + default-mesh. Cert 와이어 byte-identical +
 `CTRL_QGRANT`(0x09) append-only → 혼합버전 배포 안전.
 - **Fleet 전부 v0.7.13 build dab561f + 연결**: Oracle(systemctl restart, direct
-  138.2.14.219:41000), lablinux(LAN SSH 172.28.7.32 바이너리 스왑, relay), Mac(CI dmg
+  <ORACLE_PUB>:41000), lablinux(LAN SSH 172.28.7.32 바이너리 스왑, relay), Mac(CI dmg
   clean-swap: backup→shutdown→quit→ditto→relaunch once; `version v0.7.13 build dab561f`,
   `default` 명령 동작). 홈 메쉬 3노드 정상.
 - **join-modes 라이브 검증**: Oracle이 quick 초대(`invite --quick --max 3 --expire 1h`,
@@ -59,10 +245,10 @@ mesh exitable. Expresses the "all meshes / selected only / never" policy as per-
 Verified per-domain split-tunnel where the exit is ANOTHER member (incl. this computer acting as
 an exit for someone else): updated lablinux to a07da4d (built on Oracle, scp'd; **gave lablinux a
 systemd unit** since setsid launches over ssh didn't persist). On lablinux, rule `ifconfig.me →
-member #7 (Mac)`, split on → `curl ifconfig.me` returned **203.247.167.58 (the Mac's egress)**,
-not lablinux's own 210.107.188.8 — so lablinux's traffic exited through the Mac (path: lablinux →
+member #7 (Mac)`, split on → `curl ifconfig.me` returned **<CAMPUS_NAT> (the Mac's egress)**,
+not lablinux's own <LAB_PUB> — so lablinux's traffic exited through the Mac (path: lablinux →
 Oracle relay → Mac NAT → internet), even though Mac↔lablinux can't reach directly (campus
-isolation, relayed). off reverted to 210.107.188.8. Mac forwards+NATs as a client (forwarding=1,
+isolation, relayed). off reverted to <LAB_PUB>. Mac forwards+NATs as a client (forwarding=1,
 pf nat 100.64/10) so it works as an exit without being a pinned exit node.
 
 ## Per-domain split-tunnel exit — BUILT + LIVE-verified (2026-07-23)
@@ -86,9 +272,9 @@ Tagged v0.7.5 @ 975d26c (F1 split-tunnel + F2 conns); CI built all-platform inst
 Fresh-installed on every reachable node, GUI + daemon, all verified `v0.7.5 build 975d26c`:
 - **Mac**: removed old /Applications app, installed official 0.7.5 dmg fresh, relaunched — LIVE.
 - **Oracle** (ubuntu systemd): swapped meshd-Linux-X64 into ~/myVpn/target/release/meshd, restart — LIVE direct exit.
-- **lablinux** (hyunseok): `dpkg -i` the 0.7.5 deb (GUI /usr/bin/lattice + meshd both updated),
+- **lablinux** (<LAB_USER>): `dpkg -i` the 0.7.5 deb (GUI /usr/bin/lattice + meshd both updated),
   relaunched via /tmp/lab-start.sh — LIVE, now DIRECT to Mac (path re-converged on fresh install).
-- **Windows**: offline (192.168.0.6 + 10.32.86.243 down) — skipped.
+- **Windows**: offline (192.168.0.6 + <CAMPUS_LAN> down) — skipped.
 Connection book confirms oracle+lablinux both `direct`. Gotcha: the poisoned `grep` shell wrapper
 masked dpkg success output — use `command grep` when reading remote command output.
 
@@ -99,7 +285,7 @@ key→value." Auto-discovery/connect/endpoint-persistence ALREADY existed (DHT +
 relay→direct + to_persisted.peers reloaded on start). New: surface the RESULT as a connection
 book. MemberView gained `path` (direct/relay/offline/me) + `last_seen_secs`, derived in detail()
 from the Link's last_seen_ms/last_direct_ms. `lattice conns <mesh>` renders per-member key→value.
-LIVE (build bc0aee3): oracle shown `direct` 11s-ago at 138.2.14.219, correctly classified. — bc0aee3
+LIVE (build bc0aee3): oracle shown `direct` 11s-ago at <ORACLE_PUB>, correctly classified. — bc0aee3
 Deferred: persist path-history for post-restart view; GUI conns card; F2 relay-case live shot
 (same last_direct_ms logic, shown in logs earlier).
 
@@ -157,7 +343,7 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
   rule. Found by the cross-node test. — `af13e63` / released `v0.7.8` (`40aa1f2`)
 - **Cross-node verified (Mac client ↔ lablinux #4 exit, v0.7.8 fresh install):**
   exitable OFF → curl ifconfig.me FAILS (dropped; route→utun6 + overlay healthy, so genuinely
-  dropped at exit); exitable ON → NAT scoped to `100.80.1.0/24` only, curl → 210.107.188.8
+  dropped at exit); exitable ON → NAT scoped to `100.80.1.0/24` only, curl → <LAB_PUB>
   (lablinux egress); ON→OFF live (no restart) → NAT purged, curl fails again. — verified
 
 ## 2026-07-25 — v0.7.9: pinned-exit isolate/own-IP regression (found by user's "diff the code" call)
@@ -168,15 +354,15 @@ Deferred: per-domain different exits (ToExit(Some)), AAAA, SNI.
   999`; macOS `to ! 100.64.0.0/10`). Only forwarded INTERNET isolates. — `3a3646e` / `v0.7.9`
 - **Oracle deployed v0.7.9 + code-path verified**: cleared rules → restart → bringup AUTO-added
   999 bypass + 1000 isolate; `ip route get 100.80.1.7 from 100.80.1.1` → `dev tun0`; Mac→Oracle
-  overlay ssh `TUNNEL_OK`; Oracle-exit egress = 138.2.14.219 (isolate still works); NAT =
+  overlay ssh `TUNNEL_OK`; Oracle-exit egress = <ORACLE_PUB> (isolate still works); NAT =
   `100.80.1.0/24` only. Diagnosis method: diffed last-working baseline (NOT a guessed rekey/OS
   wedge) — logged in docs/ERRORS.md. — verified
 
 ## 2026-07-25 — full empirical cross-check (Mac on hotspot) + v0.7.10 hygiene fix
 - **Cross-check matrix ALL PASS** after Mac switched to an IPv6/CGNAT hotspot: self-healing
   re-learned the new endpoint and reconnected to both nodes (data-path TCP verified, not just
-  gossip); version uniformity; full connectivity matrix; exitable OFF→drop / ON→210.107.188.8 /
-  ON→OFF-live-purge / per-subnet NAT; Oracle isolate exit egress 138.2.14.219 + overlay
+  gossip); version uniformity; full connectivity matrix; exitable OFF→drop / ON→<LAB_PUB> /
+  ON→OFF-live-purge / per-subnet NAT; Oracle isolate exit egress <ORACLE_PUB> + overlay
   simultaneously; split-tunnel; 66+6 unit tests, fmt, clippy clean.
 - **Finding #1 (fixed, v0.7.10 `205495d`)**: the v0.7.8 legacy-`100.64/10` purge only ran in
   `disable_nat`, so a pinned exit (enable_nat-only) accumulated 130 leftover `FORWARD 100.64/10

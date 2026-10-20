@@ -16,7 +16,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 lattice-proto = { path = "../crates/proto" }
-lattice-net = { path = "../crates/net" }
+lattice-net = { path = "../crates/net", features = ["nat"] }
+lattice-meshrun = { path = "../crates/meshrun" }
 
 [[bin]]
 name = "wire_decode"
@@ -28,6 +29,34 @@ bench = false
 [[bin]]
 name = "stun_parse"
 path = "fuzz_targets/stun_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gossip_decode"
+path = "fuzz_targets/gossip_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recipher_decode"
+path = "fuzz_targets/recipher_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "beacon_parse"
+path = "fuzz_targets/beacon_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flow_parse"
+path = "fuzz_targets/flow_parse.rs"
 test = false
 doc = false
 bench = false

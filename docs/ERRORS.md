@@ -13,6 +13,46 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-10-21** · modified `fuzz/Cargo.toml` deps(Phase 1 feature 재배선) → fuzz 워크스페이스에서
+  `lattice-meshrun` 컴파일 실패: `no method named set_reuse_port found for Socket`
+  (meshrun/lan.rs:72) — 메인 워크스페이스에선 **tokio가 socket2의 `all` feature를 켜주는 feature
+  unification에 우연히 의존**하고 있었는데, fuzz 워크스페이스의 독립 resolve에서 최신 tokio가
+  socket2 0.6으로 옮겨가자 meshrun의 0.5가 맨몸이 됨 → fixed by 루트 `workspace.dependencies`에
+  `socket2 = { version = "0.5", features = ["all"] }` 명시. **교훈: 내 코드가 쓰는 dep feature는
+  내가 선언하라 — 이웃 crate의 unification은 다른 워크스페이스/future resolve에서 사라진다.**
+
+- **2026-09-19** · lablinux에서 누군가(콘솔 세션) GitHub 릴리스의 구버전 `meshd-Linux-X64`를
+  `sudo ./meshd-Linux-X64`로 여러 번 직접 실행 + 0.7.13 AppImage GUI 실행 → **`/root/.lattice/meshd/`의
+  `mesh-*.json`(멤버십+identity) 전부 소실**, systemd 유닛은 9/8부터 inactive였고 rogue 데몬이 소켓만
+  잡은 채 TUN 없음 → Oracle/Mac 모두 lablinux unreachable. 백업(ExportState) 없어 identity 복구 불가 →
+  quick bearer invite로 **#8(node-8)로 재가입** + `serve-exit` + `lattice exit home 8`로 exit 재지정.
+  팬텀 #4(구 lablinux)와 #2(구 mac)는 roster에 잔존(expel=creator-only, 미처리) → health floor만 올림.
+  **교훈: (1) 릴리스 바이너리를 라이브 노드에서 loose 실행하면 state를 먹거나 지운다 — 데몬 교체는
+  systemd 스왑 절차로만; (2) mesh state는 identity라 백업이 없으면 재가입뿐 — ExportState 백업을
+  노드마다 남겨라; (3) "A↔B 안 됨" 신고여도 먼저 제3노드 시점(`lattice info`)으로 누가 죽었는지 보라.**
+
+- **2026-08-22** · `scripts/build-app.sh`(= `npm run tauri build`) 돌렸더니 **라이브 VPN이 마운트된
+  DMG에서 도는 새 앱으로 바뀜** → 원인: tauri의 dmg 번들 단계가 `bundle_dmg.sh`로 `/Volumes/Lattice`를
+  auto-mount하고 그 볼륨의 새 `Lattice.app`이 실행됨 → single-instance guard로 새 meshd가 라이브
+  소켓을 넘겨받음. 실행 경로가 `/Volumes/Lattice/...`(DMG)라 볼륨 언마운트 시 VPN 사망하는 취약 상태.
+  진단: `ps`의 meshd 경로가 `/Applications`가 아니라 `/Volumes`. 고침: clean teardown(off→shutdown→
+  quit) → 빌드 산출물 `.app`을 `/Applications`에 `ditto` 설치 → `hdiutil detach /Volumes/Lattice` →
+  `/Applications`에서 재실행 → 실행 경로 재확인. **교훈: 라이브 VPN 중 GUI 번들 빌드는 데몬을 몰래
+  스왑할 수 있다(dmg 단계가 볼륨 마운트+앱 실행). 빌드 후 반드시 실행 경로(/Volumes vs /Applications)를
+  확인하고, 가능하면 라이브 VPN과 무관한 시점/머신에서 번들을 빌드하라.**
+
+- **2026-08-07** · GUI에서 "왜 자꾸 Default network로 감?" → 원인: **full-tunnel egress(`current` +
+  `full_tunnel`)가 재시작에 persist 안 됨.** split-tunnel은 `split-active.json`으로 유지되는데
+  full-tunnel만 비대칭으로 안 됨 → meshd 재시작(=이번 세션에 수십 번)마다 `full_tunnel=false`,
+  `current=None`으로 리셋 → Default network. 진단: persist 파일을 직접 까서 `egress.json` 부재 +
+  `persist_full_tunnel` 함수 부재 확인 → **코드가 원인**(NAT/네트워크 아님). 고침:
+  `persist_egress`/`load_egress`(`egress.json` 0600, `current.filter(|_| full_tunnel)`) +
+  SetCurrent/RemoveMesh/self-destruct에서 호출 + 부팅 복원 블록. **함정 회피**: 부팅 때 무작정
+  divert하면 exit 미연결 시 default route 블랙홀→kill-switch가 인터넷 끊음 → `restore_full_tunnel`이
+  **exit 도달 가능해질 때까지 대기 후** 적용(intent는 즉시 세팅, 실제 라우팅은 preflight 통과 후).
+  offline 검증: 단위테스트(게이팅 round-trip)+빌드+fmt+startup 스모크. **교훈: 라우팅 상태를
+  하나 persist하면 형제 상태(split↔full)도 대칭으로 persist하라 — 비대칭이 "몰래 리셋" 버그.**
+
 - **2026-08-07** · v0.7.13 join-modes 라이브 검증 중, pinned 노드에 2번째 메쉬를 붙였더니
   gossip이 안 퍼짐 → 원인: **advertise-port 고정(Oracle=41000)이 per-daemon으로 적용돼 모든 메쉬가
   같은 UDP 포트에 바인드**를 시도 → 첫 메쉬(홈)가 41000을 점유하면 2번째 메쉬는
