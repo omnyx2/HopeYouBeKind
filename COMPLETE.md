@@ -5,6 +5,38 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## 리팩토링 Phase 3 — 함수화/중복제거 (meshd handle·persist, meshrun run, GUI, CLI) (2026-10-21)
+
+전부 행동 보존(기계적) 리팩토링. 커밋 3개.
+
+1. ✅ **meshd handle() 날씬화** (commit `6d098d8`): 뚱뚱한 arm 7개(Recipher/ExportState/
+   AdmitMember/SetCurrent🔴/SetFlows/CreateInvite/CreateQuickInvite)를 이름 있는 함수로 verbatim
+   추출 → handle()은 순수 디스패치 테이블. 두 invite의 복붙 "초대 권한 게이트"(~25줄×2)와
+   bootstrap-endpoint 수집을 `invite_gate()`/`bootstrap_endpoints()`로 — secure↔quick 경로가
+   더는 서로 어긋날 수 없음. **IPC enum/와이어 토큰 무변경**(Phase-0 golden 테스트 무변경 통과).
+   + persist.rs: "serialize+write+chmod 0600" 7벌과 "read→parse→default" 6벌을
+   `write_json_secure`/`read_json_or_default`/`persist_marker`로 — 파일별 frozen serializer
+   (pretty vs compact) 유지, Phase-0 라운드트립 테스트가 그대로 증명.
+2. ✅ **meshrun run() 재구성** (commit `17155d6`): 13-포지셔널 파라미터(clippy allow로 침묵) →
+   `pub DataPlaneHandles` 구조체(호출부 15곳 field-by-name); select! arm 4개를 `LoopCtx` 메서드
+   (outbound/inbound/gossip_tick/command)로 verbatim 이동(self.-한정, `continue`→`return` 1곳).
+   폴링 소스(TUN/transport/loop_cmd/gossip 인터벌)는 Ctx 밖 — select! future가 Ctx를 빌리지
+   않는 구조. 와이어/타이머/라우팅 무변경; meshrun 테스트(relay fallback, gossip 승격, 재암호,
+   e2e 인메모리 페어) 전부 통과.
+3. ✅ **GUI + CLI** (commit `06758a9`): bridge.js(meshd 브리지)+util.js(순수 헬퍼) leaf 모듈 분리
+   — ESLint per-module no-undef가 교차 참조를 정적 전수검사(이 프론트 최초의 정적 체크).
+   egress Off/Split/Full 유도 4벌(철자 2가지로 이미 분화) → `egressModeOf()` 하나.
+   **단일 폴 스케줄러**: 독립 3초 setInterval 4개 → 틱 1개가 ListMeshes+SplitList를 한 번
+   fetch해 topbar/공격배너/경고배지와 공유 + 활성 탭 렌더; hidden 일시정지 + meshd 불통 시
+   30s까지 지수 backoff(성공/가시화 시 3s 복귀). 소켓 연결 ~5-7회/3s → ~2-4회.
+   CLI: cmd_doctor의 한국어 substring 결합을 REASON_* 상수로(view.rs 소스 라인 포인터 포함).
+   ⚠ GUI는 커밋만 — 라이브 앱 반영은 다음 번들 빌드.
+
+검증: workspace 169 passed/0 failed, clippy 경고 수 불변, fmt, eslint+vite build, CLI 구문+--help.
+보류: GUI 페이지 단위 분할(상태 설계 필요 — Phase 4 DOM-diff와 함께), 데몬 reason CODE.
+
+---
+
 ## 리팩토링 Phase 2 — meshd/main.rs 모듈 분할 (2026-10-21)
 
 **main.rs 4,889 → 2,611줄.** 순수 코드 이동 — 로직/와이어/persist 포맷 무변경, 전부 오프라인 검증.
