@@ -13,6 +13,14 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-10-21** · modified `fuzz/Cargo.toml` deps(Phase 1 feature 재배선) → fuzz 워크스페이스에서
+  `lattice-meshrun` 컴파일 실패: `no method named set_reuse_port found for Socket`
+  (meshrun/lan.rs:72) — 메인 워크스페이스에선 **tokio가 socket2의 `all` feature를 켜주는 feature
+  unification에 우연히 의존**하고 있었는데, fuzz 워크스페이스의 독립 resolve에서 최신 tokio가
+  socket2 0.6으로 옮겨가자 meshrun의 0.5가 맨몸이 됨 → fixed by 루트 `workspace.dependencies`에
+  `socket2 = { version = "0.5", features = ["all"] }` 명시. **교훈: 내 코드가 쓰는 dep feature는
+  내가 선언하라 — 이웃 crate의 unification은 다른 워크스페이스/future resolve에서 사라진다.**
+
 - **2026-09-19** · lablinux에서 누군가(콘솔 세션) GitHub 릴리스의 구버전 `meshd-Linux-X64`를
   `sudo ./meshd-Linux-X64`로 여러 번 직접 실행 + 0.7.13 AppImage GUI 실행 → **`/root/.lattice/meshd/`의
   `mesh-*.json`(멤버십+identity) 전부 소실**, systemd 유닛은 9/8부터 inactive였고 rogue 데몬이 소켓만

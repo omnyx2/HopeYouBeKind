@@ -1,20 +1,16 @@
 # TEMP.md — live working memory
 
-## 리팩토링 로드맵 — 남은 단계 (Phase 0은 완료 → COMPLETE.md 2026-10-20)
+## 리팩토링 로드맵 — 남은 단계 (Phase 0·1 완료 → COMPLETE.md 2026-10-20/21)
 
 2026-10-20 4-영역 감사 기반. 각 단계는 별도 PR, 라이브 데몬 불가침 원칙 유지.
 
-1. [ ] Phase 1 — 죽은 코드 삭제: mesh/policy.rs+roster.rs+MeshContainer(소비자 0, ~350줄),
-   net::tcp(188줄), net relay 회로층, meshrun 바이너리(main.rs — exit NAT 3번째 복사본),
-   tun/macos 빈 tracing_name, GUI vestigial deps(lattice-proto/lattice-ipc/@tauri-apps/api).
-   net의 v1부(discovery/nat/relay)는 `v1` feature 게이트(meshd 빌드에서 mdns-sd 제거).
-2. [ ] Phase 2 — meshd/main.rs(4.9k줄) 모듈 분할(순수 이동 ~1,900줄): state.rs / persist.rs
+1. [ ] Phase 2 — meshd/main.rs(4.9k줄) 모듈 분할(순수 이동 ~1,900줄): state.rs / persist.rs
    (+write_json_secure dedup, 파일별 to_vec vs to_vec_pretty 유지) / parse.rs / view.rs /
    ext.rs / ipcserve.rs / watch.rs + MeshState::new 생성자(4곳 복붙→1곳) + LoopEvent drain 추출.
-3. [ ] Phase 3 — handle() 뚱뚱한 arm 함수화(IPC enum 자체는 불가침) / meshrun run() 13-param→
+2. [ ] Phase 3 — handle() 뚱뚱한 arm 함수화(IPC enum 자체는 불가침) / meshrun run() 13-param→
    구조체 + select arm 추출 / GUI main.js 모듈 분할 + 단일 폴 스케줄러 + egressMode 헬퍼 4벌→1 /
    lattice doctor의 한국어 substring 매칭→reason code.
-4. [ ] Phase 4 — 행동 변화(각각 단독 커밋+라이브 검증): handle 내 lock 쥔 동기 shell-out,
+3. [ ] Phase 4 — 행동 변화(각각 단독 커밋+라이브 검증): handle 내 lock 쥔 동기 shell-out,
    meshrun eprintln→tracing(Windows 진단 복구), direct/relay 25s/30s skew 통일, 결정론적
    relay 선출, DHT endpoint 덮어쓰기 불변식, 창닫기=데몬사망→트레이.
    버그 후보 추가 검토: quick-admit HashMap 비결정성(membership.rs grant_members — 노드별

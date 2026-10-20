@@ -5,6 +5,30 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## 리팩토링 Phase 1 — 죽은 코드 삭제 + net v1 feature 게이트 (2026-10-21)
+
+Phase 0 감사 후속. 삭제 전 전 영역(crates/legacy/gui/connectors/fuzz) grep으로 소비자 0 재검증.
+
+1. ✅ **mesh 죽은 스켈레톤 삭제** — policy.rs + roster.rs + MeshContainer + `Mesh.roster` 필드
+   (~350줄+테스트 9개): membership.rs + meshd MeshState가 대체한 pre-membership 설계. 이름충돌
+   (RouteDecision/FlowKey/FlowMatch 2벌)과 중복 cidr_contains도 함께 소멸. commit `7f5b7dc`.
+2. ✅ **net::tcp 삭제(188줄, 소비자 0) + v1 스택 feature 게이트 + meshrun 바이너리 삭제** —
+   `nat = ["dep:rand"]`(legacy-dht의 rendezvous가 필요 — meshd가 MESHD_DHT로 재사용 + fuzz
+   stun_parse), `v1 = ["nat", "dep:mdns-sd"]`(legacy daemon/engine만). **meshd 빌드에서 mdns-sd
+   완전 제거**(cargo tree 확인). meshrun dev-runner(main.rs)는 아무도 안 빌드 + exit NAT 3번째
+   복사본이라 삭제, anyhow dep도 제거. ⚠️ 발견한 함정: meshrun/lan.rs의 `set_reuse_port`가
+   tokio의 socket2 feature unification에 우연히 의존 → 루트에 `socket2 features=["all"]` 명시
+   (docs/ERRORS.md 2026-10-21). commit `f8f9b4f`.
+3. ✅ **GUI vestigial deps + tun 빈 함수** — gui/src-tauri에서 lattice-proto/lattice-ipc(미사용,
+   legacy로 가는 마지막 빌드 엣지) 제거, package.json에서 @tauri-apps/api(미import,
+   withGlobalTauri) 제거, tun/macos.rs 빈 tracing_name 삭제. commit `6124c4d`.
+
+검증: workspace build+test(1.79) 169 passed/0 failed, clippy 0 error, fmt, fuzz 워크스페이스
+stable check, gui/src-tauri stable check, vite build+eslint, meshd 단독 tree에 mdns 0건.
+legacy 62k줄의 워크스페이스 분리는 보류(여전히 CI에서 빌드됨 — 사용자 결정 필요시 Phase 2+).
+
+---
+
 ## 리팩토링 Phase 0 — 안전망(테스트/린트/fuzz) + 소규모 버그 4건 (2026-10-20)
 
 4-영역 코드 감사(meshd / mesh+proto / net·tun·meshrun / GUI+CLI)에서 나온 첫 PR. 전부
