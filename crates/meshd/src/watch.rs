@@ -366,3 +366,214 @@ pub(crate) fn spawn_self_destruct_watchdog(mesh_id: MeshId, state: Arc<Mutex<Sta
         }
     });
 }
+
+/// Drain one mesh's data-plane loop events — a re-cipher landing (sync our stored
+/// secret/epoch/cipher), a P-C7 attack signal (arm / cancel the destroy grace), or
+/// a gossip merge (roster certs / revocations / flow table / service registry /
+/// quick-invite members). Each arm mutates `MeshState` under the global lock and
+/// flags persist/emit work for after the `&mut` borrow ends.
+/// Extracted verbatim from `bringup_dataplane` (Phase 2); behavior unchanged.
+pub(crate) fn spawn_loop_event_drain(
+    mesh_id: MeshId,
+    state: Arc<Mutex<State>>,
+    mut applied_rx: tokio::sync::mpsc::UnboundedReceiver<LoopEvent>,
+) {
+    let st = state;
+    let mid = mesh_id;
+    tokio::spawn(async move {
+        while let Some(ev) = applied_rx.recv().await {
+            let mut state = st.lock().unwrap();
+            let Some(ms) = state.meshes.get_mut(&mid) else {
+                continue;
+            };
+            let mut persist_after = false;
+            // Deferred event emits: `ms` (a &mut into `state`) is alive across the match,
+            // so we can't borrow `state` for `emit` until after it. NLL frees `ms` once the
+            // match ends, so we flag here and emit below.
+            let mut emit_peer = false;
+            let mut emit_service = false;
+            match ev {
+                LoopEvent::Recipher(r) => {
+                    ms.secret = r.secret;
+                    ms.epoch = r.epoch;
+                    ms.mesh.epoch = r.epoch;
+                    ms.cipher = r.cipher;
+                    persist_after = true; // P-S1: the new secret must reach disk
+                }
+                LoopEvent::Control(CTRL_ATTACK) => {
+                    if ms.attack_armed_at.is_none() {
+                        elog!("meshd: mesh {mid} ATTACK ALERT received — destroy grace armed ({ATTACK_GRACE_SECS}s; creator can all-clear)");
+                        ms.attack_armed_at = Some(now_ms());
+                    }
+                }
+                LoopEvent::Control(CTRL_ALLCLEAR) => {
+                    if ms.attack_armed_at.take().is_some() {
+                        elog!("meshd: mesh {mid} ALL-CLEAR received — destroy grace cancelled");
+                    }
+                }
+                LoopEvent::Control(_) => {}
+                // A peer gossiped its roster — merge any new cert for THIS mesh that we
+                // don't already hold; `roster()` re-validates the chain to the master, so
+                // pushing is safe (an invalid cert just never counts). This is what makes
+                // a member added via a third node propagate to everyone.
+                LoopEvent::Roster(bytes) => {
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = bincode::deserialize::<Vec<Cert>>(&bytes) {
+                            let net = ms.mesh.charter.master_pubkey;
+                            let before = ms.roster().len();
+                            for c in incoming {
+                                if ms.certs.len() >= MAX_ROSTER_CERTS {
+                                    elog!("meshd: mesh {mid} roster cert cap ({MAX_ROSTER_CERTS}) reached — dropping further gossiped certs");
+                                    break;
+                                }
+                                if c.network == net
+                                    && !ms
+                                        .certs
+                                        .iter()
+                                        .any(|h| h.member == c.member && h.id == c.id)
+                                {
+                                    ms.certs.push(c);
+                                }
+                            }
+                            let after = ms.roster().len();
+                            if after > before {
+                                elog!(
+                                    "meshd: mesh {mid} roster grew {before} -> {after} via gossip"
+                                );
+                                persist_after = true;
+                                emit_peer = true;
+                            }
+                        }
+                    }
+                }
+                // A peer gossiped revocations — merge new ones (and fold co-signers into an
+                // existing one, so a quorum expulsion accumulates votes). `roster()`
+                // re-checks authorization, so an unauthorized revocation simply never bites.
+                LoopEvent::Revoke(bytes) => {
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = bincode::deserialize::<Vec<Revocation>>(&bytes) {
+                            let net = ms.mesh.charter.master_pubkey;
+                            let before = ms.roster().len();
+                            let mut changed = false;
+                            for r in incoming {
+                                if r.network != net {
+                                    continue;
+                                }
+                                match ms.revocations.iter_mut().find(|e| e.member == r.member) {
+                                    Some(existing) => changed |= existing.merge_signers(&r),
+                                    None => {
+                                        if ms.revocations.len() >= MAX_REVOCATIONS {
+                                            elog!("meshd: mesh {mid} revocation cap ({MAX_REVOCATIONS}) reached — dropping further gossiped revocations");
+                                            break;
+                                        }
+                                        ms.revocations.push(r);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            let after = ms.roster().len();
+                            if changed {
+                                persist_after = true;
+                                emit_peer = true;
+                                if after < before {
+                                    elog!("meshd: mesh {mid} roster shrank {before} -> {after} via revocation gossip");
+                                }
+                            }
+                        }
+                    }
+                }
+                // A peer gossiped its SDN flow table (`version(8 BE) ‖ bincode(flows)`).
+                // Newest version wins; ties are ignored. On adopting a newer table we
+                // store it, persist it, and push it down to the live data plane.
+                LoopEvent::Flows(bytes) => {
+                    if (8..=MAX_GOSSIP_BYTES).contains(&bytes.len()) {
+                        let mut v = [0u8; 8];
+                        v.copy_from_slice(&bytes[..8]);
+                        let version = u64::from_be_bytes(v);
+                        if version > ms.flow_version {
+                            if let Ok(flows) = bincode::deserialize::<Vec<FlowRule>>(&bytes[8..]) {
+                                if flows.len() > MAX_FLOW_RULES {
+                                    elog!("meshd: mesh {mid} ignored gossiped flow table v{version} — {} rules exceeds cap {MAX_FLOW_RULES}", flows.len());
+                                    continue;
+                                }
+                                elog!(
+                                    "meshd: mesh {mid} adopted flow table v{version} ({} rules) via gossip",
+                                    flows.len()
+                                );
+                                ms.flow_version = version;
+                                ms.flows = flows.clone();
+                                if let Some(tx) = &ms.loop_cmd {
+                                    let _ = tx.send(LoopCmd::SetFlows(flows));
+                                }
+                                persist_after = true;
+                            }
+                        }
+                    }
+                }
+                // A peer gossiped its advertised services — merge them (soft state,
+                // newest-per-(member, proto) wins) so the registry converges mesh-wide. Not
+                // persisted; a `service` event tells subscribed connectors to re-query.
+                LoopEvent::Registry(bytes) => {
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = serde_json::from_slice::<Vec<ServiceRecord>>(&bytes) {
+                            let me = ms.my_id();
+                            // Don't let a peer's batch overwrite our OWN records.
+                            let incoming = incoming.into_iter().filter(|r| r.member != me);
+                            if registry::merge(&mut ms.services, incoming, now_ms(), MAX_SERVICES) {
+                                emit_service = true;
+                            }
+                        }
+                    }
+                }
+                // A peer gossiped quick-invite members (self-registered under a Grant) — merge any
+                // new record for THIS mesh; `roster()` re-validates via `grant_members`, so an
+                // invalid/surplus one simply never counts (docs/JOIN_MODES.md).
+                LoopEvent::Quick(bytes) => {
+                    if bytes.len() <= MAX_GOSSIP_BYTES {
+                        if let Ok(incoming) = bincode::deserialize::<Vec<GrantCert>>(&bytes) {
+                            let net = ms.mesh.charter.master_pubkey;
+                            let before = ms.roster().len();
+                            for q in incoming {
+                                if ms.grant_certs.len() >= MAX_ROSTER_CERTS {
+                                    break;
+                                }
+                                if q.grant.network == net
+                                    && !ms
+                                        .grant_certs
+                                        .iter()
+                                        .any(|h| h.member == q.member && h.id == q.id)
+                                {
+                                    ms.grant_certs.push(q);
+                                }
+                            }
+                            if ms.roster().len() > before {
+                                persist_after = true;
+                                emit_peer = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if persist_after {
+                persist(&state);
+            }
+            // `ms` is dead after the match (NLL), so `state` can be shared-borrowed now.
+            if emit_peer {
+                emit(
+                    &state,
+                    "peer",
+                    Some(mid),
+                    serde_json::json!({ "kind": "roster_changed", "mesh": mid }),
+                );
+            }
+            if emit_service {
+                emit(
+                    &state,
+                    "service",
+                    Some(mid),
+                    serde_json::json!({ "kind": "changed", "mesh": mid }),
+                );
+            }
+        }
+    });
+}

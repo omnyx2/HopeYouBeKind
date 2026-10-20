@@ -329,3 +329,106 @@ pub(crate) struct Bringup {
     pub(crate) header_placement: HeaderPlacement,
     pub(crate) flows: Vec<FlowRule>,
 }
+
+/// The per-site inputs of a brand-new (or restored) mesh — everything that
+/// DIFFERS between the four `MeshState` construction sites (create / secure
+/// join / quick join / restore). [`NewMesh::build`] owns the shared part:
+/// it allocates the Arc handles once and returns the `MeshState` together with
+/// the `Bringup` that shares them. Adding a `MeshState` field now has ONE home
+/// instead of four copy-pasted literals (a missed site used to silently get a
+/// default).
+pub(crate) struct NewMesh {
+    /// With `epoch` (and, for restore, `exit`) already set by the caller.
+    pub(crate) mesh: Mesh,
+    pub(crate) master: Option<MasterKey>,
+    pub(crate) my_key: MemberKey,
+    pub(crate) my_enc: EncKey,
+    pub(crate) certs: Vec<Cert>,
+    pub(crate) revocations: Vec<Revocation>,
+    pub(crate) grant_certs: Vec<GrantCert>,
+    pub(crate) secret: [u8; 32],
+    pub(crate) cipher: String,
+    pub(crate) epoch: u64,
+    /// This node's exit pick (restore only; a fresh mesh starts `None`).
+    pub(crate) exit: Option<MemberId>,
+    pub(crate) exitable: bool,
+    /// Bootstrap endpoints to seed the data plane with (P-D1).
+    pub(crate) seed: HashMap<MemberId, SocketAddr>,
+    pub(crate) flows: Vec<FlowRule>,
+    pub(crate) flow_version: u64,
+}
+
+impl NewMesh {
+    pub(crate) fn build(self) -> (MeshState, Bringup) {
+        let NewMesh {
+            mesh,
+            master,
+            my_key,
+            my_enc,
+            certs,
+            revocations,
+            grant_certs,
+            secret,
+            cipher,
+            epoch,
+            exit,
+            exitable,
+            seed,
+            flows,
+            flow_version,
+        } = self;
+        let links = seed_links(seed);
+        let exit_sel: SharedExit = Arc::new(Mutex::new(exit));
+        let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
+        let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
+        let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
+        let bringup = Bringup {
+            mesh_id: mesh.id,
+            my_id: mesh.me,
+            prefix: mesh.charter.overlay_prefix,
+            secret,
+            cipher: cipher.clone(),
+            epoch,
+            links: Arc::clone(&links),
+            exit_sel: Arc::clone(&exit_sel),
+            split_routes: Arc::clone(&split_routes),
+            my_endpoint: Arc::clone(&my_endpoint),
+            decrypt_fails: Arc::clone(&decrypt_fails),
+            traffic: Arc::clone(&traffic),
+            header_placement: mesh.charter.header_placement,
+            flows: flows.clone(),
+        };
+        let ms = MeshState {
+            mesh,
+            master,
+            my_key,
+            my_enc,
+            certs,
+            revocations,
+            grant_certs,
+            invited: Vec::new(),
+            secret,
+            links,
+            exit_sel,
+            split_routes,
+            exitable,
+            tun_name: None,
+            my_endpoint,
+            dp_port: 0,
+            dp_error: None,
+            dp_task: None,
+            cipher,
+            epoch,
+            loop_cmd: None,
+            attack_armed_at: None,
+            decrypt_fails,
+            traffic,
+            flows,
+            flow_version,
+            services: Vec::new(),
+            service_seq: 0,
+        };
+        (ms, bringup)
+    }
+}

@@ -67,10 +67,9 @@ use tokio::sync::mpsc::UnboundedSender;
 mod state;
 use state::*;
 
-mod dht;
+mod dht; // node-wide DHT rendezvous (re-find a moved peer by pubkey) — docs/DHT_RENDEZVOUS.md
 mod dns_split; // domain-based split-tunnel: DNS-driven per-domain exit routing (docs/SPLIT_TUNNEL.md)
-#[allow(dead_code)] // ported from v1: some restore/disable paths aren't wired yet.
-mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT), from v1. // node-wide DHT rendezvous (re-find a moved peer by pubkey) — docs/DHT_RENDEZVOUS.md.
+mod exit; // OS plumbing for full-tunnel egress (client routes + exit NAT)
 
 /// Where meshd listens for the GUI/CLI. A unix domain socket on macOS/Linux; a
 /// named pipe on Windows — same newline-JSON protocol either way.
@@ -709,7 +708,7 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     // update our stored secret/epoch/cipher when a re-cipher lands — initiated or
     // received).
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<LoopCmd>();
-    let (applied_tx, mut applied_rx) = tokio::sync::mpsc::unbounded_channel::<LoopEvent>();
+    let (applied_tx, applied_rx) = tokio::sync::mpsc::unbounded_channel::<LoopEvent>();
     let task = tokio::spawn(lattice_meshrun::run(
         dp,
         tun,
@@ -730,206 +729,9 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
         ms.dp_task = Some(task.abort_handle());
         ms.loop_cmd = Some(cmd_tx);
     }
-    // Drain loop events: a re-cipher landing (sync secret/epoch/cipher) or a P-C7
-    // attack signal (arm / cancel the destroy grace).
-    let st = Arc::clone(&state);
-    let mid = b.mesh_id;
-    tokio::spawn(async move {
-        while let Some(ev) = applied_rx.recv().await {
-            let mut state = st.lock().unwrap();
-            let Some(ms) = state.meshes.get_mut(&mid) else {
-                continue;
-            };
-            let mut persist_after = false;
-            // Deferred event emits: `ms` (a &mut into `state`) is alive across the match,
-            // so we can't borrow `state` for `emit` until after it. NLL frees `ms` once the
-            // match ends, so we flag here and emit below.
-            let mut emit_peer = false;
-            let mut emit_service = false;
-            match ev {
-                LoopEvent::Recipher(r) => {
-                    ms.secret = r.secret;
-                    ms.epoch = r.epoch;
-                    ms.mesh.epoch = r.epoch;
-                    ms.cipher = r.cipher;
-                    persist_after = true; // P-S1: the new secret must reach disk
-                }
-                LoopEvent::Control(CTRL_ATTACK) => {
-                    if ms.attack_armed_at.is_none() {
-                        elog!("meshd: mesh {mid} ATTACK ALERT received — destroy grace armed ({ATTACK_GRACE_SECS}s; creator can all-clear)");
-                        ms.attack_armed_at = Some(now_ms());
-                    }
-                }
-                LoopEvent::Control(CTRL_ALLCLEAR) => {
-                    if ms.attack_armed_at.take().is_some() {
-                        elog!("meshd: mesh {mid} ALL-CLEAR received — destroy grace cancelled");
-                    }
-                }
-                LoopEvent::Control(_) => {}
-                // A peer gossiped its roster — merge any new cert for THIS mesh that we
-                // don't already hold; `roster()` re-validates the chain to the master, so
-                // pushing is safe (an invalid cert just never counts). This is what makes
-                // a member added via a third node propagate to everyone.
-                LoopEvent::Roster(bytes) => {
-                    if bytes.len() <= MAX_GOSSIP_BYTES {
-                        if let Ok(incoming) = bincode::deserialize::<Vec<Cert>>(&bytes) {
-                            let net = ms.mesh.charter.master_pubkey;
-                            let before = ms.roster().len();
-                            for c in incoming {
-                                if ms.certs.len() >= MAX_ROSTER_CERTS {
-                                    elog!("meshd: mesh {mid} roster cert cap ({MAX_ROSTER_CERTS}) reached — dropping further gossiped certs");
-                                    break;
-                                }
-                                if c.network == net
-                                    && !ms
-                                        .certs
-                                        .iter()
-                                        .any(|h| h.member == c.member && h.id == c.id)
-                                {
-                                    ms.certs.push(c);
-                                }
-                            }
-                            let after = ms.roster().len();
-                            if after > before {
-                                elog!(
-                                    "meshd: mesh {mid} roster grew {before} -> {after} via gossip"
-                                );
-                                persist_after = true;
-                                emit_peer = true;
-                            }
-                        }
-                    }
-                }
-                // A peer gossiped revocations — merge new ones (and fold co-signers into an
-                // existing one, so a quorum expulsion accumulates votes). `roster()`
-                // re-checks authorization, so an unauthorized revocation simply never bites.
-                LoopEvent::Revoke(bytes) => {
-                    if bytes.len() <= MAX_GOSSIP_BYTES {
-                        if let Ok(incoming) = bincode::deserialize::<Vec<Revocation>>(&bytes) {
-                            let net = ms.mesh.charter.master_pubkey;
-                            let before = ms.roster().len();
-                            let mut changed = false;
-                            for r in incoming {
-                                if r.network != net {
-                                    continue;
-                                }
-                                match ms.revocations.iter_mut().find(|e| e.member == r.member) {
-                                    Some(existing) => changed |= existing.merge_signers(&r),
-                                    None => {
-                                        if ms.revocations.len() >= MAX_REVOCATIONS {
-                                            elog!("meshd: mesh {mid} revocation cap ({MAX_REVOCATIONS}) reached — dropping further gossiped revocations");
-                                            break;
-                                        }
-                                        ms.revocations.push(r);
-                                        changed = true;
-                                    }
-                                }
-                            }
-                            let after = ms.roster().len();
-                            if changed {
-                                persist_after = true;
-                                emit_peer = true;
-                                if after < before {
-                                    elog!("meshd: mesh {mid} roster shrank {before} -> {after} via revocation gossip");
-                                }
-                            }
-                        }
-                    }
-                }
-                // A peer gossiped its SDN flow table (`version(8 BE) ‖ bincode(flows)`).
-                // Newest version wins; ties are ignored. On adopting a newer table we
-                // store it, persist it, and push it down to the live data plane.
-                LoopEvent::Flows(bytes) => {
-                    if (8..=MAX_GOSSIP_BYTES).contains(&bytes.len()) {
-                        let mut v = [0u8; 8];
-                        v.copy_from_slice(&bytes[..8]);
-                        let version = u64::from_be_bytes(v);
-                        if version > ms.flow_version {
-                            if let Ok(flows) = bincode::deserialize::<Vec<FlowRule>>(&bytes[8..]) {
-                                if flows.len() > MAX_FLOW_RULES {
-                                    elog!("meshd: mesh {mid} ignored gossiped flow table v{version} — {} rules exceeds cap {MAX_FLOW_RULES}", flows.len());
-                                    continue;
-                                }
-                                elog!(
-                                    "meshd: mesh {mid} adopted flow table v{version} ({} rules) via gossip",
-                                    flows.len()
-                                );
-                                ms.flow_version = version;
-                                ms.flows = flows.clone();
-                                if let Some(tx) = &ms.loop_cmd {
-                                    let _ = tx.send(LoopCmd::SetFlows(flows));
-                                }
-                                persist_after = true;
-                            }
-                        }
-                    }
-                }
-                // A peer gossiped its advertised services — merge them (soft state,
-                // newest-per-(member, proto) wins) so the registry converges mesh-wide. Not
-                // persisted; a `service` event tells subscribed connectors to re-query.
-                LoopEvent::Registry(bytes) => {
-                    if bytes.len() <= MAX_GOSSIP_BYTES {
-                        if let Ok(incoming) = serde_json::from_slice::<Vec<ServiceRecord>>(&bytes) {
-                            let me = ms.my_id();
-                            // Don't let a peer's batch overwrite our OWN records.
-                            let incoming = incoming.into_iter().filter(|r| r.member != me);
-                            if registry::merge(&mut ms.services, incoming, now_ms(), MAX_SERVICES) {
-                                emit_service = true;
-                            }
-                        }
-                    }
-                }
-                // A peer gossiped quick-invite members (self-registered under a Grant) — merge any
-                // new record for THIS mesh; `roster()` re-validates via `grant_members`, so an
-                // invalid/surplus one simply never counts (docs/JOIN_MODES.md).
-                LoopEvent::Quick(bytes) => {
-                    if bytes.len() <= MAX_GOSSIP_BYTES {
-                        if let Ok(incoming) = bincode::deserialize::<Vec<GrantCert>>(&bytes) {
-                            let net = ms.mesh.charter.master_pubkey;
-                            let before = ms.roster().len();
-                            for q in incoming {
-                                if ms.grant_certs.len() >= MAX_ROSTER_CERTS {
-                                    break;
-                                }
-                                if q.grant.network == net
-                                    && !ms
-                                        .grant_certs
-                                        .iter()
-                                        .any(|h| h.member == q.member && h.id == q.id)
-                                {
-                                    ms.grant_certs.push(q);
-                                }
-                            }
-                            if ms.roster().len() > before {
-                                persist_after = true;
-                                emit_peer = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if persist_after {
-                persist(&state);
-            }
-            // `ms` is dead after the match (NLL), so `state` can be shared-borrowed now.
-            if emit_peer {
-                emit(
-                    &state,
-                    "peer",
-                    Some(mid),
-                    serde_json::json!({ "kind": "roster_changed", "mesh": mid }),
-                );
-            }
-            if emit_service {
-                emit(
-                    &state,
-                    "service",
-                    Some(mid),
-                    serde_json::json!({ "kind": "changed", "mesh": mid }),
-                );
-            }
-        }
-    });
+    // Drain loop events (re-cipher / attack signals / gossip merges) — see
+    // watch::spawn_loop_event_drain.
+    spawn_loop_event_drain(b.mesh_id, Arc::clone(&state), applied_rx);
     // P-C4 live-paired self-destruct watchdog.
     spawn_self_destruct_watchdog(b.mesh_id, Arc::clone(&state));
 }
@@ -2096,7 +1898,6 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             None,
         );
     }
-    let prefix = invite.charter.overlay_prefix;
     // Prefer the invite's live cipher (post-re-cipher); fall back to the charter's.
     let cipher = if invite.cipher.is_empty() {
         invite.charter.initial_cipher.clone()
@@ -2116,12 +1917,6 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
             seed.insert(*m, addr);
         }
     }
-    let links = seed_links(seed);
-    let exit_sel: SharedExit = Arc::new(Mutex::new(None));
-    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
-    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
-    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
-    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
     let mut mesh = Mesh::new(
         invite.mesh_id,
         invite.mesh_name.clone(),
@@ -2129,55 +1924,26 @@ fn join_mesh(st: &mut State, invite: InviteBlob) -> (Response, Option<PostAction
         invite.member_id,
     );
     mesh.epoch = epoch;
-    let bringup = st.data_plane.then(|| Bringup {
-        mesh_id: invite.mesh_id,
-        my_id: invite.member_id,
-        prefix,
+    let (ms, bringup) = NewMesh {
+        mesh,
+        master: None,
+        my_key,
+        my_enc,
+        certs: invite.certs,
+        revocations: Vec::new(),
+        grant_certs: Vec::new(),
         secret,
-        cipher: cipher.clone(),
+        cipher,
         epoch,
-        links: Arc::clone(&links),
-        exit_sel: Arc::clone(&exit_sel),
-        split_routes: Arc::clone(&split_routes),
-        my_endpoint: Arc::clone(&my_endpoint),
-        decrypt_fails: Arc::clone(&decrypt_fails),
-        traffic: Arc::clone(&traffic),
-        header_placement: mesh.charter.header_placement,
+        exit: None,
+        exitable: false,
+        seed,
         flows: lattice_proto::flow::default_table(),
-    });
-    st.meshes.insert(
-        invite.mesh_id,
-        MeshState {
-            mesh,
-            master: None,
-            my_key,
-            my_enc,
-            certs: invite.certs,
-            revocations: Vec::new(),
-            grant_certs: Vec::new(),
-            invited: Vec::new(),
-            secret,
-            links,
-            exit_sel,
-            split_routes,
-            exitable: false,
-            tun_name: None,
-            my_endpoint,
-            dp_port: 0,
-            dp_error: None,
-            dp_task: None,
-            cipher,
-            epoch,
-            loop_cmd: None,
-            attack_armed_at: None,
-            decrypt_fails,
-            traffic,
-            flows: lattice_proto::flow::default_table(),
-            flow_version: 0,
-            services: Vec::new(),
-            service_seq: 0,
-        },
-    );
+        flow_version: 0,
+    }
+    .build();
+    let bringup = st.data_plane.then_some(bringup);
+    st.meshes.insert(invite.mesh_id, ms);
     emit(
         st,
         "peer",
@@ -2255,7 +2021,6 @@ fn join_quick(
         );
     }
     let secret = blob.secret; // RAW bearer secret
-    let prefix = blob.charter.overlay_prefix;
     let cipher = if blob.cipher.is_empty() {
         blob.charter.initial_cipher.clone()
     } else {
@@ -2271,12 +2036,6 @@ fn join_quick(
             seed.insert(*m, addr);
         }
     }
-    let links = seed_links(seed);
-    let exit_sel: SharedExit = Arc::new(Mutex::new(None));
-    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
-    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
-    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
-    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
     let mut mesh = Mesh::new(
         blob.mesh_id,
         blob.mesh_name.clone(),
@@ -2284,55 +2043,26 @@ fn join_quick(
         id,
     );
     mesh.epoch = epoch;
-    let bringup = st.data_plane.then(|| Bringup {
-        mesh_id: blob.mesh_id,
-        my_id: id,
-        prefix,
+    let (ms, bringup) = NewMesh {
+        mesh,
+        master: None,
+        my_key,
+        my_enc,
+        certs,
+        revocations: Vec::new(),
+        grant_certs,
         secret,
-        cipher: cipher.clone(),
+        cipher,
         epoch,
-        links: Arc::clone(&links),
-        exit_sel: Arc::clone(&exit_sel),
-        split_routes: Arc::clone(&split_routes),
-        my_endpoint: Arc::clone(&my_endpoint),
-        decrypt_fails: Arc::clone(&decrypt_fails),
-        traffic: Arc::clone(&traffic),
-        header_placement: mesh.charter.header_placement,
+        exit: None,
+        exitable: false,
+        seed,
         flows: lattice_proto::flow::default_table(),
-    });
-    st.meshes.insert(
-        blob.mesh_id,
-        MeshState {
-            mesh,
-            master: None,
-            my_key,
-            my_enc,
-            certs,
-            revocations: Vec::new(),
-            grant_certs,
-            invited: Vec::new(),
-            secret,
-            links,
-            exit_sel,
-            split_routes,
-            exitable: false,
-            tun_name: None,
-            my_endpoint,
-            dp_port: 0,
-            dp_error: None,
-            dp_task: None,
-            cipher,
-            epoch,
-            loop_cmd: None,
-            attack_armed_at: None,
-            decrypt_fails,
-            traffic,
-            flows: lattice_proto::flow::default_table(),
-            flow_version: 0,
-            services: Vec::new(),
-            service_seq: 0,
-        },
-    );
+        flow_version: 0,
+    }
+    .build();
+    let bringup = st.data_plane.then_some(bringup);
+    st.meshes.insert(blob.mesh_id, ms);
     emit(
         st,
         "peer",
@@ -2449,67 +2179,31 @@ fn create_mesh(
     // The creator is member #1, with a master-signed cert.
     let cert = master.issue(my_key.pubkey(), 1, &my_name, now_ms());
     let my_enc = EncKey::generate();
-    let prefix = charter.overlay_prefix;
     let cipher = charter.initial_cipher.clone();
     let secret: [u8; 32] = rand::random();
-    let links = seed_links(HashMap::new());
-    let exit_sel: SharedExit = Arc::new(Mutex::new(None));
-    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
-    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
-    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
-    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
     let mesh = Mesh::new(id, name, charter, 1);
     // If data-plane mode is on, ask the async caller to bring up this mesh's loop
-    // (sharing the same links/exit handles we store below).
-    let bringup = st.data_plane.then(|| Bringup {
-        mesh_id: id,
-        my_id: 1,
-        prefix,
+    // (sharing the same links/exit handles NewMesh::build wires into both halves).
+    let (ms, bringup) = NewMesh {
+        mesh,
+        master: Some(master),
+        my_key,
+        my_enc,
+        certs: vec![cert],
+        revocations: Vec::new(),
+        grant_certs: Vec::new(),
         secret,
-        cipher: cipher.clone(),
+        cipher,
         epoch: 0,
-        links: Arc::clone(&links),
-        exit_sel: Arc::clone(&exit_sel),
-        split_routes: Arc::clone(&split_routes),
-        my_endpoint: Arc::clone(&my_endpoint),
-        decrypt_fails: Arc::clone(&decrypt_fails),
-        traffic: Arc::clone(&traffic),
-        header_placement: mesh.charter.header_placement,
+        exit: None,
+        exitable: false,
+        seed: HashMap::new(),
         flows: lattice_proto::flow::default_table(),
-    });
-    st.meshes.insert(
-        id,
-        MeshState {
-            mesh,
-            master: Some(master),
-            my_key,
-            my_enc,
-            certs: vec![cert],
-            revocations: Vec::new(),
-            grant_certs: Vec::new(),
-            invited: Vec::new(),
-            secret,
-            links,
-            exit_sel,
-            split_routes,
-            exitable: false,
-            tun_name: None,
-            my_endpoint,
-            dp_port: 0,
-            dp_error: None,
-            dp_task: None,
-            cipher,
-            epoch: 0,
-            loop_cmd: None,
-            attack_armed_at: None,
-            decrypt_fails,
-            traffic,
-            flows: lattice_proto::flow::default_table(),
-            flow_version: 0,
-            services: Vec::new(),
-            service_seq: 0,
-        },
-    );
+        flow_version: 0,
+    }
+    .build();
+    let bringup = st.data_plane.then_some(bringup);
+    st.meshes.insert(id, ms);
     emit(
         st,
         "peer",

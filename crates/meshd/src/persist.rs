@@ -349,7 +349,6 @@ pub(crate) fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         .find(|c| c.member == my_pub)
         .map(|c| c.id)
         .unwrap_or(0);
-    let prefix = p.charter.overlay_prefix;
     let mut mesh = Mesh::new(p.mesh_id, p.mesh_name.clone(), p.charter, my_id);
     mesh.epoch = p.epoch;
     mesh.exit = p.exit;
@@ -359,35 +358,13 @@ pub(crate) fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
             seed.insert(*m, a);
         }
     }
-    let links = seed_links(seed);
-    let exit_sel: SharedExit = Arc::new(Mutex::new(p.exit));
-    let split_routes: SharedSplitRoutes = Arc::new(Mutex::new(HashMap::new()));
-    let my_endpoint: SharedEndpoint = Arc::new(Mutex::new(None));
-    let decrypt_fails: DecryptFails = Arc::new(Mutex::new(HashMap::new()));
-    let traffic: SharedTraffic = Arc::new(Mutex::new(Traffic::default()));
     // An empty persisted table (older state files) means "use the default".
-    let restored_flows = if p.flows.is_empty() {
+    let flows = if p.flows.is_empty() {
         lattice_proto::flow::default_table()
     } else {
-        p.flows.clone()
+        p.flows
     };
-    let bringup = Bringup {
-        mesh_id: p.mesh_id,
-        my_id,
-        prefix,
-        secret: p.secret,
-        cipher: p.cipher.clone(),
-        epoch: p.epoch,
-        links: Arc::clone(&links),
-        exit_sel: Arc::clone(&exit_sel),
-        split_routes: Arc::clone(&split_routes),
-        my_endpoint: Arc::clone(&my_endpoint),
-        decrypt_fails: Arc::clone(&decrypt_fails),
-        traffic: Arc::clone(&traffic),
-        header_placement: mesh.charter.header_placement,
-        flows: restored_flows.clone(),
-    };
-    let ms = MeshState {
+    NewMesh {
         mesh,
         master,
         my_key,
@@ -395,29 +372,16 @@ pub(crate) fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
         certs: p.certs,
         revocations: p.revocations,
         grant_certs: p.grant_certs,
-        invited: Vec::new(),
         secret: p.secret,
-        links,
-        exit_sel,
-        split_routes,
-        exitable: p.exitable,
-        tun_name: None,
-        my_endpoint,
-        dp_port: 0,
-        dp_error: None,
-        dp_task: None,
         cipher: p.cipher,
         epoch: p.epoch,
-        loop_cmd: None,
-        attack_armed_at: None,
-        decrypt_fails,
-        traffic,
-        flows: restored_flows,
+        exit: p.exit,
+        exitable: p.exitable,
+        seed,
+        flows,
         flow_version: p.flow_version,
-        services: Vec::new(),
-        service_seq: 0,
-    };
-    (ms, bringup)
+    }
+    .build()
 }
 
 /// Whether a request mutates persistent mesh state (⇒ re-save afterward).
