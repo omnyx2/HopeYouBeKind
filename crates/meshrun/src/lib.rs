@@ -294,7 +294,10 @@ enum Route {
 }
 
 /// Is member `m`'s direct path fresh enough to use? (a direct frame within `DIRECT_OK_MS`)
-fn directly_reachable(lk: &Link, now: u64) -> bool {
+/// `pub` because this is THE definition of "direct" — meshd's view/`lattice conns`
+/// must report with the same window the data plane routes with, or the UI claims
+/// "direct" while packets are already relaying (the 25s-vs-30s skew bug).
+pub fn directly_reachable(lk: &Link, now: u64) -> bool {
     lk.last_direct_ms != 0 && now.saturating_sub(lk.last_direct_ms) < DIRECT_OK_MS
 }
 

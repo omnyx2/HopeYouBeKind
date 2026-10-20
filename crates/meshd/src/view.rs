@@ -95,8 +95,11 @@ pub(crate) fn detail(ms: &MeshState) -> MeshDetail {
                     Some(l) if l.last_seen_ms != 0 => {
                         let age = now.saturating_sub(l.last_seen_ms) / 1000;
                         let live = now.saturating_sub(l.last_seen_ms) < LIVE_WINDOW_MS;
-                        let direct = l.last_direct_ms != 0
-                            && now.saturating_sub(l.last_direct_ms) < LIVE_WINDOW_MS;
+                        // Use the data plane's OWN definition of "direct" — this used to
+                        // re-derive it with LIVE_WINDOW_MS (30s) while routing flips to the
+                        // relay at DIRECT_OK_MS (25s), so for 25-30s of staleness the UI said
+                        // "direct" while frames already relayed. One definition now.
+                        let direct = lattice_meshrun::directly_reachable(&l, now);
                         let p = if !live {
                             "offline"
                         } else if direct {
