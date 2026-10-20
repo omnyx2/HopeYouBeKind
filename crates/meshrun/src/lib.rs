@@ -320,9 +320,14 @@ fn pick_relay(
             }
         }
     }
+    // Deterministic: the FRESHEST qualifying relay (tie → lowest member id). The old
+    // `.find()` over a HashMap picked in random iteration order, so with two equally
+    // qualified public peers the chosen relay could change between gossip ticks for no
+    // reason — noise that actively cost time in live relay debugging.
     links
         .iter()
-        .find(|(m, lk)| ok(**m, lk))
+        .filter(|(m, lk)| ok(**m, lk))
+        .max_by_key(|(m, lk)| (lk.last_direct_ms, std::cmp::Reverse(**m)))
         .map(|(m, lk)| (*m, lk.endpoint))
 }
 
@@ -959,6 +964,32 @@ pub async fn run<X: Transport + 'static>(handles: DataPlaneHandles<X>) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // Relay election must be deterministic: freshest qualifying public peer wins,
+    // ties break toward the lowest id — never HashMap iteration order.
+    #[test]
+    fn relay_election_is_deterministic_and_freshest() {
+        let now = now_ms();
+        let mk = |ip: [u8; 4], direct_age_ms: u64| Link {
+            endpoint: SocketAddr::from((ip, 41000)),
+            last_seen_ms: now,
+            last_direct_ms: now - direct_age_ms,
+        };
+        let mut links: HashMap<MemberId, Link> = HashMap::new();
+        links.insert(3, mk([8, 8, 8, 8], 10_000)); // public, older direct path
+        links.insert(5, mk([9, 9, 9, 9], 1_000)); // public, freshest
+        links.insert(7, mk([192, 168, 0, 2], 500)); // private — never a relay
+        for _ in 0..20 {
+            let got = pick_relay(&links, 1, None, now).map(|(m, _)| m);
+            assert_eq!(got, Some(5), "freshest public peer wins, stably");
+        }
+        // Tie on freshness → the lowest member id, stably.
+        let tie = links[&5].last_direct_ms;
+        links.get_mut(&3).unwrap().last_direct_ms = tie;
+        for _ in 0..20 {
+            assert_eq!(pick_relay(&links, 1, None, now).map(|(m, _)| m), Some(3));
+        }
+    }
 
     // The diagnostics sink: once installed, every rlog! line reaches it (meshd tees
     // these into its diag file so Windows' hidden-stderr daemon stays debuggable).
