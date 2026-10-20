@@ -1,16 +1,22 @@
-//! Transport (carry ciphertext over UDP) and serverless discovery (find peers
-//! without a central server).
+//! Transport (carry ciphertext over UDP) for the v2 product — plus, behind the
+//! **`v1` feature**, the legacy stack's networking: mDNS discovery, STUN/hole-punch
+//! (`nat`), and the node-id relay.
 //!
-//! - [`Transport`] is the abstraction the engine sends/receives encrypted
-//!   datagrams over; [`udp::UdpTransport`] is the real implementation.
-//! - [`Discovery`] surfaces peers as they are found. LAN discovery uses mDNS
-//!   ([`discovery::MdnsDiscovery`]); WAN DHT + NAT hole-punching is roadmap.
+//! - [`Transport`] is the abstraction encrypted datagrams are sent/received over;
+//!   [`udp::UdpTransport`] is the real implementation, [`memory`] the test pair.
+//!   This is ALL that v2 (`meshd`/`meshrun`) uses — v2 LAN discovery is
+//!   `meshrun::lan`, its relay lives inside the `meshrun` loop.
+//! - `v1`-gated: [`Discovery`]/`discovery` (mDNS), `nat`, `relay` — compiled only
+//!   for `legacy/` and the fuzz harness, so a daemon build pulls no mdns-sd.
 
 use std::net::SocketAddr;
 
-use lattice_proto::NodeId;
-
+/// STUN reflexive address + UDP hole-punch (legacy daemon + the DHT rendezvous
+/// meshd reuses; fuzzed by fuzz/stun_parse).
+#[cfg(feature = "nat")]
 pub mod nat;
+/// v1-only: the NodeId-framed relay (v2's relay logic is in `lattice-meshrun`).
+#[cfg(feature = "v1")]
 pub mod relay;
 
 #[derive(thiserror::Error, Debug)]
@@ -46,14 +52,17 @@ impl<T: Transport> Transport for std::sync::Arc<T> {
     }
 }
 
-/// A peer learned from discovery: who they are and where to reach them.
+/// A peer learned from v1 discovery: who they are and where to reach them.
+#[cfg(feature = "v1")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredPeer {
-    pub id: NodeId,
+    pub id: lattice_proto::NodeId,
     pub endpoints: Vec<SocketAddr>,
 }
 
-/// Yields peers as they are discovered. Serverless by construction.
+/// Yields peers as they are discovered. Serverless by construction. (v1-only —
+/// v2 endpoint discovery is invite seeds + gossip + the meshrun LAN beacon.)
+#[cfg(feature = "v1")]
 #[async_trait::async_trait]
 pub trait Discovery: Send {
     async fn next_peer(&mut self) -> Option<DiscoveredPeer>;
@@ -96,195 +105,8 @@ pub mod udp {
     }
 }
 
-pub mod tcp {
-    //! TCP transport: carries the same opaque datagrams as [`super::udp`] but over
-    //! one connection per peer — a fallback for networks that block or throttle UDP
-    //! (see `docs/MESH_V2.md` §6).
-    //!
-    //! TCP is connection-oriented, so it does not drop into the datagram
-    //! [`Transport`] trait for free: an inbound connection's peer address is an
-    //! ephemeral client port, useless as a reply target. So on connect the **dialer
-    //! sends a one-frame hello announcing its own listening address**, and the
-    //! acceptor keys the connection by that stable address. `recv_from` therefore
-    //! always returns a peer's *listening* address, and a reply via
-    //! `send_to(that_addr)` reuses the same connection (full duplex over one TCP
-    //! stream). Datagrams are length-prefixed: `u16` big-endian length + bytes.
-    use super::*;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{mpsc, Mutex};
-
-    /// Per-peer outbound queue of raw (unframed) payloads awaiting the socket.
-    type Outbound = mpsc::Sender<Vec<u8>>;
-    type Conns = Arc<Mutex<HashMap<SocketAddr, Outbound>>>;
-
-    pub struct TcpTransport {
-        local: SocketAddr,
-        /// Peer *listening* address → its connection's outbound queue.
-        conns: Conns,
-        /// Inbound datagrams from every connection, tagged with the peer's
-        /// listening address.
-        rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
-        tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    }
-
-    impl TcpTransport {
-        /// Bind a listening socket and start accepting peer connections.
-        pub async fn bind(addr: SocketAddr) -> Result<Self, NetError> {
-            let listener = TcpListener::bind(addr).await?;
-            let local = listener.local_addr()?;
-            let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
-            let (tx, rx) = mpsc::channel(1024);
-            {
-                let conns = Arc::clone(&conns);
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    while let Ok((stream, _ephemeral)) = listener.accept().await {
-                        tokio::spawn(serve_inbound(stream, Arc::clone(&conns), tx.clone()));
-                    }
-                });
-            }
-            Ok(Self {
-                local,
-                conns,
-                rx: Mutex::new(rx),
-                tx,
-            })
-        }
-    }
-
-    /// One inbound connection: the first frame is the dialer's hello (its listening
-    /// address); the rest are datagrams. Register a reply queue keyed by that
-    /// address so `send_to` can answer over the same stream.
-    async fn serve_inbound(
-        stream: TcpStream,
-        conns: Conns,
-        tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    ) {
-        let (mut rd, wr) = stream.into_split();
-        let peer: SocketAddr = match read_frame(&mut rd).await {
-            Ok(hello) => match std::str::from_utf8(&hello)
-                .ok()
-                .and_then(|s| s.parse().ok())
-            {
-                Some(p) => p,
-                None => return,
-            },
-            Err(_) => return,
-        };
-        // No hello back — the peer already knows our address, it dialed us.
-        let (ctx, crx) = mpsc::channel::<Vec<u8>>(256);
-        tokio::spawn(drive_writer(wr, None, crx));
-        conns.lock().await.insert(peer, ctx);
-        pump_reads(rd, peer, tx, conns).await;
-    }
-
-    /// Drain a per-connection outbound queue onto the socket, framing each payload.
-    /// When `hello` is set (the dialer side) the listening address is announced
-    /// first.
-    async fn drive_writer(
-        mut wr: OwnedWriteHalf,
-        hello: Option<SocketAddr>,
-        mut crx: mpsc::Receiver<Vec<u8>>,
-    ) {
-        if let Some(addr) = hello {
-            if write_frame(&mut wr, addr.to_string().as_bytes())
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-        while let Some(buf) = crx.recv().await {
-            if write_frame(&mut wr, &buf).await.is_err() {
-                break;
-            }
-        }
-    }
-
-    /// Read frames off a connection and surface each as a datagram from `peer`'s
-    /// listening address; drop the connection from the pool when it closes.
-    async fn pump_reads(
-        mut rd: OwnedReadHalf,
-        peer: SocketAddr,
-        tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-        conns: Conns,
-    ) {
-        loop {
-            match read_frame(&mut rd).await {
-                Ok(buf) => {
-                    if tx.send((buf, peer)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        conns.lock().await.remove(&peer);
-    }
-
-    async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> std::io::Result<Vec<u8>> {
-        let mut len = [0u8; 2];
-        rd.read_exact(&mut len).await?;
-        let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
-        rd.read_exact(&mut buf).await?;
-        Ok(buf)
-    }
-
-    async fn write_frame<W: AsyncWriteExt + Unpin>(
-        wr: &mut W,
-        payload: &[u8],
-    ) -> std::io::Result<()> {
-        let n: u16 = payload.len().try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame too large")
-        })?;
-        wr.write_all(&n.to_be_bytes()).await?;
-        wr.write_all(payload).await?;
-        wr.flush().await
-    }
-
-    #[async_trait::async_trait]
-    impl Transport for TcpTransport {
-        async fn send_to(&self, data: &[u8], dest: SocketAddr) -> Result<(), NetError> {
-            let closed = || NetError::Discovery("tcp peer connection closed".into());
-            // Reuse an existing connection if we have one.
-            if let Some(tx) = self.conns.lock().await.get(&dest).cloned() {
-                return tx.send(data.to_vec()).await.map_err(|_| closed());
-            }
-            // Otherwise dial, announce our listening address, and register it.
-            let (rd, wr) = TcpStream::connect(dest).await?.into_split();
-            let (ctx, crx) = mpsc::channel::<Vec<u8>>(256);
-            tokio::spawn(drive_writer(wr, Some(self.local), crx));
-            tokio::spawn(pump_reads(
-                rd,
-                dest,
-                self.tx.clone(),
-                Arc::clone(&self.conns),
-            ));
-            // Race: a concurrent dial may have registered first — keep that one and
-            // let ours close (its writer ends when this `ctx` drops).
-            let tx = self.conns.lock().await.entry(dest).or_insert(ctx).clone();
-            tx.send(data.to_vec()).await.map_err(|_| closed())
-        }
-
-        async fn recv_from(&self) -> Result<(Vec<u8>, SocketAddr), NetError> {
-            self.rx
-                .lock()
-                .await
-                .recv()
-                .await
-                .ok_or_else(|| NetError::Discovery("tcp transport closed".into()))
-        }
-
-        fn local_addr(&self) -> Result<SocketAddr, NetError> {
-            Ok(self.local)
-        }
-    }
-}
-
+/// v1-only: mDNS LAN discovery (the v2 LAN beacon is `lattice_meshrun::lan`).
+#[cfg(feature = "v1")]
 pub mod discovery {
     use super::*;
     use lattice_proto::NodeId;
@@ -577,53 +399,5 @@ mod tests {
         a.send_to(b"hello", b_addr).await.unwrap();
         let (data, _from) = b.recv_from().await.unwrap();
         assert_eq!(&data, b"hello");
-    }
-
-    #[tokio::test]
-    async fn tcp_transport_round_trip_and_reply_reuses_connection() {
-        let a = tcp::TcpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let b = tcp::TcpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let a_addr = a.local_addr().unwrap();
-        let b_addr = b.local_addr().unwrap();
-
-        a.send_to(b"hello", b_addr).await.unwrap();
-        let (data, from) = b.recv_from().await.unwrap();
-        assert_eq!(&data, b"hello");
-        // `from` must be A's LISTENING address (via the hello), not an ephemeral
-        // client port — so the reply below can reuse the connection.
-        assert_eq!(from, a_addr);
-
-        b.send_to(b"world", from).await.unwrap();
-        let (data2, from2) = a.recv_from().await.unwrap();
-        assert_eq!(&data2, b"world");
-        assert_eq!(from2, b_addr);
-    }
-
-    #[tokio::test]
-    async fn tcp_transport_framing_delimits_frames() {
-        let a = tcp::TcpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let b = tcp::TcpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let b_addr = b.local_addr().unwrap();
-
-        let big = vec![0xAB_u8; 1400];
-        a.send_to(&big, b_addr).await.unwrap();
-        let (data, _) = b.recv_from().await.unwrap();
-        assert_eq!(data, big);
-
-        // Back-to-back frames must not coalesce on the byte stream.
-        a.send_to(b"one", b_addr).await.unwrap();
-        a.send_to(b"two", b_addr).await.unwrap();
-        let (d1, _) = b.recv_from().await.unwrap();
-        let (d2, _) = b.recv_from().await.unwrap();
-        assert_eq!(&d1, b"one");
-        assert_eq!(&d2, b"two");
     }
 }

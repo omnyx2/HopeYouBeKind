@@ -640,7 +640,6 @@ dependencies = [
 name = "lattice-meshrun"
 version = "0.7.15"
 dependencies = [
- "anyhow",
  "async-trait",
  "lattice-mesh",
  "lattice-net",

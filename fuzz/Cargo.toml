@@ -16,7 +16,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 lattice-proto = { path = "../crates/proto" }
-lattice-net = { path = "../crates/net" }
+lattice-net = { path = "../crates/net", features = ["nat"] }
 lattice-meshrun = { path = "../crates/meshrun" }
 
 [[bin]]

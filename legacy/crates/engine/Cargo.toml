@@ -11,7 +11,7 @@ lattice-proto.workspace = true
 lattice-crypto.workspace = true
 lattice-membership.workspace = true
 lattice-tun.workspace = true
-lattice-net.workspace = true
+lattice-net = { workspace = true, features = ["v1"] }
 lattice-overlay.workspace = true
 tokio = { workspace = true }
 async-trait.workspace = true
