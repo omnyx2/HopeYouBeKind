@@ -41,3 +41,9 @@ Thumbs.db
 ssh-key-*.key*
 *.pem
 gui/src-tauri/resources/meshd
+
+# cargo-fuzz artifacts (its own workspace)
+fuzz/target/
+fuzz/Cargo.lock
+fuzz/artifacts/
+fuzz/corpus/

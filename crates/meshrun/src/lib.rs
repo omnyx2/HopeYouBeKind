@@ -138,7 +138,8 @@ pub type SharedTraffic = Arc<Mutex<Traffic>>;
 /// **RISK 🟡 MED** (parser — only feeds the traffic monitor; a wrong parse mis-labels a flow, no routing impact).
 /// Parse the IPv4 5-tuple of a raw overlay packet for the flow-detail view. Fields
 /// `at_ms/out/member/via_exit` are filled by the caller. `None` if not IPv4.
-fn parse_flow(p: &[u8]) -> Option<FlowEvent> {
+#[doc(hidden)] // pub ONLY for fuzz/ harnesses — not API
+pub fn parse_flow(p: &[u8]) -> Option<FlowEvent> {
     if p.len() < 20 || (p[0] >> 4) != 4 {
         return None;
     }
@@ -376,7 +377,8 @@ fn encode_gossip(table: &[(MemberId, SocketAddr)], reflect: Option<SocketAddr>) 
 /// **RISK 🔴 HIGH** (ON-WIRE FORMAT — inverse of [`encode_gossip`]; must tolerate old/garbage lines).
 /// Decode a gossip payload → (endpoint table, our reflexive address if the sender
 /// reported one). Unknown/garbage lines are skipped (older senders sent no `self`).
-fn decode_gossip(payload: &[u8]) -> (Vec<(MemberId, SocketAddr)>, Option<SocketAddr>) {
+#[doc(hidden)] // pub ONLY for fuzz/ harnesses — not API
+pub fn decode_gossip(payload: &[u8]) -> (Vec<(MemberId, SocketAddr)>, Option<SocketAddr>) {
     let mut table = Vec::new();
     let mut reflect = None;
     for line in String::from_utf8_lossy(payload).lines() {
@@ -486,7 +488,8 @@ fn encode_recipher(r: &Recipher) -> Vec<u8> {
 }
 
 /// **RISK 🔴 HIGH** (ON-WIRE FORMAT — inverse of [`encode_recipher`]; length-checks the buffer).
-fn decode_recipher(b: &[u8]) -> Option<Recipher> {
+#[doc(hidden)] // pub ONLY for fuzz/ harnesses — not API
+pub fn decode_recipher(b: &[u8]) -> Option<Recipher> {
     if b.len() < 9 {
         return None;
     }

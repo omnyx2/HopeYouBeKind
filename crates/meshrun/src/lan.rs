@@ -52,7 +52,8 @@ fn beacon_encode(tag: &[u8; 8], member: MemberId, port: u16) -> [u8; BEACON_LEN]
 }
 
 /// Parse a beacon → (tag, member, data-plane port). `None` if it isn't one of ours.
-fn beacon_parse(b: &[u8]) -> Option<([u8; 8], MemberId, u16)> {
+#[doc(hidden)] // pub ONLY for fuzz/ harnesses — not API
+pub fn beacon_parse(b: &[u8]) -> Option<([u8; 8], MemberId, u16)> {
     if b.len() != BEACON_LEN || &b[0..4] != BEACON_MAGIC {
         return None;
     }
