@@ -131,6 +131,8 @@ fn quorum_threshold(n: usize) -> usize {
 /// always does — so the log is findable regardless of which account elevated.
 fn diag_log(msg: &str) {
     use std::io::Write;
+    // `mut` is only exercised by the Windows-only push below.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut paths = vec![std::env::temp_dir().join("lattice-meshd.log")];
     #[cfg(windows)]
     paths.push(std::path::PathBuf::from(
@@ -745,7 +747,14 @@ fn persist_default_mesh(st: &State) {
         }
         Some(_) => {
             if let Ok(json) = serde_json::to_vec(&st.default_mesh) {
-                let _ = std::fs::write(&f, &json);
+                if std::fs::write(&f, &json).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
             }
         }
     }
@@ -914,6 +923,7 @@ fn request_mutates(req: &Request) -> bool {
         Request::CreateMesh { .. }
             | Request::JoinMesh { .. }
             | Request::CreateInvite { .. }
+            | Request::AdmitMember { .. }
             | Request::SetExit { .. }
             | Request::SetPeer { .. }
             | Request::SetCurrent { .. }
@@ -4827,7 +4837,20 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_egress, persist_egress, quorum_threshold, State};
+    use super::{
+        dns_split, load_default_mesh, load_egress, load_extensions, load_split, load_split_active,
+        persist_default_mesh, persist_egress, persist_extensions, persist_split,
+        persist_split_active, quorum_threshold, request_mutates, ExtensionGrant, SplitActive,
+        State,
+    };
+
+    /// Fresh scratch dir per test (parallel-safe: tag + pid).
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lattice-{tag}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn quorum_threshold_is_ceil_60pct() {
@@ -4884,6 +4907,224 @@ mod tests {
             "default network clears the persisted egress"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // `request_mutates` must list every request that changes persistent mesh state — a missed
+    // variant means the change is silently lost on the next restart (AdmitMember was exactly
+    // that: the cert was pushed into `ms.certs` but never saved). When adding a Request
+    // variant, decide here whether it belongs in the table. (SetDefaultMesh / SetFlows /
+    // SplitOn / SplitOff persist inline via their own files, so they are deliberately absent.)
+    #[test]
+    fn request_mutates_lists_every_persisting_request() {
+        use lattice_mesh::ipc::{Request, WrappedInvite};
+        let mutating = [
+            Request::CreateMesh {
+                name: "m".into(),
+                my_name: "a".into(),
+                max_members: 8,
+                cipher: None,
+                self_destruct: None,
+                master_gated: None,
+                expel: None,
+                header: None,
+                exit_policy: None,
+                join: None,
+            },
+            Request::JoinMesh {
+                invite: WrappedInvite {
+                    salt: [0; 32],
+                    n: 0,
+                    ct: Vec::new(),
+                },
+                algo: None,
+                name: None,
+            },
+            Request::CreateInvite {
+                mesh: 1,
+                name: "a".into(),
+                member_pubkey_hex: String::new(),
+                enc_pubkey_hex: String::new(),
+                issued_at: 0,
+                algo: None,
+            },
+            Request::AdmitMember {
+                mesh: 1,
+                name: "a".into(),
+                pubkey_hex: String::new(),
+            },
+            Request::SetExit {
+                mesh: 1,
+                exit: None,
+            },
+            Request::SetPeer {
+                mesh: 1,
+                member: 2,
+                endpoint: "127.0.0.1:1".into(),
+            },
+            Request::SetCurrent { mesh: None },
+            Request::RemoveMesh { mesh: 1 },
+            Request::Recipher {
+                mesh: 1,
+                cipher: None,
+            },
+            Request::AllClear { mesh: 1 },
+            Request::ExpelMember { mesh: 1, member: 2 },
+            Request::EnableExtension {
+                id: "x".into(),
+                scopes: Vec::new(),
+                all_meshes: false,
+                meshes: Vec::new(),
+            },
+            Request::DisableExtension { id: "x".into() },
+            Request::SplitAdd {
+                domain: "d".into(),
+                mesh: 1,
+                exit: 0,
+            },
+            Request::SplitDel { domain: "d".into() },
+            Request::SetExitable {
+                mesh: 1,
+                enabled: true,
+            },
+        ];
+        for r in &mutating {
+            assert!(request_mutates(r), "must persist after {r:?}");
+        }
+        let read_only = [
+            Request::ListMeshes,
+            Request::MeshInfo { mesh: 1 },
+            Request::Ciphers,
+            Request::TrafficStats { mesh: None },
+            Request::GetPolicy,
+            Request::GetFlows { mesh: 1 },
+            Request::SplitList,
+            Request::ListExtensions,
+            Request::NewIdentity,
+            Request::InviteAlgorithms,
+            // A quick invite only MINTS a grant (it travels inside the blob); local state
+            // doesn't change until a joiner self-registers (which arrives via JoinMesh/gossip).
+            Request::CreateQuickInvite {
+                mesh: 1,
+                name: None,
+                max_uses: 1,
+                ttl_secs: 60,
+                algo: None,
+            },
+        ];
+        for r in &read_only {
+            assert!(!request_mutates(r), "must not trigger a persist: {r:?}");
+        }
+    }
+
+    // Lock the on-disk format of split.json before any persistence refactor touches it.
+    #[test]
+    fn split_rules_roundtrip() {
+        let dir = tmpdir("split");
+        let st = State {
+            persist_dir: Some(dir.clone()),
+            split_rules: vec![dns_split::SplitRule {
+                domain: "example.com".into(),
+                mesh: 3,
+                exit: 7,
+            }],
+            ..Default::default()
+        };
+        persist_split(&st);
+        let loaded = load_split(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].domain, "example.com");
+        assert_eq!(loaded[0].mesh, 3);
+        assert_eq!(loaded[0].exit, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // split-active.json: on → survives reload; off → the marker file is removed.
+    #[tokio::test]
+    async fn split_active_roundtrips_and_off_removes_marker() {
+        let dir = tmpdir("split-active");
+        let mut st = State {
+            persist_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        persist_split_active(&st);
+        assert_eq!(load_split_active(&dir), None);
+        st.split = Some(SplitActive {
+            mesh: 5,
+            task: tokio::spawn(async {}),
+            injected: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        });
+        persist_split_active(&st);
+        assert_eq!(load_split_active(&dir), Some(5));
+        if let Some(s) = st.split.take() {
+            s.task.abort();
+        }
+        persist_split_active(&st);
+        assert_eq!(
+            load_split_active(&dir),
+            None,
+            "split off removes the marker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // default-mesh.json: round-trip, clear, and the 0600 perms its sibling files already had.
+    #[test]
+    fn default_mesh_roundtrips_clears_and_is_private() {
+        let dir = tmpdir("default-mesh");
+        let mut st = State {
+            persist_dir: Some(dir.clone()),
+            default_mesh: Some(9),
+            ..Default::default()
+        };
+        persist_default_mesh(&st);
+        assert_eq!(load_default_mesh(&dir), Some(9));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("default-mesh.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "default-mesh.json must be 0600 like its sibling state files"
+            );
+        }
+        st.default_mesh = None;
+        persist_default_mesh(&st);
+        assert_eq!(load_default_mesh(&dir), None, "clearing removes the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // extensions.json: a grant (incl. per-mesh scoping fields) survives a reload intact.
+    #[test]
+    fn extension_grants_roundtrip() {
+        let dir = tmpdir("extensions");
+        let mut st = State {
+            persist_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        st.extensions.insert(
+            "minisync".into(),
+            ExtensionGrant {
+                id: "minisync".into(),
+                token: "tok".into(),
+                scopes: vec!["events:peer".into()],
+                enabled: true,
+                all_meshes: false,
+                meshes: vec![2, 4],
+            },
+        );
+        persist_extensions(&st);
+        let loaded = load_extensions(&dir);
+        let g = loaded.get("minisync").expect("grant survives reload");
+        assert_eq!(g.token, "tok");
+        assert_eq!(g.scopes, vec!["events:peer".to_string()]);
+        assert!(g.enabled);
+        assert!(!g.all_meshes);
+        assert_eq!(g.meshes, vec![2, 4]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
