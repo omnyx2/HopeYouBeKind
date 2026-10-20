@@ -508,6 +508,367 @@ pub fn decode_recipher(b: &[u8]) -> Option<Recipher> {
     })
 }
 
+/// Everything [`run`] needs, bundled — construct it field-by-name instead of the
+/// old 13-argument positional call (adding a handle is now a one-line change per
+/// call site, and the compiler names anything you forget).
+pub struct DataPlaneHandles<X: Transport + 'static> {
+    pub dp: MeshDataPlane,
+    pub tun: Box<dyn TunDevice>,
+    pub transport: X,
+    pub links: PeerLinks,
+    pub exit: SharedExit,
+    pub my_id: MemberId,
+    pub my_endpoint: SharedEndpoint,
+    /// An explicit MESHD_ADVERTISE for a known public node — the loop then never
+    /// overwrites `my_endpoint` with a reflected address (P-D3).
+    pub endpoint_pinned: bool,
+    pub loop_cmd: LoopCmdRx,
+    pub loop_event: LoopEventTx,
+    pub fails: DecryptFails,
+    pub traffic: SharedTraffic,
+    pub split_routes: SharedSplitRoutes,
+}
+
+/// The loop's long-lived shared state. The actively polled sources (TUN,
+/// transport, `loop_cmd`, the gossip interval) stay OUTSIDE this struct so the
+/// `select!` futures never borrow it — the resolved arm then borrows it mutably
+/// for its handler. Each handler below is the former `select!` arm, verbatim.
+struct LoopCtx {
+    dp: MeshDataPlane,
+    links: PeerLinks,
+    exit: SharedExit,
+    my_id: MemberId,
+    my_endpoint: SharedEndpoint,
+    endpoint_pinned: bool,
+    loop_event: LoopEventTx,
+    fails: DecryptFails,
+    traffic: SharedTraffic,
+    split_routes: SharedSplitRoutes,
+    /// Per-peer last-logged time for relay-fallback decisions, so a stuck peer can't spam.
+    relay_log_at: HashMap<MemberId, u64>,
+}
+
+impl LoopCtx {
+    /// App traffic out of the TUN → route to its member, else (internet-bound) to
+    /// the exit member, which NATs it out (P4; NAT is OS-side, exit.rs).
+    async fn outbound<X: Transport>(&mut self, transport: &X, p: Vec<u8>) {
+        let exit_now = *self.exit.lock().unwrap();
+        // Domain split-tunnel (docs/SPLIT_TUNNEL.md): if this packet's dst is a matched
+        // domain's IP, route it to its RULE's exit member — regardless of the mesh-wide
+        // exit. Everything else follows the flow table (default: overlay → owner,
+        // internet → exit). Local, never gossiped.
+        let split_to =
+            ipv4_dst(&p).and_then(|d| self.split_routes.lock().unwrap().get(&d).copied());
+        let decision = match split_to {
+            Some(m) => Some((m, true)),
+            None => match self.dp.decide(&p, exit_now) {
+                RouteDecision::Send { to, via_exit } => Some((to, via_exit)),
+                RouteDecision::Drop => None,
+            },
+        };
+        if let Some((to, via_exit)) = decision {
+            // Pick a path: direct if the peer is directly reachable, else relay the
+            // frame through a public node, which forwards it on (docs/RELAY.md).
+            let now = now_ms();
+            let route = pick_route(&self.links.lock().unwrap(), to, exit_now, now);
+            let sealed = self.dp.seal_to(to, &p);
+            match route {
+                Route::Direct(addr) => {
+                    self.traffic.lock().unwrap().record(to, true, &p, via_exit);
+                    let _ = transport.send_to(&sealed, addr).await;
+                }
+                Route::Relay { via, member } => {
+                    self.traffic.lock().unwrap().record(to, true, &p, via_exit);
+                    // The frame's header dst is `to`; the relay opens it and forwards.
+                    let _ = transport.send_to(&sealed, via).await;
+                    let last = self.relay_log_at.get(&to).copied().unwrap_or(0);
+                    if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
+                        self.relay_log_at.insert(to, now);
+                        eprintln!(
+                            "meshrun: relaying overlay → member {to} via relay member {member} ({via}) — no direct path"
+                        );
+                    }
+                }
+                Route::None => {
+                    let last = self.relay_log_at.get(&to).copied().unwrap_or(0);
+                    if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
+                        self.relay_log_at.insert(to, now);
+                        eprintln!(
+                            "meshrun: dropping overlay frame for member {to} — not directly reachable and no relay available"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A frame from a peer → deliver / relay / merge gossip.
+    async fn inbound<X: Transport>(
+        &mut self,
+        transport: &X,
+        tun: &mut Box<dyn TunDevice>,
+        frame: Vec<u8>,
+        from: SocketAddr,
+    ) {
+        // Open the frame first: post-P-C5 the wire header is sealed + floated, so
+        // the only trustworthy sender id is the AUTHENTICATED one `recv` returns
+        // (a raw plaintext parse recovers nothing). `None` ⇒ not ours / unopenable.
+        let Some((src, msg)) = self.dp.recv(&frame) else {
+            // The frame did not open under our key. If its source IP matches a
+            // peer we know how to reach, this is the split-brain signal — the
+            // peer is on a different mesh or epoch — so record it for the
+            // supervisor to warn on. Otherwise it's internet noise: drop quietly.
+            let known = self
+                .links
+                .lock()
+                .unwrap()
+                .values()
+                .any(|l| l.endpoint.ip() == from.ip());
+            if known {
+                let mut f = self.fails.lock().unwrap();
+                let e = f.entry(from.ip()).or_default();
+                e.count += 1;
+                e.last_ms = now_ms();
+            }
+            return; // (was `continue` as a select! arm — same meaning: next loop turn)
+        };
+        // Roaming + liveness: re-learn the sender's endpoint from the UDP source
+        // on the spot, so a NAT'd / moved peer is reachable again (§6) — this is
+        // what lets the exit reply to a client's real public address instead of a
+        // stale advertised LAN one. Never learn our OWN id (a relayed/looped frame
+        // can carry src==us); a self-entry pollutes the table and shows up as our
+        // endpoint.
+        if src != self.my_id {
+            let now = now_ms();
+            let mut l = self.links.lock().unwrap();
+            // A frame whose UDP source is some OTHER member's endpoint is a relayed
+            // hop, not `src` speaking to us directly. Keep `src` alive, but do NOT
+            // adopt the relay's address as `src`'s endpoint — that would pin us to
+            // the relay forever and pollute the gossip table (docs/RELAY.md).
+            let relayed = l.iter().any(|(m, lk)| *m != src && lk.endpoint == from);
+            let e = l.entry(src).or_insert(Link {
+                endpoint: from,
+                last_seen_ms: 0,
+                last_direct_ms: 0,
+            });
+            e.last_seen_ms = now;
+            if !relayed {
+                // Direct frame: this is the peer's real, current address.
+                let recovered = e.last_direct_ms == 0;
+                e.endpoint = from;
+                e.last_direct_ms = now;
+                if recovered {
+                    eprintln!("meshrun: direct path to member {src} established ({from})");
+                }
+            }
+        }
+        match msg {
+            Inbound::Deliver(inner) => {
+                self.traffic
+                    .lock()
+                    .unwrap()
+                    .record(src, false, &inner, false);
+                let _ = tun.write_packet(&inner).await;
+            }
+            // Control frame: gossip (endpoint table) or a re-cipher announce,
+            // told apart by the first payload byte.
+            Inbound::Control(payload) => match payload.first().copied() {
+                Some(CTRL_GOSSIP) => {
+                    let (table, reflect) = decode_gossip(&payload[1..]);
+                    {
+                        let mut l = self.links.lock().unwrap();
+                        apply_gossip_table(&mut l, &table, self.my_id, now_ms());
+                    }
+                    // P-D3: a peer reaching us from a PUBLIC source observed our
+                    // public NAT mapping and reflected it back. Adopt it as our
+                    // advertised endpoint (unless pinned) so peers on other
+                    // networks can reach us; the next gossip tick re-advertises it.
+                    if !self.endpoint_pinned && is_public(from.ip()) {
+                        if let Some(observed) = reflect {
+                            let mut me = self.my_endpoint.lock().unwrap();
+                            if *me != Some(observed) {
+                                eprintln!(
+                                    "meshrun: learned public address {observed} (reflected by {from}) — re-advertising"
+                                );
+                                *me = Some(observed);
+                            }
+                        }
+                    }
+                }
+                // P-C3: a member re-ciphered the mesh. We could open this frame
+                // (so it's authentic), so swap our data plane to the new epoch
+                // in place and report it up to the supervisor.
+                Some(CTRL_RECIPHER) => {
+                    if let Some(r) = decode_recipher(&payload[1..]) {
+                        eprintln!("meshrun: re-cipher → epoch {} cipher {}", r.epoch, r.cipher);
+                        self.dp.recipher(
+                            lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
+                            &r.secret,
+                        );
+                        let _ = self.loop_event.send(LoopEvent::Recipher(r));
+                    }
+                }
+                // P-C7: an attack alert or the creator's all-clear — hand it
+                // up so the supervisor arms / cancels the destroy grace.
+                Some(tag @ (CTRL_ATTACK | CTRL_ALLCLEAR)) => {
+                    let _ = self.loop_event.send(LoopEvent::Control(tag));
+                }
+                // Membership roster gossip — hand the cert bytes up to the
+                // supervisor to merge + re-validate (the frame already opened, so
+                // it came from a member sharing this mesh's secret).
+                Some(CTRL_ROSTER) => {
+                    let _ = self
+                        .loop_event
+                        .send(LoopEvent::Roster(payload[1..].to_vec()));
+                }
+                // Membership revocation gossip — hand the signed expulsions up to
+                // the supervisor to merge + re-validate (same path as the roster).
+                Some(CTRL_REVOKE) => {
+                    let _ = self
+                        .loop_event
+                        .send(LoopEvent::Revoke(payload[1..].to_vec()));
+                }
+                // SDN flow-table gossip — the supervisor adopts a newer version and
+                // sends it back down via LoopCmd::SetFlows to apply to the data plane.
+                Some(CTRL_FLOWS) => {
+                    let _ = self
+                        .loop_event
+                        .send(LoopEvent::Flows(payload[1..].to_vec()));
+                }
+                // Service-registry gossip — hand the advertised services up to the
+                // supervisor to merge (soft state, newest-per-(member, proto) wins).
+                Some(CTRL_REGISTRY) => {
+                    let _ = self
+                        .loop_event
+                        .send(LoopEvent::Registry(payload[1..].to_vec()));
+                }
+                // Quick-invite membership gossip — self-registered members under a Grant.
+                Some(CTRL_QGRANT) => {
+                    let _ = self
+                        .loop_event
+                        .send(LoopEvent::Quick(payload[1..].to_vec()));
+                }
+                _ => {}
+            },
+            // P5 relay: we're a hop, not the destination — pass the frame on
+            // unchanged (we don't need to decrypt the body to forward). We are the
+            // relay node here (docs/RELAY.md). Never forward back toward the sender
+            // (a frame whose dst we'd reach via `src`'s own address would loop).
+            Inbound::Forward { to } => {
+                let endpoint = self.links.lock().unwrap().get(&to).map(|l| l.endpoint);
+                match endpoint {
+                    Some(addr) if addr != from => {
+                        let _ = transport.send_to(&frame, addr).await;
+                    }
+                    Some(_) => {} // would echo straight back to where it came from — drop
+                    None => {
+                        let last = self.relay_log_at.get(&to).copied().unwrap_or(0);
+                        let now = now_ms();
+                        if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
+                            self.relay_log_at.insert(to, now);
+                            eprintln!(
+                                "meshrun: relay asked to forward to member {to} but its endpoint is unknown — dropping"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every ~20s: gossip our endpoint table to each known peer (also the NAT
+    /// keepalive + liveness ping). The first tick fires immediately → fast
+    /// bootstrap from the invite-seeded links.
+    async fn gossip_tick<X: Transport>(&mut self, transport: &X) {
+        let now = now_ms();
+        let my_ep = *self.my_endpoint.lock().unwrap();
+        let gossip_exit = *self.exit.lock().unwrap();
+        let (peers, table, snapshot) = {
+            let l = self.links.lock().unwrap();
+            let mut table: Vec<(MemberId, SocketAddr)> =
+                l.iter().map(|(m, lk)| (*m, lk.endpoint)).collect();
+            if let Some(ep) = my_ep {
+                table.push((self.my_id, ep));
+            }
+            // (member, endpoint, is-its-direct-path-fresh)
+            let peers: Vec<(MemberId, SocketAddr, bool)> = l
+                .iter()
+                .map(|(m, lk)| (*m, lk.endpoint, directly_reachable(lk, now)))
+                .collect();
+            (peers, table, l.clone())
+        };
+        for (m, addr, direct) in peers {
+            // Per-peer payload: the shared table + a `self` line telling THIS
+            // peer where we observe it, so a NAT'd peer learns its public
+            // address from us if we're public (P-D3). Tagged as gossip.
+            let mut payload = vec![CTRL_GOSSIP];
+            payload.extend_from_slice(&encode_gossip(&table, Some(addr)));
+            // Always send DIRECT — this is also the NAT-punch attempt that lets a
+            // direct path (re)form, so a relayed peer upgrades to direct (docs/RELAY.md).
+            let _ = transport
+                .send_to(&self.dp.seal_control(m, &payload), addr)
+                .await;
+            // If the direct path is stale, ALSO keepalive via a relay so liveness +
+            // the relay path stay up and the peer hears us (its replies then relay
+            // back). No reflexion on the relayed copy (we don't observe them directly).
+            if !direct {
+                if let Some((_rm, raddr)) = pick_relay(&snapshot, m, gossip_exit, now) {
+                    let mut rpayload = vec![CTRL_GOSSIP];
+                    rpayload.extend_from_slice(&encode_gossip(&table, None));
+                    let _ = transport
+                        .send_to(&self.dp.seal_control(m, &rpayload), raddr)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// A command from the supervisor: re-cipher (P-C3), apply a flow table, or
+    /// send a tagged Control signal to peers (P-C7 attack alert / all-clear).
+    async fn command<X: Transport>(&mut self, transport: &X, cmd: LoopCmd) {
+        match cmd {
+            LoopCmd::Recipher(r, peers) => {
+                // Announce with the CURRENT (old) cipher so present members read it,
+                // then swap our own data plane and report back up.
+                let mut payload = vec![CTRL_RECIPHER];
+                payload.extend_from_slice(&encode_recipher(&r));
+                for m in peers {
+                    let endpoint = self.links.lock().unwrap().get(&m).map(|l| l.endpoint);
+                    if let Some(addr) = endpoint {
+                        let _ = transport
+                            .send_to(&self.dp.seal_control(m, &payload), addr)
+                            .await;
+                    }
+                }
+                eprintln!(
+                    "meshrun: re-ciphered (initiator) → epoch {} cipher {}",
+                    r.epoch, r.cipher
+                );
+                self.dp.recipher(
+                    lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
+                    &r.secret,
+                );
+                let _ = self.loop_event.send(LoopEvent::Recipher(r));
+            }
+            LoopCmd::SetFlows(flows) => {
+                self.dp.set_flows(flows); // apply a programmed table to the live data plane
+            }
+            LoopCmd::SendControl(tag, body, peers) => {
+                let mut payload = vec![tag];
+                payload.extend_from_slice(&body);
+                for m in peers {
+                    let endpoint = self.links.lock().unwrap().get(&m).map(|l| l.endpoint);
+                    if let Some(addr) = endpoint {
+                        let _ = transport
+                            .send_to(&self.dp.seal_control(m, &payload), addr)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// **RISK 🔴 HIGH** — the data-plane HOT LOOP (TUN↔transport, seal/open, route/relay, gossip).
 /// Blast radius = all overlay + exit traffic; a wrong edit can drop/mis-route every packet.
 /// Run the data-plane loop until the TUN or transport closes. `links` maps a member
@@ -517,312 +878,48 @@ pub fn decode_recipher(b: &[u8]) -> Option<Recipher> {
 /// it to our public address when a public peer reflects it (P-D3), unless
 /// `endpoint_pinned` (an explicit MESHD_ADVERTISE for a known public node).
 #[allow(clippy::too_many_arguments)]
-pub async fn run<X: Transport + 'static>(
-    mut dp: MeshDataPlane,
-    mut tun: Box<dyn TunDevice>,
-    transport: X,
-    links: PeerLinks,
-    exit: SharedExit,
-    my_id: MemberId,
-    my_endpoint: SharedEndpoint,
-    endpoint_pinned: bool,
-    mut loop_cmd: LoopCmdRx,
-    loop_event: LoopEventTx,
-    fails: DecryptFails,
-    traffic: SharedTraffic,
-    split_routes: SharedSplitRoutes,
-) {
+pub async fn run<X: Transport + 'static>(handles: DataPlaneHandles<X>) {
+    let DataPlaneHandles {
+        dp,
+        mut tun,
+        transport,
+        links,
+        exit,
+        my_id,
+        my_endpoint,
+        endpoint_pinned,
+        mut loop_cmd,
+        loop_event,
+        fails,
+        traffic,
+        split_routes,
+    } = handles;
+    let mut ctx = LoopCtx {
+        dp,
+        links,
+        exit,
+        my_id,
+        my_endpoint,
+        endpoint_pinned,
+        loop_event,
+        fails,
+        traffic,
+        split_routes,
+        relay_log_at: HashMap::new(),
+    };
     let mut gossip = tokio::time::interval(std::time::Duration::from_secs(GOSSIP_INTERVAL_SECS));
-    // Per-peer last-logged time for relay-fallback decisions, so a stuck peer can't spam.
-    let mut relay_log_at: HashMap<MemberId, u64> = HashMap::new();
     loop {
         tokio::select! {
-            // App traffic out of the TUN → route to its member, else (internet-bound)
-            // to the exit member, which NATs it out (P4; NAT is OS-side, exit.rs).
             outbound = tun.read_packet() => {
                 let Ok(p) = outbound else { break };
-                let exit_now = *exit.lock().unwrap();
-                // Domain split-tunnel (docs/SPLIT_TUNNEL.md): if this packet's dst is a matched
-                // domain's IP, route it to its RULE's exit member — regardless of the mesh-wide
-                // exit. Everything else follows the flow table (default: overlay → owner,
-                // internet → exit). Local, never gossiped.
-                let split_to = ipv4_dst(&p)
-                    .and_then(|d| split_routes.lock().unwrap().get(&d).copied());
-                let decision = match split_to {
-                    Some(m) => Some((m, true)),
-                    None => match dp.decide(&p, exit_now) {
-                        RouteDecision::Send { to, via_exit } => Some((to, via_exit)),
-                        RouteDecision::Drop => None,
-                    },
-                };
-                if let Some((to, via_exit)) = decision {
-                    // Pick a path: direct if the peer is directly reachable, else relay the
-                    // frame through a public node, which forwards it on (docs/RELAY.md).
-                    let now = now_ms();
-                    let route = pick_route(&links.lock().unwrap(), to, exit_now, now);
-                    let sealed = dp.seal_to(to, &p);
-                    match route {
-                        Route::Direct(addr) => {
-                            traffic.lock().unwrap().record(to, true, &p, via_exit);
-                            let _ = transport.send_to(&sealed, addr).await;
-                        }
-                        Route::Relay { via, member } => {
-                            traffic.lock().unwrap().record(to, true, &p, via_exit);
-                            // The frame's header dst is `to`; the relay opens it and forwards.
-                            let _ = transport.send_to(&sealed, via).await;
-                            let last = relay_log_at.get(&to).copied().unwrap_or(0);
-                            if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
-                                relay_log_at.insert(to, now);
-                                eprintln!(
-                                    "meshrun: relaying overlay → member {to} via relay member {member} ({via}) — no direct path"
-                                );
-                            }
-                        }
-                        Route::None => {
-                            let last = relay_log_at.get(&to).copied().unwrap_or(0);
-                            if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
-                                relay_log_at.insert(to, now);
-                                eprintln!(
-                                    "meshrun: dropping overlay frame for member {to} — not directly reachable and no relay available"
-                                );
-                            }
-                        }
-                    }
-                }
+                ctx.outbound(&transport, p).await;
             }
-            // A frame from a peer → deliver / relay / merge gossip.
             inbound = transport.recv_from() => {
                 let Ok((frame, from)) = inbound else { break };
-                // Open the frame first: post-P-C5 the wire header is sealed + floated, so
-                // the only trustworthy sender id is the AUTHENTICATED one `recv` returns
-                // (a raw plaintext parse recovers nothing). `None` ⇒ not ours / unopenable.
-                let Some((src, msg)) = dp.recv(&frame) else {
-                    // The frame did not open under our key. If its source IP matches a
-                    // peer we know how to reach, this is the split-brain signal — the
-                    // peer is on a different mesh or epoch — so record it for the
-                    // supervisor to warn on. Otherwise it's internet noise: drop quietly.
-                    let known = links
-                        .lock()
-                        .unwrap()
-                        .values()
-                        .any(|l| l.endpoint.ip() == from.ip());
-                    if known {
-                        let mut f = fails.lock().unwrap();
-                        let e = f.entry(from.ip()).or_default();
-                        e.count += 1;
-                        e.last_ms = now_ms();
-                    }
-                    continue;
-                };
-                // Roaming + liveness: re-learn the sender's endpoint from the UDP source
-                // on the spot, so a NAT'd / moved peer is reachable again (§6) — this is
-                // what lets the exit reply to a client's real public address instead of a
-                // stale advertised LAN one. Never learn our OWN id (a relayed/looped frame
-                // can carry src==us); a self-entry pollutes the table and shows up as our
-                // endpoint.
-                if src != my_id {
-                    let now = now_ms();
-                    let mut l = links.lock().unwrap();
-                    // A frame whose UDP source is some OTHER member's endpoint is a relayed
-                    // hop, not `src` speaking to us directly. Keep `src` alive, but do NOT
-                    // adopt the relay's address as `src`'s endpoint — that would pin us to
-                    // the relay forever and pollute the gossip table (docs/RELAY.md).
-                    let relayed = l.iter().any(|(m, lk)| *m != src && lk.endpoint == from);
-                    let e = l.entry(src).or_insert(Link {
-                        endpoint: from,
-                        last_seen_ms: 0,
-                        last_direct_ms: 0,
-                    });
-                    e.last_seen_ms = now;
-                    if !relayed {
-                        // Direct frame: this is the peer's real, current address.
-                        let recovered = e.last_direct_ms == 0;
-                        e.endpoint = from;
-                        e.last_direct_ms = now;
-                        if recovered {
-                            eprintln!(
-                                "meshrun: direct path to member {src} established ({from})"
-                            );
-                        }
-                    }
-                }
-                match msg {
-                    Inbound::Deliver(inner) => {
-                        traffic.lock().unwrap().record(src, false, &inner, false);
-                        let _ = tun.write_packet(&inner).await;
-                    }
-                    // Control frame: gossip (endpoint table) or a re-cipher announce,
-                    // told apart by the first payload byte.
-                    Inbound::Control(payload) => match payload.first().copied() {
-                        Some(CTRL_GOSSIP) => {
-                            let (table, reflect) = decode_gossip(&payload[1..]);
-                            {
-                                let mut l = links.lock().unwrap();
-                                apply_gossip_table(&mut l, &table, my_id, now_ms());
-                            }
-                            // P-D3: a peer reaching us from a PUBLIC source observed our
-                            // public NAT mapping and reflected it back. Adopt it as our
-                            // advertised endpoint (unless pinned) so peers on other
-                            // networks can reach us; the next gossip tick re-advertises it.
-                            if !endpoint_pinned && is_public(from.ip()) {
-                                if let Some(observed) = reflect {
-                                    let mut me = my_endpoint.lock().unwrap();
-                                    if *me != Some(observed) {
-                                        eprintln!(
-                                            "meshrun: learned public address {observed} (reflected by {from}) — re-advertising"
-                                        );
-                                        *me = Some(observed);
-                                    }
-                                }
-                            }
-                        }
-                        // P-C3: a member re-ciphered the mesh. We could open this frame
-                        // (so it's authentic), so swap our data plane to the new epoch
-                        // in place and report it up to the supervisor.
-                        Some(CTRL_RECIPHER) => {
-                            if let Some(r) = decode_recipher(&payload[1..]) {
-                                eprintln!("meshrun: re-cipher → epoch {} cipher {}", r.epoch, r.cipher);
-                                dp.recipher(
-                                    lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
-                                    &r.secret,
-                                );
-                                let _ = loop_event.send(LoopEvent::Recipher(r));
-                            }
-                        }
-                        // P-C7: an attack alert or the creator's all-clear — hand it
-                        // up so the supervisor arms / cancels the destroy grace.
-                        Some(tag @ (CTRL_ATTACK | CTRL_ALLCLEAR)) => {
-                            let _ = loop_event.send(LoopEvent::Control(tag));
-                        }
-                        // Membership roster gossip — hand the cert bytes up to the
-                        // supervisor to merge + re-validate (the frame already opened, so
-                        // it came from a member sharing this mesh's secret).
-                        Some(CTRL_ROSTER) => {
-                            let _ = loop_event.send(LoopEvent::Roster(payload[1..].to_vec()));
-                        }
-                        // Membership revocation gossip — hand the signed expulsions up to
-                        // the supervisor to merge + re-validate (same path as the roster).
-                        Some(CTRL_REVOKE) => {
-                            let _ = loop_event.send(LoopEvent::Revoke(payload[1..].to_vec()));
-                        }
-                        // SDN flow-table gossip — the supervisor adopts a newer version and
-                        // sends it back down via LoopCmd::SetFlows to apply to the data plane.
-                        Some(CTRL_FLOWS) => {
-                            let _ = loop_event.send(LoopEvent::Flows(payload[1..].to_vec()));
-                        }
-                        // Service-registry gossip — hand the advertised services up to the
-                        // supervisor to merge (soft state, newest-per-(member, proto) wins).
-                        Some(CTRL_REGISTRY) => {
-                            let _ = loop_event.send(LoopEvent::Registry(payload[1..].to_vec()));
-                        }
-                        // Quick-invite membership gossip — self-registered members under a Grant.
-                        Some(CTRL_QGRANT) => {
-                            let _ = loop_event.send(LoopEvent::Quick(payload[1..].to_vec()));
-                        }
-                        _ => {}
-                    },
-                    // P5 relay: we're a hop, not the destination — pass the frame on
-                    // unchanged (we don't need to decrypt the body to forward). We are the
-                    // relay node here (docs/RELAY.md). Never forward back toward the sender
-                    // (a frame whose dst we'd reach via `src`'s own address would loop).
-                    Inbound::Forward { to } => {
-                        let endpoint = links.lock().unwrap().get(&to).map(|l| l.endpoint);
-                        match endpoint {
-                            Some(addr) if addr != from => {
-                                let _ = transport.send_to(&frame, addr).await;
-                            }
-                            Some(_) => {} // would echo straight back to where it came from — drop
-                            None => {
-                                let last = relay_log_at.get(&to).copied().unwrap_or(0);
-                                let now = now_ms();
-                                if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
-                                    relay_log_at.insert(to, now);
-                                    eprintln!(
-                                        "meshrun: relay asked to forward to member {to} but its endpoint is unknown — dropping"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                ctx.inbound(&transport, &mut tun, frame, from).await;
             }
-            // Every ~20s: gossip our endpoint table to each known peer (also the NAT
-            // keepalive + liveness ping). The first tick fires immediately → fast
-            // bootstrap from the invite-seeded links.
-            _ = gossip.tick() => {
-                let now = now_ms();
-                let my_ep = *my_endpoint.lock().unwrap();
-                let gossip_exit = *exit.lock().unwrap();
-                let (peers, table, snapshot) = {
-                    let l = links.lock().unwrap();
-                    let mut table: Vec<(MemberId, SocketAddr)> =
-                        l.iter().map(|(m, lk)| (*m, lk.endpoint)).collect();
-                    if let Some(ep) = my_ep {
-                        table.push((my_id, ep));
-                    }
-                    // (member, endpoint, is-its-direct-path-fresh)
-                    let peers: Vec<(MemberId, SocketAddr, bool)> = l
-                        .iter()
-                        .map(|(m, lk)| (*m, lk.endpoint, directly_reachable(lk, now)))
-                        .collect();
-                    (peers, table, l.clone())
-                };
-                for (m, addr, direct) in peers {
-                    // Per-peer payload: the shared table + a `self` line telling THIS
-                    // peer where we observe it, so a NAT'd peer learns its public
-                    // address from us if we're public (P-D3). Tagged as gossip.
-                    let mut payload = vec![CTRL_GOSSIP];
-                    payload.extend_from_slice(&encode_gossip(&table, Some(addr)));
-                    // Always send DIRECT — this is also the NAT-punch attempt that lets a
-                    // direct path (re)form, so a relayed peer upgrades to direct (docs/RELAY.md).
-                    let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
-                    // If the direct path is stale, ALSO keepalive via a relay so liveness +
-                    // the relay path stay up and the peer hears us (its replies then relay
-                    // back). No reflexion on the relayed copy (we don't observe them directly).
-                    if !direct {
-                        if let Some((_rm, raddr)) = pick_relay(&snapshot, m, gossip_exit, now) {
-                            let mut rpayload = vec![CTRL_GOSSIP];
-                            rpayload.extend_from_slice(&encode_gossip(&table, None));
-                            let _ = transport.send_to(&dp.seal_control(m, &rpayload), raddr).await;
-                        }
-                    }
-                }
-            }
-            // A command from the supervisor: re-cipher (P-C3) or send a tagged Control
-            // signal to peers (P-C7 attack alert / all-clear).
-            Some(cmd) = loop_cmd.recv() => match cmd {
-                LoopCmd::Recipher(r, peers) => {
-                    // Announce with the CURRENT (old) cipher so present members read it,
-                    // then swap our own data plane and report back up.
-                    let mut payload = vec![CTRL_RECIPHER];
-                    payload.extend_from_slice(&encode_recipher(&r));
-                    for m in peers {
-                        let endpoint = links.lock().unwrap().get(&m).map(|l| l.endpoint);
-                        if let Some(addr) = endpoint {
-                            let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
-                        }
-                    }
-                    eprintln!("meshrun: re-ciphered (initiator) → epoch {} cipher {}", r.epoch, r.cipher);
-                    dp.recipher(
-                        lattice_mesh::crypto::suite(&r.cipher, &r.secret, r.epoch),
-                        &r.secret,
-                    );
-                    let _ = loop_event.send(LoopEvent::Recipher(r));
-                }
-                LoopCmd::SetFlows(flows) => {
-                    dp.set_flows(flows); // apply a programmed table to the live data plane
-                }
-                LoopCmd::SendControl(tag, body, peers) => {
-                    let mut payload = vec![tag];
-                    payload.extend_from_slice(&body);
-                    for m in peers {
-                        let endpoint = links.lock().unwrap().get(&m).map(|l| l.endpoint);
-                        if let Some(addr) = endpoint {
-                            let _ = transport.send_to(&dp.seal_control(m, &payload), addr).await;
-                        }
-                    }
-                }
-            }
+            _ = gossip.tick() => ctx.gossip_tick(&transport).await,
+            Some(cmd) = loop_cmd.recv() => ctx.command(&transport, cmd).await,
         }
     }
 }
@@ -894,36 +991,36 @@ mod tests {
         let a_eps = seed_links(std::iter::once((2u8, b_addr)).collect());
         let b_eps = seed_links(std::iter::once((1u8, a_addr)).collect());
 
-        tokio::spawn(run(
-            dp(1),
-            Box::new(atun),
-            ta,
-            a_eps,
-            exit(None),
-            1,
-            ep(None),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        )); // Alice (member 1)
-        tokio::spawn(run(
-            dp(2),
-            Box::new(btun),
-            tb,
-            b_eps,
-            exit(None),
-            2,
-            ep(None),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        )); // Bob   (member 2)
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(1),
+            tun: Box::new(atun),
+            transport: ta,
+            links: a_eps,
+            exit: exit(None),
+            my_id: 1,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        })); // Alice (member 1)
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(2),
+            tun: Box::new(btun),
+            transport: tb,
+            links: b_eps,
+            exit: exit(None),
+            my_id: 2,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        })); // Bob   (member 2)
 
         // Inject an IP packet at Alice's TUN, destined for Bob's overlay IP.
         let packet = ipv4_to("100.80.3.2".parse().unwrap()); // mesh 3, member 2
@@ -949,36 +1046,36 @@ mod tests {
         let a_eps = seed_links(std::iter::once((2u8, b_addr)).collect());
         let b_eps = seed_links(std::iter::once((1u8, a_addr)).collect());
 
-        tokio::spawn(run(
-            dp(1),
-            Box::new(atun),
-            ta,
-            a_eps,
-            exit(Some(2)),
-            1,
-            ep(None),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        )); // exit = member 2
-        tokio::spawn(run(
-            dp(2),
-            Box::new(btun),
-            tb,
-            b_eps,
-            exit(None),
-            2,
-            ep(None),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(1),
+            tun: Box::new(atun),
+            transport: ta,
+            links: a_eps,
+            exit: exit(Some(2)),
+            my_id: 1,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        })); // exit = member 2
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(2),
+            tun: Box::new(btun),
+            transport: tb,
+            links: b_eps,
+            exit: exit(None),
+            my_id: 2,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
 
         // A real internet destination (not in the mesh /24) → goes to the exit.
         let packet = ipv4_to("1.1.1.1".parse().unwrap());
@@ -1062,51 +1159,51 @@ mod tests {
         let b_eps = seed_links(std::iter::once((3u8, c)).collect());
         let c_eps = seed_links(HashMap::new());
 
-        tokio::spawn(run(
-            dp(1),
-            Box::new(atun),
-            net.node(a),
-            a_eps,
-            exit(None),
-            1,
-            ep(None),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
-        tokio::spawn(run(
-            dp(2),
-            Box::new(btun),
-            net.node(b),
-            b_eps,
-            exit(None),
-            2,
-            ep(None),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        )); // relay hop
-        tokio::spawn(run(
-            dp(3),
-            Box::new(ctun),
-            net.node(c),
-            c_eps,
-            exit(None),
-            3,
-            ep(None),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(1),
+            tun: Box::new(atun),
+            transport: net.node(a),
+            links: a_eps,
+            exit: exit(None),
+            my_id: 1,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(2),
+            tun: Box::new(btun),
+            transport: net.node(b),
+            links: b_eps,
+            exit: exit(None),
+            my_id: 2,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        })); // relay hop
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(3),
+            tun: Box::new(ctun),
+            transport: net.node(c),
+            links: c_eps,
+            exit: exit(None),
+            my_id: 3,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
 
         let packet = ipv4_to("100.80.3.3".parse().unwrap()); // member 3 = C
         ahandle.inject.send(packet.clone()).await.unwrap();
@@ -1153,51 +1250,51 @@ mod tests {
         let c_eps = seed_links(std::iter::once((2u8, b)).collect());
         let a_view = Arc::clone(&a_eps);
 
-        tokio::spawn(run(
-            dp(1),
-            Box::new(atun),
-            net.node(a),
-            a_eps,
-            exit(None),
-            1,
-            ep(Some(a)),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
-        tokio::spawn(run(
-            dp(2),
-            Box::new(btun),
-            net.node(b),
-            b_eps,
-            exit(None),
-            2,
-            ep(Some(b)),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
-        tokio::spawn(run(
-            dp(3),
-            Box::new(ctun),
-            net.node(c),
-            c_eps,
-            exit(None),
-            3,
-            ep(Some(c)),
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(1),
+            tun: Box::new(atun),
+            transport: net.node(a),
+            links: a_eps,
+            exit: exit(None),
+            my_id: 1,
+            my_endpoint: ep(Some(a)),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(2),
+            tun: Box::new(btun),
+            transport: net.node(b),
+            links: b_eps,
+            exit: exit(None),
+            my_id: 2,
+            my_endpoint: ep(Some(b)),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(3),
+            tun: Box::new(ctun),
+            transport: net.node(c),
+            links: c_eps,
+            exit: exit(None),
+            my_id: 3,
+            my_endpoint: ep(Some(c)),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
 
         // Poll A's link table until C (member 3) appears, learned via B's gossip.
         let learned = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1334,36 +1431,36 @@ mod tests {
         let b_view = Arc::clone(&b_ep);
 
         // A is pinned-public; B is not pinned and starts at its LAN address.
-        tokio::spawn(run(
-            dp(1),
-            Box::new(atun),
-            net.node(a_pub),
-            a_eps,
-            exit(None),
-            1,
-            ep(Some(a_pub)),
-            true,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
-        tokio::spawn(run(
-            dp(2),
-            Box::new(btun),
-            net.node(b_public),
-            b_eps,
-            exit(None),
-            2,
-            b_ep,
-            false,
-            dummy_cmd(),
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(1),
+            tun: Box::new(atun),
+            transport: net.node(a_pub),
+            links: a_eps,
+            exit: exit(None),
+            my_id: 1,
+            my_endpoint: ep(Some(a_pub)),
+            endpoint_pinned: true,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(2),
+            tun: Box::new(btun),
+            transport: net.node(b_public),
+            links: b_eps,
+            exit: exit(None),
+            my_id: 2,
+            my_endpoint: b_ep,
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
 
         // B should adopt the public address A reflected (the `self` line in A's gossip).
         let upgraded = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1409,36 +1506,36 @@ mod tests {
 
         let (a_cmd_tx, a_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (b_applied_tx, mut b_applied_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(run(
-            dp(1),
-            Box::new(atun),
-            ta,
-            a_eps,
-            exit(None),
-            1,
-            ep(None),
-            false,
-            a_cmd_rx,
-            dummy_applied(),
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
-        tokio::spawn(run(
-            dp(2),
-            Box::new(btun),
-            tb,
-            b_eps,
-            exit(None),
-            2,
-            ep(None),
-            false,
-            dummy_cmd(),
-            b_applied_tx,
-            no_fails(),
-            no_traffic(),
-            no_split(),
-        ));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(1),
+            tun: Box::new(atun),
+            transport: ta,
+            links: a_eps,
+            exit: exit(None),
+            my_id: 1,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: a_cmd_rx,
+            loop_event: dummy_applied(),
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
+        tokio::spawn(run(DataPlaneHandles {
+            dp: dp(2),
+            tun: Box::new(btun),
+            transport: tb,
+            links: b_eps,
+            exit: exit(None),
+            my_id: 2,
+            my_endpoint: ep(None),
+            endpoint_pinned: false,
+            loop_cmd: dummy_cmd(),
+            loop_event: b_applied_tx,
+            fails: no_fails(),
+            traffic: no_traffic(),
+            split_routes: no_split(),
+        }));
 
         // Baseline: a packet flows on the original cipher.
         let p1 = ipv4_to("100.80.3.2".parse().unwrap());

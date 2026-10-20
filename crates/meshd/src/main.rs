@@ -709,21 +709,21 @@ async fn bringup_dataplane(b: Bringup, state: Arc<Mutex<State>>) {
     // received).
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<LoopCmd>();
     let (applied_tx, applied_rx) = tokio::sync::mpsc::unbounded_channel::<LoopEvent>();
-    let task = tokio::spawn(lattice_meshrun::run(
+    let task = tokio::spawn(lattice_meshrun::run(lattice_meshrun::DataPlaneHandles {
         dp,
         tun,
         transport,
-        b.links,
-        b.exit_sel,
-        b.my_id,
-        Arc::clone(&b.my_endpoint),
-        pinned,
-        cmd_rx,
-        applied_tx,
-        b.decrypt_fails,
-        b.traffic,
-        b.split_routes,
-    ));
+        links: b.links,
+        exit: b.exit_sel,
+        my_id: b.my_id,
+        my_endpoint: Arc::clone(&b.my_endpoint),
+        endpoint_pinned: pinned,
+        loop_cmd: cmd_rx,
+        loop_event: applied_tx,
+        fails: b.decrypt_fails,
+        traffic: b.traffic,
+        split_routes: b.split_routes,
+    }));
     // Record the loop's abort handle (RemoveMesh stops it) + the command sender.
     if let Some(ms) = state.lock().unwrap().meshes.get_mut(&b.mesh_id) {
         ms.dp_task = Some(task.abort_handle());
