@@ -581,6 +581,17 @@ def cmd_backup(sock, a):
           f"(then deletes it). Run this before updating/reinstalling.")
 
 
+# ---- doctor's reason-string markers -------------------------------------------------
+# `lattice doctor` classifies a peer's `reason` by SUBSTRING MATCH against the Korean
+# prose the daemon emits in crates/meshd/src/view.rs (detail()'s reason strings). That
+# coupling is fragile by nature — if meshd rewords a reason, the matching silently falls
+# through to the generic advice. These constants make the coupling visible and keep it
+# in ONE place; the real fix is daemon-emitted reason CODES (tracked in TEMP.md Phase 4).
+REASON_DECRYPT_FAIL = "복호 실패"        # view.rs: "...프레임 {n}건이 복호 실패 — 상대가 다른 mesh이거나..."
+REASON_NEVER_HEARD = "한 번도 수신"      # view.rs: "주소만 알고 아직 한 번도 수신 못함 — ..."
+REASON_PEER_GONE = "오프라인이거나 IP"   # view.rs: "최근 30초간 수신 없음 — 상대가 오프라인이거나 IP가..."
+
+
 def cmd_doctor(sock, a):
     """Diagnose mesh health and suggest a fix — surfaces what the daemon already knows
     (idle reasons, decrypt-fail warnings) and turns it into actionable advice."""
@@ -603,13 +614,13 @@ def cmd_doctor(sock, a):
                 continue
             r = mb.get("reason") or f"state={mb['state']}"
             name = mb["name"]
-            if "복호 실패" in r:
+            if REASON_DECRYPT_FAIL in r:
                 fix = (f"'{name}'이 다른 mesh/epoch일 가능성 큼. 양쪽 `lattice info`의 net 지문이 "
                        f"같은지 확인하고, 다르면 한쪽을 기준으로 재초대(invite→join)하세요.")
-            elif "한 번도 수신" in r:
+            elif REASON_NEVER_HEARD in r:
                 fix = (f"'{name}'의 데몬이 켜져 있는지, 방화벽이 UDP를 막는지 확인. 공용 노드면 "
                        f"포트 개방, 아니면 상대가 먼저 이쪽으로 한 번 보내야 NAT가 열립니다.")
-            elif "오프라인이거나 IP" in r:
+            elif REASON_PEER_GONE in r:
                 fix = (f"'{name}'이 잠들었거나 IP가 바뀐 듯. DHT가 켜져 있으면 자동 재발견됩니다 "
                        f"(MESHD_DHT≠0). 계속이면 상대 노드가 꺼진 상태.")
             else:  # unknown
