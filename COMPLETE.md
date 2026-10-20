@@ -5,6 +5,32 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## 리팩토링 Phase 2 — meshd/main.rs 모듈 분할 (2026-10-21)
+
+**main.rs 4,889 → 2,611줄.** 순수 코드 이동 — 로직/와이어/persist 포맷 무변경, 전부 오프라인 검증.
+
+1. ✅ **7개 모듈 분리** (commit `e43f91b`): state.rs(State/MeshState/Bringup/PostAction/grant·event
+   타입+emit) / persist.rs(온디스크 파일 전부+restore_mesh+request_mutates) / parse.rs(순수
+   파서·포매터) / view.rs(detail/traffic 프로젝션, 읽기전용) / watch.rs(백그라운드 루프 4종) /
+   ext.rs(커넥터 세션/scope gate/레지스트리) / ipcserve.rs(accept 루프/단일인스턴스 가드/serve_conn).
+   패턴: 이동 아이템은 pub(crate), 각 모듈은 `use crate::*`(루트 import+잔여 아이템이 자손에
+   가시), 루트는 `use <mod>::*` 역수입 → 콜사이트 텍스트 불변. main.rs에는 라이프사이클 코어만
+   (main/bringup/handle/join·create·expel/egress/shutdown).
+2. ✅ **NewMesh::build() 생성자 통합** (commit `3f6f372`): 4곳(create/join/join_quick/restore)의
+   ~60줄 MeshState+Bringup 복붙 리터럴 → 한 곳. Arc 핸들을 한 지점에서 생성해 양쪽에 배선 —
+   MeshState 필드 추가가 이제 1-site 변경(빠뜨린 곳이 조용히 디폴트 먹던 패턴 제거).
+3. ✅ **LoopEvent drain 추출** (동일 커밋): bringup_dataplane 속 200줄 gossip-merge/재암호/공격
+   이벤트 드레인 → watch::spawn_loop_event_drain (verbatim). 🔴 bringup 경로가 ~190줄로 축소.
+4. ✅ mod exit의 stale `#[allow(dead_code)]` 제거 — **3-OS 체크**(darwin 빌드 + linux-gnu/
+   windows-gnu cross `cargo check`)로 무경고 확인; 이 크로스체크가 분할 전체의 비-macOS 컴파일도
+   검증. 엉킨 dht/exit mod 주석 분리.
+
+검증: workspace 169 passed/0 failed(Phase 0 persist/와이어 테스트 포함 무변경 통과), clippy 경고
+세트 분할 전과 동일(기존 15), fmt. zsh가 커밋 메시지 백틱을 명령치환한 사고 1회 → `git commit -F
+<file>`로 작성(교훈: 백틱 든 메시지는 -m 금지).
+
+---
+
 ## 리팩토링 Phase 1 — 죽은 코드 삭제 + net v1 feature 게이트 (2026-10-21)
 
 Phase 0 감사 후속. 삭제 전 전 영역(crates/legacy/gui/connectors/fuzz) grep으로 소비자 0 재검증.

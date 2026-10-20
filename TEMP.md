@@ -1,16 +1,16 @@
 # TEMP.md — live working memory
 
-## 리팩토링 로드맵 — 남은 단계 (Phase 0·1 완료 → COMPLETE.md 2026-10-20/21)
+## 리팩토링 로드맵 — 남은 단계 (Phase 0·1·2 완료 → COMPLETE.md 2026-10-20/21)
 
 2026-10-20 4-영역 감사 기반. 각 단계는 별도 PR, 라이브 데몬 불가침 원칙 유지.
+(Phase 2에서 안 한 것: persist.rs 내부의 write_json_secure/read_json_or_default dedup —
+파일별 serializer 차이(to_vec vs to_vec_pretty) 보존 조건으로 Phase 3에 흡수.)
 
-1. [ ] Phase 2 — meshd/main.rs(4.9k줄) 모듈 분할(순수 이동 ~1,900줄): state.rs / persist.rs
-   (+write_json_secure dedup, 파일별 to_vec vs to_vec_pretty 유지) / parse.rs / view.rs /
-   ext.rs / ipcserve.rs / watch.rs + MeshState::new 생성자(4곳 복붙→1곳) + LoopEvent drain 추출.
-2. [ ] Phase 3 — handle() 뚱뚱한 arm 함수화(IPC enum 자체는 불가침) / meshrun run() 13-param→
+1. [ ] Phase 3 — handle() 뚱뚱한 arm 함수화(IPC enum 자체는 불가침) / persist write_json_secure
+   dedup / meshrun run() 13-param→
    구조체 + select arm 추출 / GUI main.js 모듈 분할 + 단일 폴 스케줄러 + egressMode 헬퍼 4벌→1 /
    lattice doctor의 한국어 substring 매칭→reason code.
-3. [ ] Phase 4 — 행동 변화(각각 단독 커밋+라이브 검증): handle 내 lock 쥔 동기 shell-out,
+2. [ ] Phase 4 — 행동 변화(각각 단독 커밋+라이브 검증): handle 내 lock 쥔 동기 shell-out,
    meshrun eprintln→tracing(Windows 진단 복구), direct/relay 25s/30s skew 통일, 결정론적
    relay 선출, DHT endpoint 덮어쓰기 불변식, 창닫기=데몬사망→트레이.
    버그 후보 추가 검토: quick-admit HashMap 비결정성(membership.rs grant_members — 노드별
