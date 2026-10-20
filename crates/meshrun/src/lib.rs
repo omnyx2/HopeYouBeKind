@@ -606,15 +606,18 @@ impl LoopCtx {
             // frame through a public node, which forwards it on (docs/RELAY.md).
             let now = now_ms();
             let route = pick_route(&self.links.lock().unwrap(), to, exit_now, now);
-            let sealed = self.dp.seal_to(to, &p);
+            // Seal INSIDE the routed arms: a Route::None drop used to pay a full AEAD
+            // seal (and burn a nonce) for a frame that was then discarded.
             match route {
                 Route::Direct(addr) => {
                     self.traffic.lock().unwrap().record(to, true, &p, via_exit);
+                    let sealed = self.dp.seal_to(to, &p);
                     let _ = transport.send_to(&sealed, addr).await;
                 }
                 Route::Relay { via, member } => {
                     self.traffic.lock().unwrap().record(to, true, &p, via_exit);
                     // The frame's header dst is `to`; the relay opens it and forwards.
+                    let sealed = self.dp.seal_to(to, &p);
                     let _ = transport.send_to(&sealed, via).await;
                     let last = self.relay_log_at.get(&to).copied().unwrap_or(0);
                     if now.saturating_sub(last) >= RELAY_LOG_THROTTLE_MS {
