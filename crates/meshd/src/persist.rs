@@ -107,6 +107,48 @@ pub(crate) fn to_persisted(ms: &MeshState) -> PersistedMesh {
     }
 }
 
+/// Shared writer tail of every `persist_*`: serialize (compact or pretty — the
+/// choice is PER FILE and FROZEN: mesh files + lists are pretty, the small
+/// `Option<MeshId>` marker files are compact; tests in main.rs lock the formats),
+/// write, chmod 0600. Best-effort, like every state write here.
+fn write_json_secure<T: Serialize>(f: &std::path::Path, value: &T, pretty: bool) {
+    let json = if pretty {
+        serde_json::to_vec_pretty(value)
+    } else {
+        serde_json::to_vec(value)
+    };
+    if let Ok(json) = json {
+        if std::fs::write(f, &json).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// Shared reader: missing/corrupt state file ⇒ `T::default()` — startup never
+/// fails on a bad file, it just starts without that piece of state.
+fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(f: &std::path::Path) -> T {
+    std::fs::read(f)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// An `Option<MeshId>` marker file (`split-active` / `default-mesh` / `egress`):
+/// `Some` ⇒ write it (compact, 0600), `None` ⇒ remove the file.
+fn persist_marker(dir: &std::path::Path, file: &str, v: Option<MeshId>) {
+    let f = dir.join(file);
+    match v {
+        None => {
+            let _ = std::fs::remove_file(&f);
+        }
+        Some(_) => write_json_secure(&f, &v, false),
+    }
+}
+
 /// Where the update-migration backup lives: env `MESHD_IMPORT`, else
 /// `<tempdir>/lattice-mesh-backup.json`. `ExportState` writes it before an update and
 /// startup reads (then deletes) it, so a reinstall never drops a node from its meshes
@@ -119,10 +161,7 @@ pub(crate) fn migration_backup_path() -> PathBuf {
 
 /// Read the update-migration backup (a JSON array of meshes) if present.
 pub(crate) fn load_backup(path: &std::path::Path) -> Vec<PersistedMesh> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<PersistedMesh>>(&b).ok())
-        .unwrap_or_default()
+    read_json_or_default(path)
 }
 
 /// Save all current meshes and prune files for meshes that are gone (so a
@@ -132,17 +171,7 @@ pub(crate) fn persist(st: &State) {
     persist_extensions(st);
     persist_split(st);
     for ms in st.meshes.values() {
-        let p = to_persisted(ms);
-        if let Ok(json) = serde_json::to_vec_pretty(&p) {
-            let f = mesh_file(dir, ms.mesh.id);
-            if std::fs::write(&f, &json).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
-                }
-            }
-        }
+        write_json_secure(&mesh_file(dir, ms.mesh.id), &to_persisted(ms), true);
     }
     // Prune meshes no longer present.
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -172,39 +201,18 @@ pub(crate) fn extensions_file(dir: &std::path::Path) -> PathBuf {
 pub(crate) fn persist_extensions(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
     let grants: Vec<&ExtensionGrant> = st.extensions.values().collect();
-    if let Ok(json) = serde_json::to_vec_pretty(&grants) {
-        let f = extensions_file(dir);
-        if std::fs::write(&f, &json).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
-            }
-        }
-    }
+    write_json_secure(&extensions_file(dir), &grants, true);
 }
 
 /// Persist the local split-tunnel rules to `split.json` (0600). Called from [`persist`].
 pub(crate) fn persist_split(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
-    if let Ok(json) = serde_json::to_vec_pretty(&st.split_rules) {
-        let f = dir.join("split.json");
-        if std::fs::write(&f, &json).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
-            }
-        }
-    }
+    write_json_secure(&dir.join("split.json"), &st.split_rules, true);
 }
 
 /// Load the split-tunnel rules at startup. Missing/corrupt file ⇒ empty.
 pub(crate) fn load_split(dir: &std::path::Path) -> Vec<dns_split::SplitRule> {
-    std::fs::read(dir.join("split.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    read_json_or_default(&dir.join("split.json"))
 }
 
 /// Persist WHICH mesh's split-tunnel is currently on (a separate file so `split.json`'s format is
@@ -212,64 +220,23 @@ pub(crate) fn load_split(dir: &std::path::Path) -> Vec<dns_split::SplitRule> {
 /// (the rules stay, but the on/off state was in-memory). `None` (split off) removes the file.
 pub(crate) fn persist_split_active(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
-    let f = dir.join("split-active.json");
-    let active: Option<MeshId> = st.split.as_ref().map(|s| s.mesh);
-    match active {
-        None => {
-            let _ = std::fs::remove_file(&f);
-        }
-        Some(_) => {
-            if let Ok(json) = serde_json::to_vec(&active) {
-                if std::fs::write(&f, &json).is_ok() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ =
-                            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
-                    }
-                }
-            }
-        }
-    }
+    persist_marker(dir, "split-active.json", st.split.as_ref().map(|s| s.mesh));
 }
 
 /// The mesh whose split-tunnel was on at last persist (`None` = it was off). Re-enabled at startup.
 pub(crate) fn load_split_active(dir: &std::path::Path) -> Option<MeshId> {
-    std::fs::read(dir.join("split-active.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Option<MeshId>>(&b).ok())
-        .flatten()
+    read_json_or_default(&dir.join("split-active.json"))
 }
 
 /// Persist the node's preferred default mesh (a view/selection hint; no routing). `None` removes it.
 pub(crate) fn persist_default_mesh(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
-    let f = dir.join("default-mesh.json");
-    match st.default_mesh {
-        None => {
-            let _ = std::fs::remove_file(&f);
-        }
-        Some(_) => {
-            if let Ok(json) = serde_json::to_vec(&st.default_mesh) {
-                if std::fs::write(&f, &json).is_ok() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ =
-                            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
-                    }
-                }
-            }
-        }
-    }
+    persist_marker(dir, "default-mesh.json", st.default_mesh);
 }
 
 /// The node's preferred default mesh at startup (`None` = unset). Loaded once; safe (no routing).
 pub(crate) fn load_default_mesh(dir: &std::path::Path) -> Option<MeshId> {
-    std::fs::read(dir.join("default-mesh.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Option<MeshId>>(&b).ok())
-        .flatten()
+    read_json_or_default(&dir.join("default-mesh.json"))
 }
 
 /// Persist the FULL-tunnel egress selection so it survives a daemon restart (mirrors
@@ -278,45 +245,21 @@ pub(crate) fn load_default_mesh(dir: &std::path::Path) -> Option<MeshId> {
 /// any mutation of `current`/`full_tunnel`; it always reflects the live full-tunnel mesh (or none).
 pub(crate) fn persist_egress(st: &State) {
     let Some(dir) = &st.persist_dir else { return };
-    let f = dir.join("egress.json");
-    let active: Option<MeshId> = st.current.filter(|_| st.full_tunnel);
-    match active {
-        None => {
-            let _ = std::fs::remove_file(&f);
-        }
-        Some(_) => {
-            if let Ok(json) = serde_json::to_vec(&active) {
-                if std::fs::write(&f, &json).is_ok() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ =
-                            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
-                    }
-                }
-            }
-        }
-    }
+    persist_marker(dir, "egress.json", st.current.filter(|_| st.full_tunnel));
 }
 
 /// The mesh that was the full-tunnel egress at last persist (`None` = default network). Re-applied at
 /// startup — but only once the exit is reachable (see [`restore_full_tunnel`]), never blindly at boot.
 pub(crate) fn load_egress(dir: &std::path::Path) -> Option<MeshId> {
-    std::fs::read(dir.join("egress.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Option<MeshId>>(&b).ok())
-        .flatten()
+    read_json_or_default(&dir.join("egress.json"))
 }
 
 /// Load the extension grants at startup (id → grant). Missing/corrupt file ⇒ empty.
 pub(crate) fn load_extensions(dir: &std::path::Path) -> HashMap<String, ExtensionGrant> {
-    let f = extensions_file(dir);
-    let Ok(bytes) = std::fs::read(&f) else {
-        return HashMap::new();
-    };
-    serde_json::from_slice::<Vec<ExtensionGrant>>(&bytes)
-        .map(|v| v.into_iter().map(|g| (g.id.clone(), g)).collect())
-        .unwrap_or_default()
+    read_json_or_default::<Vec<ExtensionGrant>>(&extensions_file(dir))
+        .into_iter()
+        .map(|g| (g.id.clone(), g))
+        .collect()
 }
 
 /// Load persisted meshes from disk (startup).
