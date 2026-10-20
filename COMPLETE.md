@@ -5,6 +5,30 @@ commit. The durable record; `TEMP.md` only holds open items.
 
 ---
 
+## 리팩토링 Phase 4 (오프라인 묶음) — 진단 sink + 리포팅/라우팅 결함 3건 (2026-10-21)
+
+행동 변화지만 전부 오프라인(유닛테스트+빌드) 검증 가능한 묶음. 커밋 4개, 각각 단독.
+
+1. ✅ **meshrun 진단 sink** (commit `05a6fce`)¹: relay 결정/direct 복구/reflexion/재암호 로그가
+   bare eprintln → Windows(상승+숨김 실행)에선 아무도 못 읽었음. `set_log_sink()`(OnceLock) +
+   rlog! 매크로로 전 지점 교체, meshd가 main() 첫 줄에서 elog!과 동일한 tee(stderr+diag 파일)
+   설치. sink 미설치(테스트/단독)면 기존 stderr 그대로 — 무sink 동작 byte-identical. 신규 dep 0.
+2. ✅ **direct/relay 25s/30s skew 통일** (commit `13eabbb`): meshd view가 LIVE_WINDOW_MS(30s)로 "direct"를 재유도
+   → 데이터플레인은 DIRECT_OK_MS(25s)에서 relay로 전환 — 25~30s 구간 UI가 "direct" 거짓말.
+   `meshrun::directly_reachable` pub 승격 + view가 그걸 호출(정의 한 곳). 리포팅만 변화.
+3. ✅ **결정론적 relay 선출** (commit `e9caf3b`): pick_relay 폴백이 HashMap `.find()`(랜덤 순회) → 동급 후보 2개면
+   gossip tick마다 relay가 이유 없이 바뀜. freshest(last_direct_ms 최대, 동률→낮은 id)로 고정
+   + 유닛테스트. 로컬 정책만, 와이어 무관.
+4. ✅ **Route::None인데 AEAD seal** (commit `bd1142f`): seal_to가 라우팅 match 앞에 있어 드랍될 프레임에도 풀 seal
+   + send_seq 소모. seal을 Direct/Relay arm 안으로 — 전송 프레임 바이트 동일, 드랍 프레임은
+   CPU/논스 안 태움.
+
+검증: workspace **171 passed/0 failed**(sink + relay 결정론 테스트 추가), clippy 0 error, fmt.
+¹ 교훈(사소): skew 커밋을 검증 전에 떠서 &Link 타입 에러가 커밋에 들어갔다 — 즉시 수정 후
+amend. 검증 게이트는 커밋 **앞**에.
+
+---
+
 ## 리팩토링 Phase 3 — 함수화/중복제거 (meshd handle·persist, meshrun run, GUI, CLI) (2026-10-21)
 
 전부 행동 보존(기계적) 리팩토링. 커밋 3개.

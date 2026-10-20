@@ -1,16 +1,20 @@
 # TEMP.md — live working memory
 
-## 리팩토링 로드맵 — 남은 단계 (Phase 0·1·2·3 완료 → COMPLETE.md 2026-10-20/21)
+## 리팩토링 로드맵 — 남은 단계 (Phase 0·1·2·3 + 4-오프라인 완료 → COMPLETE.md 2026-10-20/21)
 
-2026-10-20 4-영역 감사 기반. 각 단계는 별도 PR, 라이브 데몬 불가침 원칙 유지.
-(Phase 3에서 보류: GUI 페이지 단위 모듈 분할 — 공유 가변 상태(state.js 설계) 필요, Phase 4의
-innerHTML→DOM-diff 재작업과 함께가 적기. doctor는 마커 상수화까지만 — reason CODE는 데몬 작업.)
+2026-10-20 4-영역 감사 기반. 라이브 데몬 불가침 원칙 유지.
+(보류 중: GUI 페이지 단위 분할(상태 설계 필요 — DOM-diff 재작업과 함께), 데몬 reason CODE.)
 
-1. [ ] Phase 4 — 행동 변화(각각 단독 커밋+라이브 검증): handle 내 lock 쥔 동기 shell-out,
-   meshrun eprintln→tracing(Windows 진단 복구), direct/relay 25s/30s skew 통일, 결정론적
-   relay 선출, DHT endpoint 덮어쓰기 불변식, 창닫기=데몬사망→트레이.
-   버그 후보 추가 검토: quick-admit HashMap 비결정성(membership.rs grant_members — 노드별
-   로스터 분기 가능, 수정은 roster-merge semantics 변경이라 Phase와 별도로 신중히).
+1. [ ] Phase 4 — 라이브/멀티노드 검증 필요 묶음(각각 단독 커밋 + 라이브 재검증, 스왑 절차 준수):
+   - handle 내 lock 쥔 동기 shell-out(route/pfctl/powershell)을 PostAction으로 — 라우팅 복원과
+     IPC 응답 순서가 바뀌는 의미 변화(kill-switch/SetCurrent{None} 경로).
+   - DHT 재발견의 endpoint 무조건 덮어쓰기(meshd dht reconnect) — apply_gossip_table 불변식
+     (fresh direct는 안 덮음) 적용. docs/DHT_RENDEZVOUS.md 펴놓고.
+   - 창닫기=데몬사망 → 시스템 트레이(+명시적 "Quit & disconnect"). orphan-root-meshd 사고 이력
+     주의(single-instance guard 테스트 필수).
+   - quick-admit HashMap 비결정성(membership.rs grant_members) — roster-merge 의미 변화,
+     혼합버전 페어 테스트 필요.
+   참고: 다음 플릿 롤아웃 때 Phase 2~4 변경 전체의 라이브 검증 겸사(버전업 + 클린스왑).
 
 ## 상시 메모 (이전 세션에서 유지)
 
