@@ -59,6 +59,9 @@
             <button class="nav-item" data-tab="extensions" data-grp="user">
               <span class="nav-ico">🧩</span> Extensions
             </button>
+            <button class="nav-item" data-tab="settings" data-grp="user">
+              <span class="nav-ico">⚙️</span> Settings
+            </button>
             <!-- Mesh mode (scoped to the opened mesh) -->
             <button class="nav-item" data-tab="mesh-overview" data-grp="mesh">
               <span class="nav-ico">⬢</span> Overview
@@ -206,6 +209,14 @@
               discover members and advertise services (folder sync, VNC, …). You choose
               <b>what each one may see</b>. <span class="muted small">(docs/EXTENSIONS.md)</span></p>
             <div id="ext-body"></div>
+          </section>
+
+          <!-- App & daemon lifecycle (docs/LIFECYCLE.md) -->
+          <section data-panel="settings" class="panel hidden">
+            <h1 class="panel-title">Settings</h1>
+            <p class="panel-sub">VPN 데몬은 백그라운드 서비스로 돕니다 — 이 앱은 보기/조작만 하고,
+              창을 닫아도 VPN은 유지됩니다 (완전 종료는 트레이 메뉴).</p>
+            <div id="settings-body"></div>
           </section>
 
           <!-- Mesh mode: Overview (docs/GUI_PAGES.md §3) -->

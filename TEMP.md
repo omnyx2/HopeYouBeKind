@@ -5,6 +5,11 @@
 2026-10-20 4-영역 감사 기반. 라이브 데몬 불가침 원칙 유지.
 (보류 중: GUI 페이지 단위 분할(상태 설계 필요 — DOM-diff 재작업과 함께), 데몬 reason CODE.)
 
+0. [ ] **수명주기 개편 (docs/LIFECYCLE.md, 2026-10-21 시작)** — 데몬=OS 서비스 소유,
+   GUI=무권한 뷰어+트레이, 설치·삭제 통합(메쉬 state 질문→ExportState stash→자동 재로드):
+   (a) 트레이+창닫기숨김+2종 Quit (b) daemon/autostart Tauri 커맨드 (c) Settings 패널
+   (d) install/uninstall-mac.sh (e) 후속: NSIS cleanup, deb prerm, Win 네이티브 서비스,
+   버전 불일치 경고. 라이브 검증 체크리스트 = LIFECYCLE.md §8.
 1. [ ] Phase 4 — 라이브/멀티노드 검증 필요 묶음(각각 단독 커밋 + 라이브 재검증, 스왑 절차 준수):
    - handle 내 lock 쥔 동기 shell-out(route/pfctl/powershell)을 PostAction으로 — 라우팅 복원과
      IPC 응답 순서가 바뀌는 의미 변화(kill-switch/SetCurrent{None} 경로).
