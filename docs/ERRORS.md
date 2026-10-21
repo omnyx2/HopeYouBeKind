@@ -25,6 +25,14 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
   이원화된 로스터는 모든 소비자가 양쪽을 봐야 한다; (3) 로그 스팸은 증상, 근본은 self-id 오인.**
   검증: cross-build(mingw)→배포→재가입→재시작 reload 확인(8멤버, my_id 안정, 스팸 0).
 
+- **2026-10-21 (속편)** · 위 my_id 수정 배포 후에도 Windows **재시작하면 오버레이 불통** 재발 →
+  tun IP가 `100.80.1.0`(member 0)! 근본: **`restore_mesh()`(디스크 재로드)가 my_id를 `certs`에서만
+  계산하는 동일 버그를 독립적으로 보유** → quick-join 노드는 reload 시 데이터플레인이 member 0으로
+  떠서 overlay=x.x.x.0, 주소불가(direct 링크는 맺히나 오버레이 트래픽 증발). fixed `<restore_mesh
+  grant_certs 폴백>` + round-trip 테스트. 검증: 배포→재시작 후 tun=100.80.1.11, oracle/mac 오버레이
+  TCP True, oracle가 win2#11 relay online 인식. **교훈: 같은 로직(my_id 유도)이 메서드/복원 두 곳에
+  복제돼 있었다 — 한 곳 고칠 때 형제를 grep하라(my_id()와 restore_mesh 둘 다 certs-only였음).**
+
 - **2026-10-21** · v0.7.16(lifecycle) 첫 라이브 설치 중 → 새 데몬이 소켓에 양보하고 종료, 포트
   42002/42900 "already in use", 소켓은 root 소유 stale 파일로 잔존 → 원인: **예전 `tauri dev`가
   띄운 `target/debug/resources/meshd` 좀비**가 포트+소켓을 쥐고 있었음(가드는 설계대로 양보).
