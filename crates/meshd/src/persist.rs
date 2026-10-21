@@ -55,14 +55,41 @@ pub(crate) fn persist_dir() -> Option<PathBuf> {
     if std::env::var("MESHD_NO_PERSIST").is_ok() {
         return None;
     }
+    let home_based = || {
+        // Unix: $HOME. Windows has no HOME — it uses %USERPROFILE% (or %APPDATA%), and a
+        // SYSTEM-run service (the boot scheduled task) has neither pointing anywhere useful,
+        // so fall back to %ProgramData%. Without this, persist_dir() was None on Windows and
+        // the node FORGOT every mesh on restart (observed live, 2026-10-21).
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".lattice/meshd"))
+            .or_else(|| {
+                #[cfg(windows)]
+                {
+                    std::env::var("USERPROFILE")
+                        .ok()
+                        .map(|h| PathBuf::from(h).join(".lattice/meshd"))
+                        .or_else(|| {
+                            std::env::var("APPDATA")
+                                .ok()
+                                .map(|h| PathBuf::from(h).join("Lattice/meshd"))
+                        })
+                        .or_else(|| {
+                            std::env::var("ProgramData")
+                                .ok()
+                                .map(|h| PathBuf::from(h).join("Lattice/meshd"))
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            })
+    };
     let dir = std::env::var("MESHD_STATE_DIR")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".lattice/meshd"))
-        })?;
+        .or_else(home_based)?;
     std::fs::create_dir_all(&dir).ok()?;
     #[cfg(unix)]
     {
