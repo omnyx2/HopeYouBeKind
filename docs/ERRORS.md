@@ -13,6 +13,18 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-10-21** · Windows(omnyx LAN 박스) 0.7.16 라이브 테스트에서 "불안정" 신고 → 진단 결과
+  **코드 버그 2개 + 오진 1개**: (A) `MeshState::my_id()`가 `certs`만 뒤져 **quick-join 노드는
+  my_id=0** 반환(자기 인증서는 `grant_certs`에 있음) → DHT reconnect가 자기(member N)를 안
+  빼고 **매 틱 자기 재발견 스팸**. fixed `c872547`(grant_certs 폴백+테스트). (B) `persist_dir()`가
+  Unix `$HOME`만 봐서 **Windows는 persist 전무**(HOME 미설정) → 재시작마다 메쉬 전소실.
+  fixed `65b0271`(USERPROFILE/APPDATA/ProgramData 폴백). (오진) split-tunnel ON/OFF flapping은
+  **데몬 버그 아님** — 사용자가 GUI egress 모드를 누른 흔적(setEgressMode의 SetCurrent-None→
+  SplitOn), `SetCurrent None` 후 재발 안 함. **교훈: (1) Windows를 라이브로 안 돌려봐서 persist
+  부재가 여태 안 드러남 — per-OS 경로는 그 OS에서 실제로 떠봐야 한다; (2) my_id처럼 cert/grant
+  이원화된 로스터는 모든 소비자가 양쪽을 봐야 한다; (3) 로그 스팸은 증상, 근본은 self-id 오인.**
+  검증: cross-build(mingw)→배포→재가입→재시작 reload 확인(8멤버, my_id 안정, 스팸 0).
+
 - **2026-10-21** · v0.7.16(lifecycle) 첫 라이브 설치 중 → 새 데몬이 소켓에 양보하고 종료, 포트
   42002/42900 "already in use", 소켓은 root 소유 stale 파일로 잔존 → 원인: **예전 `tauri dev`가
   띄운 `target/debug/resources/meshd` 좀비**가 포트+소켓을 쥐고 있었음(가드는 설계대로 양보).
