@@ -12,7 +12,11 @@
    라이브 검증(2026-10-21, v0.7.16 설치): ✅창닫기→트레이 생존+VPN 유지 ✅데몬 v0.7.16 기동
    ✅state/egress/full-tunnel 자동 복귀 ✅설치 스크립트(보존 플로우). 남은 §8: 트레이 메뉴
    육안(상태줄·열기·종료 2종), "종료+VPN 중지", 부팅 토글 재부팅 검증, GUI 자동시작,
-   uninstall-mac.sh 실전. fleet: Mac=0.7.16(라이브), lablinux=0.7.15, oracle=0.7.13 — 롤아웃 대기.
+   uninstall-mac.sh 실전.
+   fleet: Mac=0.7.16 ✅, **oracle=0.7.16 ✅(2026-10-21 롤아웃, b00a2d4, Mac↔oracle direct 재확인)**,
+   lablinux=0.7.15 — **박스 다운이라 보류**(LAN/overlay ssh·gossip 전부 침묵). 켜지면:
+   `scp scripts/rollout-linux.sh lab:/tmp/ && ssh lab 'nohup bash /tmp/rollout-linux.sh <repo> &'`
+   → 나중에 /tmp/lattice-rollout.log 읽기.
 1. [ ] Phase 4 — 라이브/멀티노드 검증 필요 묶음(각각 단독 커밋 + 라이브 재검증, 스왑 절차 준수):
    - handle 내 lock 쥔 동기 shell-out(route/pfctl/powershell)을 PostAction으로 — 라우팅 복원과
      IPC 응답 순서가 바뀌는 의미 변화(kill-switch/SetCurrent{None} 경로).
