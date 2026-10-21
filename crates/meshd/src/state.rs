@@ -156,10 +156,18 @@ impl MeshState {
     /// This node's in-mesh id (from its own cert).
     pub(crate) fn my_id(&self) -> MemberId {
         let me = self.my_key.pubkey();
-        self.certs
+        if let Some(c) = self.certs.iter().find(|c| c.member == me) {
+            return c.id;
+        }
+        // A QUICK (bearer) join self-registers as a GrantCert, NOT a Cert — so scanning only
+        // `certs` returns 0 for a quick-joined node. That id=0 then makes the node fail to
+        // recognize its OWN gossiped/DHT endpoint as self, re-discovering member <id> forever
+        // (observed on a fresh quick-join). Mirror the roster/`is_me` logic, which already
+        // folds in grant members by pubkey.
+        self.grant_certs
             .iter()
-            .find(|c| c.member == me)
-            .map(|c| c.id)
+            .find(|q| q.member == me)
+            .map(|q| q.id)
             .unwrap_or(0)
     }
 }

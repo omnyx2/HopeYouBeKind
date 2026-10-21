@@ -2391,10 +2391,67 @@ fn expel_member(st: &mut State, mesh: MeshId, member: MemberId) -> (Response, Op
 mod tests {
     use super::{
         dns_split, load_default_mesh, load_egress, load_extensions, load_split, load_split_active,
-        persist_default_mesh, persist_egress, persist_extensions, persist_split,
-        persist_split_active, quorum_threshold, request_mutates, ExtensionGrant, SplitActive,
-        State,
+        now_ms, persist_default_mesh, persist_egress, persist_extensions, persist_split,
+        persist_split_active, quorum_threshold, request_mutates, ExtensionGrant, NewMesh,
+        SplitActive, State,
     };
+    use lattice_mesh::charter::{
+        ExitPolicy, ExpelPolicy, GenesisCharter, HeaderPlacement, InviteTopology, JoinFloor,
+        RecipherTrigger, SelfDestruct,
+    };
+    use lattice_mesh::keydist::EncKey;
+    use lattice_mesh::membership::{MasterKey, MemberKey};
+    use lattice_mesh::Mesh;
+
+    // A quick-joined node self-registers as a GrantCert (NOT a Cert), so `my_id()` must scan
+    // grant_certs too — else it returns 0, and the node re-discovers its OWN endpoint forever
+    // (seen live on a fresh Windows quick-join, 2026-10-21).
+    #[test]
+    fn my_id_resolves_a_quick_joined_member() {
+        let master = MasterKey::generate();
+        let my_key = MemberKey::generate();
+        let charter = GenesisCharter {
+            master_pubkey: master.network(),
+            invite: InviteTopology::OpenChain,
+            trigger: RecipherTrigger::Quorum { k: 2 },
+            max_members: 254,
+            initial_cipher: "chachapoly-epoch".into(),
+            overlay_prefix: [100, 80],
+            self_destruct: SelfDestruct::Off,
+            expel: ExpelPolicy::CreatorOnly,
+            header_placement: HeaderPlacement::Random,
+            exit_policy: ExitPolicy::Isolate,
+            join_floor: JoinFloor::Any,
+        };
+        let now = now_ms();
+        let grant = master.grant([7u8; 16], 1, now + 600_000, now);
+        let my_qcert = my_key.grant_cert(grant, 10, "win2", now);
+        let mut mesh = Mesh::new(1, "home".into(), charter, 10);
+        mesh.epoch = 0;
+        let (ms, _b) = NewMesh {
+            mesh,
+            master: None,
+            my_key,
+            my_enc: EncKey::generate(),
+            certs: Vec::new(), // quick join: no classic cert for us
+            revocations: Vec::new(),
+            grant_certs: vec![my_qcert], // ...we're here instead
+            secret: [0u8; 32],
+            cipher: "chachapoly-epoch".into(),
+            epoch: 0,
+            exit: None,
+            exitable: false,
+            seed: std::collections::HashMap::new(),
+            flows: Vec::new(),
+            flow_version: 0,
+        }
+        .build();
+        assert_eq!(
+            ms.my_id(),
+            10,
+            "quick-joined node must know its own id, not 0"
+        );
+    }
 
     /// Fresh scratch dir per test (parallel-safe: tag + pid).
     fn tmpdir(tag: &str) -> std::path::PathBuf {
