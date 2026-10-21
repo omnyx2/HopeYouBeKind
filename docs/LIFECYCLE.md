@@ -84,7 +84,7 @@
 |---|---|---|
 | macOS | `/Applications/Lattice.app`(+`.prev` 백업), `/Volumes/Lattice`(DMG 마운트), 수동/osascript로 뜬 root meshd 프로세스, `/tmp/lattice-meshd.{sock,log}`, LaunchDaemon plist, 레포 `target/`에서 복사해 쓰던 loose meshd | install: 전부 teardown 후 교체. uninstall: 전부 제거 + (질문 후) state dir |
 | Linux | systemd 유닛 + `/usr/lib/lattice/resources/meshd`(패키지), loose 실행본, `/root/.lattice/meshd` state, 구 GUI AppImage/deb | `lattice uninstall-service` + deb prerm(후속); uninstall 스크립트가 질문 후 state 처리 |
-| Windows | `%LOCALAPPDATA%\Lattice\meshd.exe` 런카피, 설치 디렉터리, 예약 태스크, HKCU Run 키 | NSIS 제거부가 태스크/런카피 제거(후속 §7) |
+| Windows | `%LOCALAPPDATA%\Lattice\meshd.exe` + `C:\ProgramData\Lattice`(SYSTEM 태스크 카피) 런카피, 설치 디렉터리, 예약 태스크 `Lattice\meshd`, HKCU Run 키 | `scripts/uninstall-win.ps1`가 전부 제거(graceful Shutdown→태스크/런카피/NSIS·MSI); `install-win.ps1`은 그걸 먼저 돌리고 설치 |
 
 ## 6. 이번에 구현하는 것 (오프라인 검증 범위)
 
@@ -101,8 +101,10 @@
 
 ## 7. 후속 (문서만, 별도 작업)
 
-- Windows: NSIS 커스텀 템플릿으로 설치 전 cleanup(런카피/태스크) + 제거부; 장기적으로 meshd의
-  네이티브 Windows 서비스화(windows-service crate).
+- Windows: install/uninstall/daemon-start는 `scripts/*-win.ps1`로 구현+라이브 검증(2026-10-21,
+  박스 0.7.2→0.7.16 클린 재설치 + SYSTEM 태스크 데몬 + 메쉬 가입 e2e). 남은 것: NSIS installer
+  자체에 설치-전 cleanup 내장(현재는 install-win.ps1이 대행), meshd 네이티브 Windows 서비스화
+  (windows-service crate; 현재는 ONSTART 예약 태스크가 실용 등가).
 - Linux: deb postinst/prerm에 유닛 설치·제거 연결(현재는 CLI 수동).
 - 업데이트 배너의 "Update" 흐름을 §4 보존 플로우와 통합(이미 ExportState는 호출함).
 - GUI의 데몬 버전 ↔ 앱 버전 불일치 경고(구 GUI가 신 데몬에 붙는 2026-09-19 패턴 감지).
