@@ -313,11 +313,21 @@ pub(crate) fn restore_mesh(p: PersistedMesh) -> (MeshState, Bringup) {
     let my_enc = EncKey::from_bytes(&p.enc_bytes);
     let master = p.master_seed.map(|s| MasterKey::from_seed(&s));
     let my_pub = my_key.pubkey();
+    // Resolve our id from certs, else grant_certs — a QUICK (bearer) join self-registers as a
+    // GrantCert, not a Cert. Scanning only certs returned id=0 on reload, so the data plane came
+    // up with overlay `<prefix>.<mesh>.0` (observed live on Windows: tun IP 100.80.1.0, no overlay
+    // reachability) and the node couldn't be addressed. Mirror MeshState::my_id().
     let my_id = p
         .certs
         .iter()
         .find(|c| c.member == my_pub)
         .map(|c| c.id)
+        .or_else(|| {
+            p.grant_certs
+                .iter()
+                .find(|q| q.member == my_pub)
+                .map(|q| q.id)
+        })
         .unwrap_or(0);
     let mut mesh = Mesh::new(p.mesh_id, p.mesh_name.clone(), p.charter, my_id);
     mesh.epoch = p.epoch;

@@ -2392,8 +2392,8 @@ mod tests {
     use super::{
         dns_split, load_default_mesh, load_egress, load_extensions, load_split, load_split_active,
         now_ms, persist_default_mesh, persist_egress, persist_extensions, persist_split,
-        persist_split_active, quorum_threshold, request_mutates, ExtensionGrant, NewMesh,
-        SplitActive, State,
+        persist_split_active, quorum_threshold, request_mutates, restore_mesh, to_persisted,
+        ExtensionGrant, NewMesh, SplitActive, State,
     };
     use lattice_mesh::charter::{
         ExitPolicy, ExpelPolicy, GenesisCharter, HeaderPlacement, InviteTopology, JoinFloor,
@@ -2450,6 +2450,20 @@ mod tests {
             ms.my_id(),
             10,
             "quick-joined node must know its own id, not 0"
+        );
+
+        // ...and the id must SURVIVE a persist→reload: restore_mesh independently re-derives
+        // my_id, and if it only scanned certs the data plane came back up as member 0 (overlay
+        // x.x.x.0, no reachability — seen live on Windows after a restart).
+        let persisted = to_persisted(&ms);
+        let (restored, bringup) = restore_mesh(persisted);
+        assert_eq!(
+            restored.mesh.me, 10,
+            "reload must keep the quick-member id, not reset to 0"
+        );
+        assert_eq!(
+            bringup.my_id, 10,
+            "the data plane must come up as member 10, not 0"
         );
     }
 
