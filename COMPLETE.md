@@ -28,6 +28,15 @@ GUI는 뷰어, 트레이 표시(3 OS), 설치 시 레거시 정리 + 메쉬 stat
    핸드오버, 설치 후 /Volumes 프로세스 sanity 체크.
 
 검증: stable cargo check(src-tauri, 경고 0) + eslint + vite build + bash -n + opsec clean.
+**Windows 라이브 검증·안정화 (2026-10-21, 0855eca)**: LAN Windows 11 박스(omnyx, SSH 키 세션=
+elevated)에서 **0.7.2 → 클린 삭제 → 0.7.16 MSI 설치** → meshd v0.7.16가 **SYSTEM ONSTART
+예약 태스크**로 가동(파이프 up, 게이트웨이 변경 자가치유) → oracle quick-invite로 **home 메쉬
+가입** → oracle가 win2(#10) **direct** 인식, 양쪽 7멤버 수렴. scripts/{install,uninstall,
+win-daemon-start,join}-win.ps1 신설(mac 짝). 함정: `-File` 로더가 Korean 코드페이지에서
+백틱-escape 따옴표를 깨뜨림 → 전부 단일따옴표+문자열 concat으로 재작성. SSH 접속: omnyx 관리자
+→ 개인 authorized_keys 무시됨, `administrators_authorized_keys`에 키 설치해야 함(Win OpenSSH
+함정).
+
 **라이브 검증 완료(2026-10-21, v0.7.16 build 6eb4c9a, detached 체커)**: 신규 install-mac.sh로
 설치(state 보존 플로우), 메쉬+sticky egress+full-tunnel 전부 자동 복귀(egress IP=oracle 확인),
 창닫기→트레이 생존(GUI/데몬/소켓 생존). 중간에 tauri-dev 좀비 meshd 사건 발견→teardown 보강

@@ -13,7 +13,7 @@
    ✅state/egress/full-tunnel 자동 복귀 ✅설치 스크립트(보존 플로우). 남은 §8: 트레이 메뉴
    육안(상태줄·열기·종료 2종), "종료+VPN 중지", 부팅 토글 재부팅 검증, GUI 자동시작,
    uninstall-mac.sh 실전.
-   fleet: Mac=0.7.16 ✅, **oracle=0.7.16 ✅(2026-10-21 롤아웃, b00a2d4, Mac↔oracle direct 재확인)**,
+   fleet: Mac=0.7.16 ✅, **Windows(omnyx LAN)=0.7.16 ✅(클린 재설치+SYSTEM 서비스+가입 e2e)**, oracle=0.7.16 ✅(2026-10-21 롤아웃, b00a2d4, Mac↔oracle direct 재확인)**,
    lablinux=0.7.15 — **박스 다운이라 보류**(LAN/overlay ssh·gossip 전부 침묵). 켜지면:
    `scp scripts/rollout-linux.sh lab:/tmp/ && ssh lab 'nohup bash /tmp/rollout-linux.sh <repo> &'`
    → 나중에 /tmp/lattice-rollout.log 읽기.
