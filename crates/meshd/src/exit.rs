@@ -561,19 +561,26 @@ pub fn restore_dns() {
         let _ = std::fs::remove_file(DNS_SAVED);
         tracing::info!("DNS restored");
     }
-    // Safety net: NEVER leave the resolver pointed at our now-dead proxy. If we couldn't restore a
-    // real backup (lost e.g. to a SIGTERM/crash that skipped clean shutdown) and `/etc/resolv.conf`
-    // is still a plain file pointing at loopback, fall back to the systemd-resolved stub (if this
-    // host uses it) or a public resolver — otherwise all DNS dies with the daemon.
+    // Safety net: NEVER leave the resolver pointed at a resolver only the (now-dead) tunnel could
+    // reach. If we couldn't restore a real backup (lost e.g. to a crash, or because the backup
+    // lived in /tmp and a REBOOT wiped it) and `/etc/resolv.conf` is a plain file we likely wrote,
+    // recover it — otherwise DNS stays dead across reboots (the Ubuntu "재부팅해도 안 됨" bug).
     if !restored && std::fs::read_link("/etc/resolv.conf").is_err() {
         let cur = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-        if cur.trim().is_empty() || cur.contains("127.0.0.1") || cur.contains("127.0.0.53") {
+        let stub = std::path::Path::new("/run/systemd/resolve/stub-resolv.conf");
+        // On a systemd-resolved host (stub present) the HEALTHY resolv.conf is a SYMLINK to the
+        // stub — so a plain file here means something (us) replaced it, whatever it points at
+        // (127.0.0.1 split proxy OR the full-tunnel `1.1.1.1` that the old safety net missed).
+        // Off systemd-resolved, only touch an empty/loopback file (a legit plain resolv.conf is
+        // normal there and must be left alone).
+        let looks_hijacked = cur.trim().is_empty()
+            || cur.contains("127.0.0.1")
+            || cur.contains("127.0.0.53")
+            || (stub.exists() && cur.contains("nameserver"));
+        if looks_hijacked {
             let _ = std::fs::remove_file("/etc/resolv.conf");
-            if std::path::Path::new("/run/systemd/resolve/stub-resolv.conf").exists() {
-                let _ = std::os::unix::fs::symlink(
-                    "/run/systemd/resolve/stub-resolv.conf",
-                    "/etc/resolv.conf",
-                );
+            if stub.exists() {
+                let _ = std::os::unix::fs::symlink(stub, "/etc/resolv.conf");
             } else {
                 let _ = std::fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n");
             }

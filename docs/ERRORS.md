@@ -25,6 +25,17 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
   **교훈: 라우팅을 persist해서 부팅에 재적용하는 코드는, 그 라우팅을 '포기'하는 경로에서 반드시
   persist도 같이 지워라 — 안 그러면 '고쳐도 리붓하면 또' 루프.**
 
+- **2026-11-26 (Linux)** · 같은 "재부팅해도 인터넷 안 됨"이 **우분투**에서도 발생 → Linux 고유
+  벡터 2개: (1) full-tunnel이 `/etc/resolv.conf`를 **`1.1.1.1`**(터널 경유)로 덮는데 restore_dns
+  안전망은 **`127.0.0.1`만** 잡아 full-tunnel 케이스를 놓침; (2) DNS 백업이 **`/tmp`**(재부팅에
+  소실)라 크래시+리붓 후 원본 복원 불가 → resolv.conf가 깨진 채 잔존. kill-switch egress-clear
+  수정(3c32f4f)은 OS 공통이라 route 재divert는 이미 차단됨. 추가 fix: restore_dns 안전망을
+  **systemd-resolved 호스트(stub 존재)에서 resolv.conf가 symlink가 아니라 plain file이면 복구**
+  하도록 확장(127.0.0.1/1.1.1.1 모두 → stub symlink 복원). non-systemd 호스트에선 빈/loopback만
+  건드려 정상 plain resolv.conf는 보존. **교훈: Windows는 DNS를 가상 어댑터에만 걸어 데몬死와
+  함께 사라지지만, Linux는 전역 파일(/etc/resolv.conf)을 덮으므로 복원 실패가 재부팅을 넘어
+  지속된다 — per-OS로 '지속 벡터'가 다르다.**
+
 - **2026-10-21** · Windows(omnyx LAN 박스) 0.7.16 라이브 테스트에서 "불안정" 신고 → 진단 결과
   **코드 버그 2개 + 오진 1개**: (A) `MeshState::my_id()`가 `certs`만 뒤져 **quick-join 노드는
   my_id=0** 반환(자기 인증서는 `grant_certs`에 있음) → DHT reconnect가 자기(member N)를 안
