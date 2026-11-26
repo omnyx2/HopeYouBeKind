@@ -13,6 +13,18 @@ Why it was hard to diagnose → Shipped → Remaining design gaps.
 
 ## Quick log — "modified X → got error Y → fixed by Z" (newest first)
 
+- **2026-11-26** · Windows 랩 박스: "lattice가 네트워크 인터페이스랑 충돌, 인터넷이 **재부팅해도**
+  안 됨" → 원인: **kill-switch가 되돌릴 때 persist된 `egress.json`을 안 지움.** full-tunnel 중
+  exit가 트래픽을 못 흘리면(캠퍼스: oracle endpoint는 초대로 알지만 UDP 방화벽 차단) kill-switch가
+  `restore_routes` 후 `current=None`만 하고 egress.json은 그대로 → **부팅 서비스(SYSTEM 태스크)가
+  매 부팅마다 load_egress로 죽은 full-tunnel을 재적용 → 디폴트 라우트를 죽은 tun으로 divert →
+  인터넷 먹통, 리붓마다 반복.** Wintun 어댑터 자체는 정적IP만 설정(기본라우트 無)이라 무죄; 라우트는
+  ActiveStore라 리붓에 사라지지만 **부팅 재적용**이 되살림. fix: kill-switch revert가
+  `full_tunnel=false` + **`persist_egress`로 egress.json 삭제**(한 번 되돌린 exit는 자동복원 금지)
+  + 첫 프로브 20s→5s(먹통 창 축소). 테스트 `kill_switch_revert_clears_persisted_egress`.
+  **교훈: 라우팅을 persist해서 부팅에 재적용하는 코드는, 그 라우팅을 '포기'하는 경로에서 반드시
+  persist도 같이 지워라 — 안 그러면 '고쳐도 리붓하면 또' 루프.**
+
 - **2026-10-21** · Windows(omnyx LAN 박스) 0.7.16 라이브 테스트에서 "불안정" 신고 → 진단 결과
   **코드 버그 2개 + 오진 1개**: (A) `MeshState::my_id()`가 `certs`만 뒤져 **quick-join 노드는
   my_id=0** 반환(자기 인증서는 `grant_certs`에 있음) → DHT reconnect가 자기(member N)를 안

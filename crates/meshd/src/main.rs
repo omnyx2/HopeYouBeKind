@@ -926,8 +926,14 @@ async fn split_disable(state: Arc<Mutex<State>>) {
 
 fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
     tokio::spawn(async move {
+        // First check soon (5s), then every 20s. A boot-time divert to an exit that can't
+        // actually carry traffic (e.g. the exit's endpoint is known from the invite but its
+        // UDP is firewall-blocked — campus NAT) black-holes the default route; a fast first
+        // probe keeps that outage to seconds instead of ~25s.
+        let mut first = true;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(if first { 5 } else { 20 })).await;
+            first = false;
             // Stop watching once egress moved off this mesh (user changed it).
             if state.lock().unwrap().current != Some(mesh) {
                 return;
@@ -943,11 +949,18 @@ fn arm_kill_switch(mesh: MeshId, state: Arc<Mutex<State>>) {
                 let mut st = state.lock().unwrap();
                 if st.current == Some(mesh) {
                     elog!(
-                        "meshd kill-switch: full-tunnel exit not passing traffic — reverting to direct internet"
+                        "meshd kill-switch: full-tunnel exit not passing traffic — reverting to direct internet + forgetting the egress (so it won't re-break next boot)"
                     );
                     exit::restore_routes();
                     exit::restore_dns();
                     st.current = None;
+                    st.full_tunnel = false;
+                    // CRITICAL: also clear the PERSISTED egress. Without this, `egress.json`
+                    // still named this mesh, so the boot service re-applied the full tunnel on
+                    // every restart → diverted the default route to the dead exit → internet
+                    // broke again, reboot after reboot (the "재부팅해도 안 됨" bug). An exit the
+                    // kill-switch had to rip down is not one to auto-restore.
+                    persist_egress(&st);
                 }
                 return; // reverted (or someone else did) — stop probing
             }
@@ -2638,6 +2651,36 @@ mod tests {
         for r in &read_only {
             assert!(!request_mutates(r), "must not trigger a persist: {r:?}");
         }
+    }
+
+    // The kill-switch "재부팅해도 안 됨" fix: when the full-tunnel exit can't pass traffic and the
+    // kill-switch reverts to direct internet, it must ALSO forget the PERSISTED egress — otherwise
+    // the boot service re-applies the dead full tunnel on every restart and the internet breaks
+    // again, reboot after reboot. This locks that revert invariant (the async probe itself isn't
+    // unit-tested; this is the state transition the revert performs).
+    #[test]
+    fn kill_switch_revert_clears_persisted_egress() {
+        let dir = tmpdir("killswitch");
+        let mut st = State {
+            persist_dir: Some(dir.clone()),
+            current: Some(3),
+            full_tunnel: true,
+            ..Default::default()
+        };
+        persist_egress(&st); // a full-tunnel egress is remembered on disk
+        assert_eq!(load_egress(&dir), Some(3), "precondition: egress persisted");
+
+        // --- the kill-switch revert (exit not passing traffic) ---
+        st.current = None;
+        st.full_tunnel = false;
+        persist_egress(&st);
+
+        assert_eq!(
+            load_egress(&dir),
+            None,
+            "a reverted exit must NOT be auto-restored on the next boot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Lock the on-disk format of split.json before any persistence refactor touches it.
