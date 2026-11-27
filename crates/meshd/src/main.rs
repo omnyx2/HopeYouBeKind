@@ -759,6 +759,26 @@ fn local_ip() -> Option<std::net::IpAddr> {
 /// stable "which network am I physically on" signal for topology grouping. Picks the first
 /// up, non-loopback, RFC1918 IPv4, skipping the mesh overlay (`100.64.0.0/10`) and tunnels.
 /// 🟢 This host's primary private LAN IPv4 (for the LAN beacon / advertise address). Unix.
+/// Interface-type priority for the advertised LAN address (docs: multi-home endpoint):
+/// WIRED (ethernet) first, then WiFi, then anything else (tethering/virtual). Lower = better.
+/// A multi-homed host should advertise a stable, preferred address, not "whichever interface
+/// getifaddrs happened to list first".
+#[cfg(unix)]
+fn iface_rank(name: &str) -> u8 {
+    if name.starts_with("en")
+        || name.starts_with("eth")
+        || name.starts_with("eno")
+        || name.starts_with("enp")
+        || name.starts_with("ens")
+    {
+        0 // wired ethernet
+    } else if name.starts_with("wl") || name.starts_with("wlan") || name.starts_with("wlp") {
+        1 // wifi
+    } else {
+        2 // tethering / virtual / other
+    }
+}
+
 #[cfg(unix)]
 fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     use std::net::Ipv4Addr;
@@ -767,7 +787,12 @@ fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
         if libc::getifaddrs(&mut ifap) != 0 {
             return None;
         }
-        let mut found: Option<Ipv4Addr> = None;
+        // Rank candidates by interface TYPE so a multi-homed host advertises a stable,
+        // preferred address instead of "whichever getifaddrs listed first" (non-deterministic,
+        // and it flapped between a box's wired and wifi addresses). Order: WIRED first, then
+        // WiFi, then anything else — wired links are the more stable/faster path when present.
+        let rank = iface_rank;
+        let mut best: Option<(u8, Ipv4Addr)> = None;
         let mut cur = ifap;
         while !cur.is_null() {
             let ifa = &*cur;
@@ -792,11 +817,19 @@ fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
             if ip.is_loopback() || ip.is_link_local() || is_overlay || !ip.is_private() {
                 continue;
             }
-            found = Some(ip);
-            break;
+            let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                .to_str()
+                .unwrap_or("");
+            let r = rank(name);
+            if best.map(|(br, _)| r < br).unwrap_or(true) {
+                best = Some((r, ip));
+                if r == 0 {
+                    break; // wired wins outright; stop early
+                }
+            }
         }
         libc::freeifaddrs(ifap);
-        found
+        best.map(|(_, ip)| ip)
     }
 }
 
@@ -2486,6 +2519,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn iface_rank_prefers_wired_then_wifi() {
+        use super::iface_rank;
+        // wired ethernet (various udev names) = best
+        for n in ["eth0", "enp12s0", "eno1", "ens3", "en0"] {
+            assert_eq!(iface_rank(n), 0, "{n} should rank wired");
+        }
+        // wifi next
+        for n in ["wlan0", "wlp13s0", "wl0"] {
+            assert_eq!(iface_rank(n), 1, "{n} should rank wifi");
+        }
+        // tethering / virtual / other last
+        for n in ["docker0", "br-abc", "tun0", "ppp0"] {
+            assert_eq!(iface_rank(n), 2, "{n} should rank other");
+        }
+        assert!(iface_rank("eth0") < iface_rank("wlan0")); // wired beats wifi
     }
 
     #[test]
