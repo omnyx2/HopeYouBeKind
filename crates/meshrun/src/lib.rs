@@ -385,8 +385,19 @@ fn apply_gossip_table(
                 );
             }
             // Stale (no fresh direct path) → adopt the gossiped address; it may be current.
+            // EXCEPT: never downgrade a PUBLIC endpoint we hold to a PRIVATE gossiped one. A
+            // peer behind NAT that never learned its public address advertises its own LAN
+            // address (e.g. 172.28.x); if that overwrites the public source we learned from
+            // its frames, a reachable direct path is demoted to a (often dead) relay — the
+            // peer then looks "relay/offline" to us forever even though we can reply to it.
+            // Same-LAN peers both hold private addresses, so this only guards the cross-NAT
+            // case. (docs/RELAY.md; found live on a campus-NAT node.)
             Some(existing) if !directly_reachable(existing, now) => {
-                existing.endpoint = ep;
+                let downgrade_public_to_private =
+                    is_public(existing.endpoint.ip()) && !is_public(ep.ip());
+                if !downgrade_public_to_private {
+                    existing.endpoint = ep;
+                }
             }
             // Fresh direct path → keep our own, more accurate address.
             Some(_) => {}
@@ -967,6 +978,50 @@ pub async fn run<X: Transport + 'static>(handles: DataPlaneHandles<X>) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // A peer behind NAT advertising its own LAN address must NOT demote the public
+    // source we learned from its frames — else a reachable direct path turns into a
+    // dead relay (the campus-NAT convergence bug).
+    #[test]
+    fn gossip_does_not_downgrade_a_public_endpoint_to_a_private_one() {
+        let now = now_ms();
+        let pub_ep: SocketAddr = "203.0.113.9:42001".parse().unwrap(); // learned public source
+        let mut links: HashMap<MemberId, Link> = HashMap::new();
+        links.insert(
+            9,
+            Link {
+                endpoint: pub_ep,
+                last_seen_ms: now,
+                last_direct_ms: 0, // stale direct → the branch that adopts gossip
+            },
+        );
+        // Peer 9 gossips itself at a PRIVATE LAN address (never learned its public one).
+        let lan: SocketAddr = "172.28.7.32:42001".parse().unwrap();
+        apply_gossip_table(&mut links, &[(9, lan)], 1, now);
+        assert_eq!(
+            links[&9].endpoint, pub_ep,
+            "a private gossiped addr must not overwrite a learned public endpoint"
+        );
+        // But a public gossiped address (a genuine roam) IS adopted when stale.
+        let pub2: SocketAddr = "198.51.100.5:42001".parse().unwrap();
+        apply_gossip_table(&mut links, &[(9, pub2)], 1, now);
+        assert_eq!(links[&9].endpoint, pub2, "a public roam still updates");
+        // And two same-LAN peers (we hold a private addr too) still learn via gossip.
+        links.insert(
+            5,
+            Link {
+                endpoint: "10.0.0.5:42001".parse().unwrap(),
+                last_seen_ms: now,
+                last_direct_ms: 0,
+            },
+        );
+        let lan5: SocketAddr = "10.0.0.6:42001".parse().unwrap();
+        apply_gossip_table(&mut links, &[(5, lan5)], 1, now);
+        assert_eq!(
+            links[&5].endpoint, lan5,
+            "same-LAN private update still works"
+        );
+    }
 
     // Relay election must be deterministic: freshest qualifying public peer wins,
     // ties break toward the lowest id — never HashMap iteration order.
