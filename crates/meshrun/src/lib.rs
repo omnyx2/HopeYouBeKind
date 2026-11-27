@@ -293,6 +293,23 @@ enum Route {
     None,
 }
 
+/// Did a frame from `src` arriving at `from` actually come RELAYED (forwarded by another
+/// member), rather than from `src` directly? True only if a DIFFERENT member that we have a
+/// FRESH DIRECT path to currently sits at `from` — that member is a live relay. A stale or
+/// phantom entry at `from` does NOT count: with a port-preserving NAT a machine's old
+/// incarnation lingers at the same public ip:port, and treating that as a relay would stop
+/// the real peer from ever learning its own direct path (docs/RELAY.md).
+fn is_relayed_hop(
+    links: &HashMap<MemberId, Link>,
+    src: MemberId,
+    from: SocketAddr,
+    now: u64,
+) -> bool {
+    links
+        .iter()
+        .any(|(m, lk)| *m != src && lk.endpoint == from && directly_reachable(lk, now))
+}
+
 /// Is member `m`'s direct path fresh enough to use? (a direct frame within `DIRECT_OK_MS`)
 /// `pub` because this is THE definition of "direct" — meshd's view/`lattice conns`
 /// must report with the same window the data plane routes with, or the UI claims
@@ -694,7 +711,15 @@ impl LoopCtx {
             // hop, not `src` speaking to us directly. Keep `src` alive, but do NOT
             // adopt the relay's address as `src`'s endpoint — that would pin us to
             // the relay forever and pollute the gossip table (docs/RELAY.md).
-            let relayed = l.iter().any(|(m, lk)| *m != src && lk.endpoint == from);
+            //
+            // ...but ONLY a member we actually have a FRESH DIRECT path to can be a live
+            // relay. A STALE/phantom member sitting at the same address does not make this
+            // a relayed hop — and with a port-preserving NAT, a machine's old incarnation
+            // (e.g. its other dual-boot OS, or a prior join) lingers at the SAME public
+            // ip:port, so without this check a node behind such a NAT could NEVER establish
+            // a direct path (its own frames were mis-read as relayed). Found live: a campus
+            // node stuck on relay because a phantom shared its 210.x:42001 endpoint.
+            let relayed = is_relayed_hop(&l, src, from, now);
             let e = l.entry(src).or_insert(Link {
                 endpoint: from,
                 last_seen_ms: 0,
@@ -1020,6 +1045,43 @@ mod tests {
         assert_eq!(
             links[&5].endpoint, lan5,
             "same-LAN private update still works"
+        );
+    }
+
+    // A node behind a port-preserving NAT whose OLD incarnation (phantom) lingers at the
+    // same public ip:port must still be able to establish its own direct path — the phantom
+    // must not make the real peer's frames look "relayed".
+    #[test]
+    fn stale_phantom_at_same_addr_does_not_block_a_direct_path() {
+        let now = now_ms();
+        let shared: SocketAddr = "210.107.188.8:42001".parse().unwrap();
+        let mut links: HashMap<MemberId, Link> = HashMap::new();
+        // Phantom #8 (an old incarnation) sits at the shared NAT addr but is STALE.
+        links.insert(
+            8,
+            Link {
+                endpoint: shared,
+                last_seen_ms: now - 999_999,
+                last_direct_ms: 0,
+            },
+        );
+        // A frame from the REAL peer #9 arrives from that same addr.
+        assert!(
+            !is_relayed_hop(&links, 9, shared, now),
+            "a stale phantom at the same addr must NOT make #9's frame look relayed"
+        );
+        // But a LIVE member #7 directly reachable at that addr IS a real relay.
+        links.insert(
+            7,
+            Link {
+                endpoint: shared,
+                last_seen_ms: now,
+                last_direct_ms: now,
+            },
+        );
+        assert!(
+            is_relayed_hop(&links, 9, shared, now),
+            "a fresh/direct member at the addr is a genuine relay hop"
         );
     }
 
